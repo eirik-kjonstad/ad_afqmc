@@ -462,6 +462,9 @@ class uhf(wave_function_unrestricted):
         f_dn = jnp.einsum(
             "gij,jk->gik", rot_chol[1], green_walker[1].T, optimize="optimal"
         )
+        f_up = 1.0j * f_up
+        f_dn = 1.0j * f_dn
+        
         c_up = vmap(jnp.trace)(f_up)
         c_dn = vmap(jnp.trace)(f_dn)
         exc_up = jnp.sum(vmap(lambda x: x * x.T)(f_up))
