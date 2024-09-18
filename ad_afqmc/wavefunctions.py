@@ -440,7 +440,7 @@ class uhf(wave_function_unrestricted):
         fb_dn = jnp.einsum(
             "gij,ij->g", ham_data["rot_chol"][1], green_walker[1], optimize="optimal"
         )
-        return fb_up + fb_dn
+        return (1.0j)*(fb_up + fb_dn)
 
     @partial(jit, static_argnums=0)
     def calc_energy(
