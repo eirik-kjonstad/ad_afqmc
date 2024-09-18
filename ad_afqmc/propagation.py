@@ -148,13 +148,15 @@ class propagator:
             overlaps_new,
             prop["overlaps"],
         )
-        imp_fun_phaseless = jnp.abs(imp_fun) * jnp.cos(theta)
-        imp_fun_phaseless = jnp.where(
-            jnp.isnan(imp_fun_phaseless), 0.0, imp_fun_phaseless
-        )
-        imp_fun_phaseless = jnp.where(imp_fun_phaseless < 1.0e-3, 0.0, imp_fun_phaseless)  # type: ignore
-        imp_fun_phaseless = jnp.where(imp_fun_phaseless > 100.0, 0.0, imp_fun_phaseless)
-        prop["weights"] = imp_fun_phaseless * prop["weights"]
+        #imp_fun_phaseless = jnp.abs(imp_fun) * jnp.cos(theta)
+        #imp_fun_phaseless = jnp.where(
+        #    jnp.isnan(imp_fun_phaseless), 0.0, imp_fun_phaseless
+        #)
+        #imp_fun_phaseless = jnp.where(imp_fun_phaseless < 1.0e-3, 0.0, imp_fun_phaseless)  # type: ignore
+        #imp_fun_phaseless = jnp.where(imp_fun_phaseless > 100.0, 0.0, imp_fun_phaseless)
+        #prop["weights"] = imp_fun_phaseless * prop["weights"]
+        #prop["weights"] = jnp.abs(imp_fun) * prop["weights"]
+        #prop["weights"] = imp_fun * prop["weights"]
         prop["weights"] = jnp.where(prop["weights"] > 100.0, 0.0, prop["weights"])
         prop["pop_control_ene_shift"] = prop["e_estimate"] - 0.1 * jnp.array(jnp.log(jnp.sum(prop["weights"]) / self.n_walkers) / self.dt)  # type: ignore
         prop["overlaps"] = overlaps_new
@@ -282,6 +284,7 @@ class propagator_uhf(propagator):
 
     @partial(jit, static_argnums=(0, 1))
     def propagate_free(self, trial, ham, prop, fields, wave_data):
+        print("am I ever in propagate_free??")
         # jax.debug.print('ham:\n{}', ham)
         # jax.debug.print('prop:\n{}', prop)
         # jax.debug.print('fields:\n{}', fields)
@@ -393,6 +396,7 @@ class propagator_cpmc(propagator_uhf):
         Returns:
             prop_data: dictionary containing the updated propagation data
         """
+        print("am I ever in the propagate method for cpmc?")
         # one body
         prop_data = self.propagate_one_body(trial, ham_data, prop_data, wave_data)
 

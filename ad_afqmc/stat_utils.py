@@ -20,7 +20,9 @@ def blocking_analysis(weights, energies, neql=0, printQ=False, writeBlockedQ=Fal
     for i in blockSizes[blockSizes < nSamples / 2.0]:
         nBlocks = nSamples // i
         blockedWeights = np.zeros(nBlocks)
+        blockedWeights = np.complex128(blockedWeights)
         blockedEnergies = np.zeros(nBlocks)
+        blockedEnergies = np.complex128(blockedEnergies)
         for j in range(nBlocks):
             blockedWeights[j] = weights[j * i : (j + 1) * i].sum()
             blockedEnergies[j] = (

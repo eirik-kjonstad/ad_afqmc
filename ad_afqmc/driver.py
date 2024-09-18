@@ -41,6 +41,8 @@ def afqmc(
         observable_op = jnp.array(ham_data["h1"])
         observable_constant = 0.0
 
+    # testing to make chol imaginary
+    #ham_data["chol"] = 1.0j*ham_data["chol"]
     rdm_op = 0.0 * jnp.array(ham_data["h1"])  # for reverse mode
     rdm_2_op = None
     if options["ad_mode"] == "2rdm":
@@ -143,13 +145,14 @@ def afqmc(
         block_energy_n, prop_data = sampler.propagate_phaseless(
             ham, ham_data, propagator_eq, prop_data, trial, wave_data
         )
-        block_energy_n = np.array([block_energy_n], dtype="float32")
-        block_weight_n = np.array([jnp.sum(prop_data["weights"])], dtype="float32")
+        block_energy_n = np.array([block_energy_n], dtype="complex128")
+        block_weight_n = np.array([jnp.sum(prop_data["weights"])], dtype="complex128")
+        print(f"energy: {block_energy_n}, weight: {block_weight_n}")
         block_weighted_energy_n = np.array(
-            [block_energy_n * block_weight_n], dtype="float32"
+            [block_energy_n * block_weight_n], dtype="complex128"
         )
-        total_block_energy_n = np.zeros(1, dtype="float32")
-        total_block_weight_n = np.zeros(1, dtype="float32")
+        total_block_energy_n = np.zeros(1, dtype="complex128")
+        total_block_weight_n = np.zeros(1, dtype="complex128")
         comm.Reduce(
             [block_weighted_energy_n, MPI.FLOAT],
             [total_block_energy_n, MPI.FLOAT],
@@ -203,7 +206,12 @@ def afqmc(
     if rank == 0:
         global_block_weights = np.zeros(size * propagator.n_blocks)
         global_block_energies = np.zeros(size * propagator.n_blocks)
+        #efk
+        global_block_weights = np.complex128(global_block_weights)
+        global_block_energies = np.complex128(global_block_energies)
+        #
         global_block_observables = np.zeros(size * propagator.n_blocks)
+        global_block_observables = np.complex128(global_block_observables)
         if options["ad_mode"] == "reverse":
             global_block_rdm1s = np.zeros(
                 (size * propagator.n_blocks, *(ham_data["h1"].shape))
@@ -257,6 +265,7 @@ def afqmc(
 
     for n in range(propagator.n_blocks):
         if options["ad_mode"] == "forward":
+            print(f"ad mode = forward")
             coupling = 0.0
             block_energy_n, block_observable_n, prop_data = jvp(
                 propagate_phaseless_wrapper,
@@ -268,6 +277,7 @@ def afqmc(
                 block_observable_n = trial_observable
                 local_large_deviations += 1
         elif options["ad_mode"] == "reverse":
+            print(f"ad mode = reverse")
             coupling = 1.0
             block_energy_n, block_vjp_fun, prop_data = vjp(
                 propagate_phaseless_wrapper, coupling, rdm_op, prop_data, has_aux=True
@@ -279,6 +289,7 @@ def afqmc(
                 block_rdm1_n = trial_rdm1
                 local_large_deviations += 1
         elif options["ad_mode"] == "2rdm":
+            print(f"ad mode = 2rdm")
             coupling = 1.0
             block_energy_n, block_vjp_fun, prop_data = vjp(
                 propagate_phaseless_wrapper, coupling, rdm_2_op, prop_data, has_aux=True
@@ -298,14 +309,14 @@ def afqmc(
             )
             block_observable_n = 0.0
 
-        block_energy_n = np.array([block_energy_n], dtype="float32")
+        block_energy_n = np.array([block_energy_n], dtype="complex128")
         block_observable_n = np.array(
-            [block_observable_n + observable_constant], dtype="float32"
+            [block_observable_n + observable_constant], dtype="complex128"
         )
-        block_weight_n = np.array([jnp.sum(prop_data["weights"])], dtype="float32")
-        block_rdm1_n = np.array(block_rdm1_n, dtype="float32")
+        block_weight_n = np.array([jnp.sum(prop_data["weights"])], dtype="complex128")
+        block_rdm1_n = np.array(block_rdm1_n, dtype="complex128")
         if options["ad_mode"] == "2rdm":
-            block_rdm2_n = np.array(block_rdm2_n, dtype="float32")
+            block_rdm2_n = np.array(block_rdm2_n, dtype="complex128")
 
         gather_weights = None
         gather_energies = None
@@ -313,12 +324,12 @@ def afqmc(
         gather_rdm1s = None
         gather_rdm2s = None
         if rank == 0:
-            gather_weights = np.zeros(size, dtype="float32")
-            gather_energies = np.zeros(size, dtype="float32")
-            gather_observables = np.zeros(size, dtype="float32")
+            gather_weights = np.zeros(size, dtype="complex128")
+            gather_energies = np.zeros(size, dtype="complex128")
+            gather_observables = np.zeros(size, dtype="complex128")
             if options["ad_mode"] == "reverse":
                 gather_rdm1s = np.zeros(
-                    (size, *(ham_data["h1"].shape)), dtype="float32"
+                    (size, *(ham_data["h1"].shape)), dtype="complex128"
                 )
             elif options["ad_mode"] == "2rdm":
                 gather_rdm2s = np.zeros((size, *(rdm_2_op.shape)), dtype="float32")

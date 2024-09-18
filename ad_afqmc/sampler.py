@@ -1,4 +1,5 @@
 import os
+import jax.numpy as jnp
 
 os.environ["XLA_FLAGS"] = (
     "--xla_force_host_platform_device_count=1 --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
@@ -44,6 +45,9 @@ def _block_scan(prop_data, _x, ham_data, propagator, trial, wave_data):
     _step_scan_wrapper = lambda x, y: _step_scan(
         x, y, ham_data, propagator, trial, wave_data
     )
+    #efk
+    prop_data["weights"] = jnp.complex128(prop_data["weights"])
+    #
     prop_data, _ = lax.scan(_step_scan_wrapper, prop_data, fields)
     prop_data["n_killed_walkers"] += prop_data["weights"].size - jnp.count_nonzero(
         prop_data["weights"]
@@ -93,9 +97,13 @@ def _block_scan_free(prop_data, _x, ham_data, propagator, trial, wave_data):
 
 @partial(jit, static_argnums=(3, 4))
 def _sr_block_scan(prop_data, _x, ham_data, propagator, trial, wave_data):
+    print("in _sr_block_scan")
     _block_scan_wrapper = lambda x, y: _block_scan(
         x, y, ham_data, propagator, trial, wave_data
     )
+    #efk
+    prop_data["weights"] = jnp.complex128(prop_data["weights"])
+    #
     prop_data, (block_energy, block_weight) = lax.scan(
         _block_scan_wrapper, prop_data, None, length=propagator.n_ene_blocks
     )
@@ -238,6 +246,10 @@ def propagate_phaseless(ham, ham_data, propagator, prop_data, trial, wave_data):
     prop_data["overlaps"] = trial.calc_overlap_vmap(prop_data["walkers"], wave_data)
     prop_data["n_killed_walkers"] = 0
     prop_data["pop_control_ene_shift"] = prop_data["e_estimate"]
+    # efk
+    prop_data["pop_control_ene_shift"] = jnp.complex128(prop_data["pop_control_ene_shift"])
+    #prop_data["weights"] = jnp.complex128(prop_data["weights"])
+    #
     prop_data, (block_energy, block_weight) = lax.scan(
         _sr_block_scan_wrapper, prop_data, None, length=propagator.n_sr_blocks
     )
