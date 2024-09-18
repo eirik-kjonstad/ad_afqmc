@@ -51,7 +51,7 @@ class hamiltonian:
     def prop_ham(self, ham_data, dt, _trial, wave_data=None):
         ham_data["mf_shifts"] = 2.0j * vmap(
             lambda x: jnp.sum(jnp.diag(x.reshape(self.norb, self.norb))[: self.nelec])
-        )(ham_data["chol"])
+        )(1.0j * ham_data["chol"])
         ham_data["mf_shifts_fp"] = ham_data["mf_shifts"] / 2.0 / self.nelec
         ham_data["h0_prop"] = (
             -ham_data["h0"] - jnp.sum(ham_data["mf_shifts"] ** 2) / 2.0
@@ -66,10 +66,11 @@ class hamiltonian:
             ham_data["chol"].reshape(-1, self.norb, self.norb),
             optimize="optimal",
         )
+        v0 = -v0
         ham_data["normal_ordering_term"] = -v0
         h1_mod = ham_data["h1"] - v0
         h1_mod = h1_mod - jnp.real(
-            1.0j
+            (1.0j)*(1.0j)
             * jnp.einsum(
                 "g,gik->ik",
                 ham_data["mf_shifts"],
