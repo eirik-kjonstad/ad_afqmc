@@ -233,7 +233,8 @@ class propagator_uhf(propagator):
     @partial(jit, static_argnums=(0,))
     def apply_propagator_vmap(self, ham, walkers, fields):
         vhs = (
-            1.0j
+            #1.0j
+            1.0
             * jnp.sqrt(self.dt)
             * fields.dot(ham["chol"]).reshape(
                 walkers[0].shape[0], walkers[0].shape[1], walkers[0].shape[1]
