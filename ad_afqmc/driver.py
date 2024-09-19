@@ -572,6 +572,7 @@ def fp_afqmc(
         )
         global_block_weights[n] = weights[0]
         global_block_energies[n] = energy_samples[0]
+
         total_weight += weights
         total_energy += weights * (energy_samples - total_energy) / total_weight
         if options["save_walkers"] == True:
@@ -582,10 +583,17 @@ def fp_afqmc(
                 with open(f"prop_data_{rank}.bin", "wb") as f:
                     pickle.dump(prop_data_tr, f)
 
-        if n % (max(propagator.n_ene_blocks // 10, 1)) == 0:
-            comm.Barrier()
-            if rank == 0:
-                print(f"{n:5d}: {total_energy}")
+        #if n % (max(propagator.n_ene_blocks // 10, 1)) == 0:
+        comm.Barrier()
+        if rank == 0:
+            print(f"{n:5d}: {np.mean(total_energy)}")
+                #e_afqmc, energy_error = stat_utils.blocking_analysis_complex(
+                #   global_block_weights[: (n + 1) * size],
+                #   global_block_energies[: (n + 1) * size],
+                #   neql=0,
+                #)
+                #print(f"{n:5d}: {e_afqmc}")
+
         np.savetxt(
             "samples_raw.dat", np.stack((global_block_weights, global_block_energies)).T
         )
