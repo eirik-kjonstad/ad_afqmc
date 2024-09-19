@@ -156,7 +156,7 @@ class propagator:
         #imp_fun_phaseless = jnp.where(imp_fun_phaseless > 100.0, 0.0, imp_fun_phaseless)
         #prop["weights"] = imp_fun_phaseless * prop["weights"]
         #prop["weights"] = jnp.abs(imp_fun) * prop["weights"]
-        #prop["weights"] = imp_fun * prop["weights"]
+        prop["weights"] = imp_fun * prop["weights"]
         prop["weights"] = jnp.where(prop["weights"] > 100.0, 0.0, prop["weights"])
         prop["pop_control_ene_shift"] = prop["e_estimate"] - 0.1 * jnp.array(jnp.log(jnp.sum(prop["weights"]) / self.n_walkers) / self.dt)  # type: ignore
         prop["overlaps"] = overlaps_new

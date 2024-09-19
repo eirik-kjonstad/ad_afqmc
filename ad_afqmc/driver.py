@@ -368,7 +368,7 @@ def afqmc(
         prop_data = propagator.stochastic_reconfiguration_global(prop_data, comm)
         prop_data["e_estimate"] = 0.9 * prop_data["e_estimate"] + 0.1 * block_energy_n
 
-        if n % (max(propagator.n_blocks // 10, 1)) == 0:
+        if n % (max(propagator.n_blocks // 100, 1)) == 0:
             comm.Barrier()
             if rank == 0:
                 e_afqmc, energy_error = stat_utils.blocking_analysis(
