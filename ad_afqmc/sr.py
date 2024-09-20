@@ -47,7 +47,7 @@ def stochastic_reconfiguration(walkers, weights, zeta):
 @jit
 def stochastic_reconfiguration_uhf(walkers, weights, zeta):
     nwalkers = walkers[0].shape[0]
-    cumulative_weights = jnp.cumsum(jnp.abs(weights))
+    cumulative_weights = jnp.cumsum(weights) #jnp.cumsum(jnp.abs(weights))
     total_weight = cumulative_weights[-1]
     average_weight = total_weight / nwalkers
     weights = jnp.ones(nwalkers) * average_weight
@@ -142,7 +142,7 @@ def stochastic_reconfiguration_mpi_uhf(walkers, weights, zeta, comm):
     comm.Gather(weights, global_buffer_weights, root=0)
 
     if rank == 0:
-        cumulative_weights = np.cumsum(np.abs(global_buffer_weights))
+        cumulative_weights = np.cumsum(global_buffer_weights) #np.cumsum(np.abs(global_buffer_weights))
         total_weight = cumulative_weights[-1]
         average_weight = total_weight / nwalkers / size
         global_buffer_weights_new = (np.ones(nwalkers * size) * average_weight).astype(
