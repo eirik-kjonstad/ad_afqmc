@@ -394,6 +394,68 @@ class rhf(wave_function_restricted):
             )
         )
 
+@dataclass
+class mps(wave_function_restricted):
+   # Just a temporary holder for MPS... This one is now RHF
+
+    norb: int
+    nelec: (
+        int  # this is the number of electrons of each spin, so nelec = total_nelec // 2
+    )
+
+    @partial(jit, static_argnums=0)
+    def calc_overlap(self, walker: Sequence, wave_data: Any = None) -> complex:
+        return jnp.linalg.det(walker[: walker.shape[1], :]) ** 2
+
+    @partial(jit, static_argnums=0)
+    def calc_green(self, walker: Sequence, wave_data: Any = None) -> jnp.ndarray:
+        return (walker.dot(jnp.linalg.inv(walker[: walker.shape[1], :]))).T
+
+    @partial(jit, static_argnums=0)
+    def calc_1rdm(self, walker: Sequence, wave_data: Any = None):  # shouldnt be here
+        rdm1 = (
+            walker.dot(jnp.linalg.inv(walker.T.conj().dot(walker))).dot(walker.T.conj())
+        ).T
+        return rdm1
+
+    @partial(jit, static_argnums=0)
+    def calc_1rdm_vmap(self, walkers, wave_data=None):
+        return vmap(self.calc_1rdm, in_axes=(0, None))(walkers, wave_data)
+
+    @partial(jit, static_argnums=0)
+    def calc_force_bias(
+        self, walker: Sequence, ham_data: dict, wave_data: Any = None
+    ) -> jnp.ndarray:
+        green_walker = self.calc_green(walker, wave_data)
+        fb = 2.0 * jnp.einsum(
+            "gij,ij->g", ham_data["rot_chol"], green_walker, optimize="optimal"
+        )
+        return fb
+
+    @partial(jit, static_argnums=0)
+    def calc_energy(self, walker: Sequence, ham_data: dict, wave_data: Any = None):
+        h0, rot_h1, rot_chol = ham_data["h0"], ham_data["rot_h1"], ham_data["rot_chol"]
+        ene0 = h0
+        green_walker = self.calc_green(walker, wave_data)
+        ene1 = 2.0 * jnp.sum(green_walker * rot_h1)
+        f = jnp.einsum("gij,jk->gik", rot_chol, green_walker.T, optimize="optimal")
+        c = vmap(jnp.trace)(f)
+        exc = jnp.sum(vmap(lambda x: x * x.T)(f))
+        ene2 = 2.0 * jnp.sum(c * c) - exc
+        return ene2 + ene1 + ene0
+
+    def get_rdm1(self, wave_data: Any = None):
+        rdm1 = 2 * np.eye(self.norb, self.nelec).dot(np.eye(self.norb, self.nelec).T)
+        return rdm1
+
+    def __hash__(self):
+        return hash(
+            (
+                self.norb,
+                self.nelec,
+            )
+        )
+
 
 @dataclass
 class uhf(wave_function_unrestricted):
@@ -1508,7 +1570,6 @@ class CISD_THC(wave_function_auto_restricted):
 
     def __hash__(self):
         return hash((self.norb, self.nelec, 2, self.eps))
-
 
 @dataclass
 class UCISD(wave_function_auto_unrestricted):

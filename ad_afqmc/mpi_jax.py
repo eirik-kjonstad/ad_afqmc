@@ -106,6 +106,25 @@ def _prep_afqmc(options=None):
         )
         trial = wavefunctions.rhf(norb, nelec // 2)
         wave_data = jnp.eye(norb)
+    elif options["walker_type"] == "mps":
+        # placeholder for now, just standard RHF
+        ham_data["h1"] = h1
+        if options["symmetry"]:
+            ham_data["mask"] = jnp.where(jnp.abs(ham_data["h1"]) > 1.0e-10, 1.0, 0.0)
+        else:
+            ham_data["mask"] = jnp.ones(ham_data["h1"].shape)
+        ham = hamiltonian.hamiltonian_mps(nmo, nelec // 2, nchol)
+        prop = propagation.propagator_mps(
+            options["dt"],
+            options["n_prop_steps"],
+            options["n_ene_blocks"],
+            options["n_sr_blocks"],
+            options["n_blocks"],
+            ad_q,
+            options["n_walkers"],
+        )
+        trial = wavefunctions.mps(norb, nelec // 2)
+        wave_data = jnp.eye(norb)
     elif options["walker_type"] == "uhf":
         ham_data["h1"] = jnp.array([h1, h1])
         if options["symmetry"]:

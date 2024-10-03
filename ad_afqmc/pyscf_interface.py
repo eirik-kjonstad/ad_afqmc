@@ -45,6 +45,96 @@ def modified_cholesky(mat: np.ndarray, max_error: float = 1e-6) -> np.ndarray:
     return chol_vecs[:nchol]
 
 
+# prepare phaseless afqmc with mps trial
+def prep_afqmc_mps(
+    cholesky_threshold: float = 1e-5,
+):
+    from pyscf import gto, scf
+    import numpy as np
+    from pyblock2._pyscf.ao2mo import integrals as itg
+    from pyblock2.driver.core import DMRGDriver, SymmetryTypes
+    
+    # Set settings for the sweeps
+    bond_dims = [1] * 8
+    noises = [1e-4] * 4 + [1e-5] * 4 + [0]
+    thrds = [1e-10] * 8 
+
+    # Run SCF and get integrals
+    mol = gto.M(atom="N 0 0 0; N 0 0 1.1", basis="sto3g", symmetry="c1", verbose=0)
+    mf = scf.RHF(mol).run(conv_tol=1E-14)
+
+    # h1e, g2e should be in the "CAS" MO basis here
+    # restricted to non-core and CAS space. Here we should have no frozen orbitals
+    # and a full CAS space, so this is the full MO basis
+    ncas, n_elec, spin, ecore, h1e, g2e, orb_sym = itg.get_rhf_integrals(mf, ncore=0, ncas=None, g2e_symm=1)
+
+    # Run DMRG with bond dimension 1
+    driver = DMRGDriver(scratch="./tmp", symm_type=SymmetryTypes.SU2, n_threads=4)
+    driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin, orb_sym=orb_sym)
+
+    mpo = driver.get_qc_mpo(h1e=h1e, g2e=g2e, ecore=ecore, iprint=1)
+    ket = driver.get_random_mps(tag="GS", bond_dim=1, nroots=1)
+    energy = driver.dmrg(mpo, ket, n_sweeps=20, bond_dims=bond_dims, noises=noises,
+        thrds=thrds, iprint=1)
+    print('DMRG energy = %20.15f' % energy)
+
+    pdm1 = driver.get_1pdm(ket)
+    pdm2 = driver.get_2pdm(ket).transpose(0, 3, 1, 2)
+    print('Energy from pdms = %20.15f' % (np.einsum('ij,ij->', pdm1, h1e)
+        + 0.5 * np.einsum('ijkl,ijkl->', pdm2, driver.unpack_g2e(g2e)) + ecore))
+
+    impo = driver.get_identity_mpo()
+    expt = driver.expectation(ket, mpo, ket) / driver.expectation(ket, impo, ket)
+    print('Energy from expectation = %20.15f' % expt)
+
+    # Cholesky decompose integrals
+    norb = np.size(h1e,0)
+    print(g2e)
+    print(f"Number of orbitals: {norb}")
+    
+    # Restore converts 8-fold packed g2e to 4-fold packed (pq,rs)
+    # which makes it into a semi positive definite matrix that we 
+    # can perform Cholesky decomposition on
+    g2e = ao2mo.restore(4, g2e, norb)
+    print(g2e)
+    chol0 = modified_cholesky(g2e, cholesky_threshold)
+    nchol = chol0.shape[0]
+
+    # Unpack pq -> p,q and set lower and upper triagonals
+    # equal to each other
+    # => gives the full L_J_pq
+    chol = np.zeros((nchol, norb, norb))
+    for i in range(nchol):
+        for m in range(norb):
+            for n in range(m + 1):
+                triind = m * (m + 1) // 2 + n
+                chol[i, m, n] = chol0[i, triind]
+                chol[i, n, m] = chol0[i, triind]
+
+    # Check that cholesky was done right
+    # works!
+#    g2e = ao2mo.restore(1, g2e, norb)
+#    for m in range(norb):
+#        for n in range(norb):
+#            for k in range(norb):
+#                for l in range(norb):
+#                    elm = 0.0
+#                    for i in range(nchol):
+#                        elm = elm + chol[i,m,n]*chol[i,k,l]
+#                    print(f"{elm}, {g2e[m,n,k,l]} {elm - g2e[m,n,k,l]}")
+
+    # Now we need to transfer information to the AFQMC code
+    # We write an HDF5 file with the contents we require
+    chol = chol.reshape((chol.shape[0], -1)) # flattens J,p,q into J,pq
+    assert len(chol.shape) == 2
+    with h5py.File("FCIDUMP_chol_MPS", "w") as fh5:
+        fh5["header"] = np.array([n_elec, norb, spin, chol.shape[0]])
+        fh5["hcore"] = h1e.flatten()
+        fh5["chol"] = chol.flatten()
+        fh5["energy_core"] = ecore
+
+    return ket # We keep the MPS in memory
+
 # prepare phaseless afqmc with mf trial
 def prep_afqmc(
     mf: Union[scf.uhf.UHF, scf.rhf.RHF],

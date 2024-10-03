@@ -84,6 +84,72 @@ class hamiltonian:
 
 
 @dataclass
+class hamiltonian_mps:
+   # placeholder for now, just RHF
+
+    norb: int  # number of spatial orbitals
+    nelec: int  # number of electrons of each spin, so nelec = total_nelec // 2
+    nchol: int
+
+    @partial(jit, static_argnums=(0,))
+    def rot_orbs(self, ham_data, mo_coeff):
+        ham_data["h1"] = mo_coeff.T.dot(ham_data["h1"]).dot(mo_coeff)
+        ham_data["chol"] = jnp.einsum(
+            "gij,jp->gip", ham_data["chol"].reshape(-1, self.norb, self.norb), mo_coeff
+        )
+        ham_data["chol"] = jnp.einsum(
+            "qi,gip->gqp", mo_coeff.T, ham_data["chol"]
+        ).reshape(-1, self.norb * self.norb)
+        return ham_data
+
+    @partial(jit, static_argnums=(0,))
+    def rot_ham(self, ham_data, wave_data=None):
+        ham_data["h1"] = (ham_data["h1"] + ham_data["h1"].T) / 2.0
+        ham_data["rot_h1"] = ham_data["h1"][: self.nelec, :].copy()
+        ham_data["rot_chol"] = (
+            ham_data["chol"]
+            .reshape(-1, self.norb, self.norb)[:, : self.nelec, :]
+            .copy()
+        )
+        return ham_data
+
+    @partial(jit, static_argnums=(0, 3))
+    def prop_ham(self, ham_data, dt, _trial, wave_data=None):
+        ham_data["mf_shifts"] = 2.0j * vmap(
+            lambda x: jnp.sum(jnp.diag(x.reshape(self.norb, self.norb))[: self.nelec])
+        )(ham_data["chol"])
+        ham_data["mf_shifts_fp"] = ham_data["mf_shifts"] / 2.0 / self.nelec
+        ham_data["h0_prop"] = (
+            -ham_data["h0"] - jnp.sum(ham_data["mf_shifts"] ** 2) / 2.0
+        )
+        ham_data["h0_prop_fp"] = [
+            (ham_data["h0_prop"] + ham_data["ene0"]) / self.nelec,
+            (ham_data["h0_prop"] + ham_data["ene0"]) / self.nelec,
+        ]
+        v0 = 0.5 * jnp.einsum(
+            "gik,gjk->ij",
+            ham_data["chol"].reshape(-1, self.norb, self.norb),
+            ham_data["chol"].reshape(-1, self.norb, self.norb),
+            optimize="optimal",
+        )
+        ham_data["normal_ordering_term"] = -v0
+        h1_mod = ham_data["h1"] - v0
+        h1_mod = h1_mod - jnp.real(
+            1.0j
+            * jnp.einsum(
+                "g,gik->ik",
+                ham_data["mf_shifts"],
+                ham_data["chol"].reshape(-1, self.norb, self.norb),
+            )
+        )
+        ham_data["exp_h1"] = jsp.linalg.expm(-dt * h1_mod / 2.0)
+        return ham_data
+
+    def __hash__(self):
+        return hash((self.norb, self.nelec, self.nchol))
+
+
+@dataclass
 class hamiltonian_uhf:
     norb: int  # number of spatial orbitals
     nelec: tuple
