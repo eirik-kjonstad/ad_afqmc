@@ -396,12 +396,15 @@ class rhf(wave_function_restricted):
 
 @dataclass
 class mps(wave_function_restricted):
-   # Just a temporary holder for MPS... This one is now RHF
+    import block2
+    import pyblock2.driver.core
 
     norb: int
     nelec: (
         int  # this is the number of electrons of each spin, so nelec = total_nelec // 2
     )
+    ket: block2.su2.MPS 
+    dmrg_driver: pyblock2.driver.core.DMRGDriver
 
     @partial(jit, static_argnums=0)
     def calc_overlap(self, walker: Sequence, wave_data: Any = None) -> complex:
@@ -432,17 +435,40 @@ class mps(wave_function_restricted):
         )
         return fb
 
-    @partial(jit, static_argnums=0)
+    #@partial(jit, static_argnums=0)
     def calc_energy(self, walker: Sequence, ham_data: dict, wave_data: Any = None):
+        import numpy as np
+        from pyscf import ao2mo
+
+        green_walker = list()
+        pdm2 = list()
+        for k in range(len(walker)):
+            pdm1 = self.dmrg_driver.get_1pdm(walker[k])
+            green_walker.append(pdm1)
+            pdm2_walker = self.dmrg_driver.get_2pdm(walker[k]).transpose(0, 3, 1, 2)
+            pdm2.append(pdm2_walker)
+        
         h0, rot_h1, rot_chol = ham_data["h0"], ham_data["rot_h1"], ham_data["rot_chol"]
+        chol = ham_data["chol"]
+        h1e = ham_data["h1"]
+        norb = np.size(h1e,0)
+        chol = chol.reshape(-1,norb,norb)
+        nchol = np.size(chol,0)
+
         ene0 = h0
-        green_walker = self.calc_green(walker, wave_data)
-        ene1 = 2.0 * jnp.sum(green_walker * rot_h1)
-        f = jnp.einsum("gij,jk->gik", rot_chol, green_walker.T, optimize="optimal")
-        c = vmap(jnp.trace)(f)
-        exc = jnp.sum(vmap(lambda x: x * x.T)(f))
-        ene2 = 2.0 * jnp.sum(c * c) - exc
-        return ene2 + ene1 + ene0
+
+        g2e_1 = np.zeros((norb,norb,norb,norb))
+        g2e_1 = jnp.einsum("imn,ikl->mnkl", chol, chol, optimize="optimal")
+        g2e = ao2mo.restore(8, g2e_1, norb)
+
+        energy = np.zeros(len(walker)) 
+
+        for k in range(len(walker)):
+            walker_energy = np.einsum('ij,ij->', green_walker[0], h1e) + 0.5 * np.einsum('ijkl,ijkl->', pdm2[0], self.dmrg_driver.unpack_g2e(g2e)) + h0
+            print(f'Walker {k} energy from PDMs = {walker_energy}')
+            energy[k] = walker_energy
+
+        return energy 
 
     def get_rdm1(self, wave_data: Any = None):
         rdm1 = 2 * np.eye(self.norb, self.nelec).dot(np.eye(self.norb, self.nelec).T)

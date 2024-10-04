@@ -28,7 +28,7 @@ rank = comm.Get_rank()
 
 
 def afqmc(
-    ham_data, ham, propagator, trial, wave_data, observable, options, init_walkers=None
+    ham_data, ham, propagator, trial, wave_data, observable, options, init_walkers=None, ket=None,
 ):
     init = time.time()
     seed = options["seed"]

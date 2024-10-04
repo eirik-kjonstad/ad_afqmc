@@ -47,7 +47,7 @@ def modified_cholesky(mat: np.ndarray, max_error: float = 1e-6) -> np.ndarray:
 
 # prepare phaseless afqmc with mps trial
 def prep_afqmc_mps(
-    cholesky_threshold: float = 1e-5,
+    cholesky_threshold: float = 1e-8,
 ):
     from pyscf import gto, scf
     import numpy as np
@@ -69,7 +69,7 @@ def prep_afqmc_mps(
     ncas, n_elec, spin, ecore, h1e, g2e, orb_sym = itg.get_rhf_integrals(mf, ncore=0, ncas=None, g2e_symm=1)
 
     # Run DMRG with bond dimension 1
-    driver = DMRGDriver(scratch="./tmp", symm_type=SymmetryTypes.SU2, n_threads=4)
+    driver = DMRGDriver(scratch="./tmp", symm_type=SymmetryTypes.SU2, n_threads=1)
     driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin, orb_sym=orb_sym)
 
     mpo = driver.get_qc_mpo(h1e=h1e, g2e=g2e, ecore=ecore, iprint=1)
@@ -89,14 +89,12 @@ def prep_afqmc_mps(
 
     # Cholesky decompose integrals
     norb = np.size(h1e,0)
-    print(g2e)
     print(f"Number of orbitals: {norb}")
     
     # Restore converts 8-fold packed g2e to 4-fold packed (pq,rs)
     # which makes it into a semi positive definite matrix that we 
     # can perform Cholesky decomposition on
     g2e = ao2mo.restore(4, g2e, norb)
-    print(g2e)
     chol0 = modified_cholesky(g2e, cholesky_threshold)
     nchol = chol0.shape[0]
 
@@ -127,13 +125,13 @@ def prep_afqmc_mps(
     # We write an HDF5 file with the contents we require
     chol = chol.reshape((chol.shape[0], -1)) # flattens J,p,q into J,pq
     assert len(chol.shape) == 2
-    with h5py.File("FCIDUMP_chol_MPS", "w") as fh5:
+    with h5py.File("FCIDUMP_chol", "w") as fh5:
         fh5["header"] = np.array([n_elec, norb, spin, chol.shape[0]])
         fh5["hcore"] = h1e.flatten()
         fh5["chol"] = chol.flatten()
         fh5["energy_core"] = ecore
 
-    return ket # We keep the MPS in memory
+    return ket, driver 
 
 # prepare phaseless afqmc with mf trial
 def prep_afqmc(
