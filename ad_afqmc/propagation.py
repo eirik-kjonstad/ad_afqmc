@@ -202,7 +202,8 @@ class propagator_mps(propagator):
         e_estimate = jnp.array(jnp.sum(energy_samples) / self.n_walkers)
         prop_data["e_estimate"] = e_estimate
         prop_data["pop_control_ene_shift"] = e_estimate
-        prop_data["overlaps"] = trial.calc_overlap_vmap(prop_data["walkers"], wave_data)
+        #prop_data["overlaps"] = trial.calc_overlap_vmap(prop_data["walkers"], wave_data)
+        prop_data["overlaps"] = trial.calc_overlap(prop_data["walkers"], wave_data)
         return prop_data
 
     @partial(jit, static_argnums=(0,))

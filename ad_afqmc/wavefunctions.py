@@ -408,7 +408,16 @@ class mps(wave_function_restricted):
 
     @partial(jit, static_argnums=0)
     def calc_overlap(self, walker: Sequence, wave_data: Any = None) -> complex:
-        return jnp.linalg.det(walker[: walker.shape[1], :]) ** 2
+        # this should be <phi_T | phi>
+        # walker: sequence of MPSs (ket-s) -> phi
+        # self.ket -> phi_T
+        impo = self.dmrg_driver.get_identity_mpo()
+        overlaps = list()
+        for k in range(len(walker)):
+            expt = self.dmrg_driver.expectation(self.ket, impo, walker[k])
+            print(f"Overlap <phi_T|phi> for walker {k} is {expt}")
+            overlaps.append(expt)
+        return overlaps 
 
     @partial(jit, static_argnums=0)
     def calc_green(self, walker: Sequence, wave_data: Any = None) -> jnp.ndarray:
