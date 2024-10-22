@@ -235,7 +235,8 @@ def propagate_phaseless(ham, ham_data, propagator, prop_data, trial, wave_data):
     def _sr_block_scan_wrapper(x, y):
         return _sr_block_scan(x, y, ham_data, propagator, trial, wave_data)
 
-    prop_data["overlaps"] = trial.calc_overlap_vmap(prop_data["walkers"], wave_data)
+    #prop_data["overlaps"] = trial.calc_overlap_vmap(prop_data["walkers"], wave_data)
+    prop_data["overlaps"] = trial.calc_overlap(prop_data["walkers"], wave_data)
     prop_data["n_killed_walkers"] = 0
     prop_data["pop_control_ene_shift"] = prop_data["e_estimate"]
     prop_data, (block_energy, block_weight) = lax.scan(

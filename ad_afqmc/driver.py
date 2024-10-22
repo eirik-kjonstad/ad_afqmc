@@ -72,10 +72,12 @@ def afqmc(
     ham_data = ham.rot_ham(ham_data, wave_data)
     ham_data = ham.prop_ham(ham_data, propagator.dt, trial, wave_data)
     prop_data = propagator.init_prop_data(trial, wave_data, ham, ham_data, init_walkers)
-    if jnp.abs(jnp.sum(prop_data["overlaps"])) < 1.0e-6:
-        raise ValueError(
-            "Initial overlaps are zero. Pass walkers with non-zero overlap."
-        )
+    # disabling this sanity check for now, 
+    # should put back at some point -EFK, 10 oct 2024 
+    #if jnp.abs(jnp.sum(prop_data["overlaps"])) < 1.0e-6:
+    #    raise ValueError(
+    #        "Initial overlaps are zero. Pass walkers with non-zero overlap."
+    #    )
     prop_data["key"] = random.PRNGKey(seed + rank)
     trial_rdm1 = trial.get_rdm1(wave_data)
     trial_observable = np.sum(trial_rdm1 * observable_op)

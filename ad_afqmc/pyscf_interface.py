@@ -68,8 +68,12 @@ def prep_afqmc_mps(
     # and a full CAS space, so this is the full MO basis
     ncas, n_elec, spin, ecore, h1e, g2e, orb_sym = itg.get_rhf_integrals(mf, ncore=0, ncas=None, g2e_symm=1)
 
+    print(np.shape(h1e))
+    print(np.shape(g2e))
+    #exit(0)
+
     # Run DMRG with bond dimension 1
-    driver = DMRGDriver(scratch="./tmp", symm_type=SymmetryTypes.SU2, n_threads=1)
+    driver = DMRGDriver(scratch="./tmp", symm_type=SymmetryTypes.CPX | SymmetryTypes.SU2, n_threads=1)
     driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin, orb_sym=orb_sym)
 
     mpo = driver.get_qc_mpo(h1e=h1e, g2e=g2e, ecore=ecore, iprint=1)
@@ -78,14 +82,13 @@ def prep_afqmc_mps(
         thrds=thrds, iprint=1)
     print('DMRG energy = %20.15f' % energy)
 
-    pdm1 = driver.get_1pdm(ket)
-    pdm2 = driver.get_2pdm(ket).transpose(0, 3, 1, 2)
-    print('Energy from pdms = %20.15f' % (np.einsum('ij,ij->', pdm1, h1e)
-        + 0.5 * np.einsum('ijkl,ijkl->', pdm2, driver.unpack_g2e(g2e)) + ecore))
+    #pdm1 = driver.get_1pdm(ket)
+    #pdm2 = driver.get_2pdm(ket).transpose(0, 3, 1, 2)
+    #print(f"Energy from pdms = {np.einsum('ij,ij->', pdm1, h1e) + 0.5 * np.einsum('ijkl,ijkl->', pdm2, driver.unpack_g2e(g2e)) + ecore}")
 
     impo = driver.get_identity_mpo()
     expt = driver.expectation(ket, mpo, ket) / driver.expectation(ket, impo, ket)
-    print('Energy from expectation = %20.15f' % expt)
+    print(f"Energy from expectation = {expt}")
 
     # Cholesky decompose integrals
     norb = np.size(h1e,0)

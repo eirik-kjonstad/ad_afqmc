@@ -417,6 +417,7 @@ class mps(wave_function_restricted):
             expt = self.dmrg_driver.expectation(self.ket, impo, walker[k])
             print(f"Overlap <phi_T|phi> for walker {k} is {expt}")
             overlaps.append(expt)
+        overlaps = np.array(overlaps)
         return overlaps 
 
     @partial(jit, static_argnums=0)
@@ -438,11 +439,41 @@ class mps(wave_function_restricted):
     def calc_force_bias(
         self, walker: Sequence, ham_data: dict, wave_data: Any = None
     ) -> jnp.ndarray:
-        green_walker = self.calc_green(walker, wave_data)
-        fb = 2.0 * jnp.einsum(
-            "gij,ij->g", ham_data["rot_chol"], green_walker, optimize="optimal"
-        )
-        return fb
+
+        from pyscf import ao2mo
+        
+        fbs = list()
+        impo = self.dmrg_driver.get_identity_mpo()
+        for k in range(len(walker)):
+            # Get g^gamma = <phi_T | G^gamma | phi > for the given walker
+            fb = np.zeros(np.size(ham_data["chol"],0))
+            n_chol = np.size(ham_data["chol"],0)
+            for j in range(n_chol):
+                n_mo = int(np.sqrt(np.size(ham_data["chol"],1)))
+                print(f"n mos: {n_mo}")
+                h1e = np.array(ham_data["chol"][j,:].reshape(n_mo,n_mo))
+                g2e = np.zeros((n_mo,n_mo,n_mo,n_mo))
+                print(np.shape(h1e))
+                print(np.shape(g2e))
+                mpo = self.dmrg_driver.get_qc_mpo(h1e=h1e, g2e=g2e, ecore=0.0, iprint=1)
+                print(f"For chol vector {j} we got mpo {mpo}")
+                fb[j] = np.real(self.dmrg_driver.expectation(self.ket, mpo, walker[k]) / self.dmrg_driver.expectation(self.ket, impo, walker[k]))
+                #exit(0)
+            print(f"force bias walker {k}")
+            print(fb)
+            fbs.append(fb)
+                
+            #green_walker = self.dmrg_driver.get_1pdm(walker[k])
+            #print(f"Green walker {k} is {green_walker}")
+            # replace rot chol by chol because rot chol cuts out the non-occupied orbitals
+            # - is this correct - double check!
+            #fb = 2.0 * np.einsum(
+            #    "gij,ij->g", ham_data["chol"], green_walker, optimize="optimal"
+            #)
+            #print(f"Force bias for walker {k} is {fb[:3]}")            
+        fbs = np.array(fbs) # convert into array for use later on
+        print(fbs)
+        return fbs
 
     #@partial(jit, static_argnums=0)
     def calc_energy(self, walker: Sequence, ham_data: dict, wave_data: Any = None):
@@ -475,7 +506,7 @@ class mps(wave_function_restricted):
         for k in range(len(walker)):
             walker_energy = np.einsum('ij,ij->', green_walker[0], h1e) + 0.5 * np.einsum('ijkl,ijkl->', pdm2[0], self.dmrg_driver.unpack_g2e(g2e)) + h0
             print(f'Walker {k} energy from PDMs = {walker_energy}')
-            energy[k] = walker_energy
+            energy[k] = np.real(walker_energy)
 
         return energy 
 

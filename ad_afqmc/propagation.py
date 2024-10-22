@@ -101,6 +101,12 @@ class propagator:
         vhs = (
             1.0j
             * jnp.sqrt(self.dt)
+            # i thought fields had n-prop-step but that is not what the caller says
+            # fields = [n_walkers, n_chol]
+            # ham["chol"] = [n_chol, n_mo, n_mo]
+            # walkers = [n_walkers, n_mo, n_elec]
+            # => result is this [n_walkers, n_mo, n_mo]
+            # i.e. for each walker, we oij
             * fields.dot(ham["chol"]).reshape(
                 walkers.shape[0], walkers.shape[1], walkers.shape[1]
             )
@@ -253,6 +259,9 @@ class propagator_mps(propagator):
 
     @partial(jit, static_argnums=(0,))
     def apply_propagator_vmap(self, ham, walkers, fields):
+        # exp(i sqrt(dt) x.L) hwere L is the Cholesky vector
+        # x.L.reshape 
+        # x^gamma L^gamma_pq -> how is this dot performed?
         vhs = (
             1.0j
             * jnp.sqrt(self.dt)
@@ -282,7 +291,7 @@ class propagator_mps(propagator):
 
     @partial(jit, static_argnums=(0, 1))
     def propagate(self, trial, ham, prop, fields, wave_data):
-        force_bias = trial.calc_force_bias_vmap(prop["walkers"], ham, wave_data)
+        force_bias = trial.calc_force_bias(prop["walkers"], ham, wave_data)
         field_shifts = -jnp.sqrt(self.dt) * (1.0j * force_bias - ham["mf_shifts"])
         shifted_fields = fields - field_shifts
         shift_term = jnp.sum(shifted_fields * ham["mf_shifts"], axis=1)
@@ -290,11 +299,34 @@ class propagator_mps(propagator):
             fields * field_shifts - field_shifts * field_shifts / 2.0, axis=1
         )
 
-        prop["walkers"] = self.apply_propagator_vmap(
-            ham, prop["walkers"], shifted_fields
+        # fields = [n_walkers, n_chol]
+        # ham["chol"] = [n_chol, n_mo, n_mo]
+        # walkers = [n_walkers, n_mo, n_elec]
+        # => result is this [n_walkers, n_mo, n_mo]
+        vhs = (
+            jnp.sqrt(self.dt)
+            * fields.dot(ham["chol"]).reshape(
+                len(prop["walkers"]), ham["h1"].shape[0], ham["h1"].shape[0]
+            )
         )
 
-        overlaps_new = trial.calc_overlap_vmap(prop["walkers"], wave_data)
+        # now we need to apply the operators:
+        # | walker > = exp(h1) exp(vhs) exp(h1) | walker >
+        import numpy as np
+        n_mo = ham["h1"].shape[0]
+        g2e = np.zeros((n_mo,n_mo,n_mo,n_mo))
+        h1e = np.array(ham["h1"])
+        h1 = trial.dmrg_driver.get_qc_mpo(h1e=h1e, g2e=g2e, ecore=0.0, iprint=1)
+        for k in range(len(prop["walkers"])):
+            prop["walkers"][k] = trial.dmrg_driver.td_dmrg(mpo=h1, ket=prop["walkers"][k], delta_t=self.dt/2., n_steps=1, final_mps_tag=prop["walkers"][k].info.tag)
+            vhs_array = np.array(vhs[k,:,:])
+            delta_t_imag = 1.0j
+            vhs_op = trial.dmrg_driver.get_qc_mpo(h1e=vhs_array, g2e=g2e, ecore=0.0, iprint=1)
+            prop["walkers"][k] = trial.dmrg_driver.td_dmrg(mpo=vhs_op, ket=prop["walkers"][k], delta_t=delta_t_imag, n_steps=1,final_mps_tag=prop["walkers"][k].info.tag)
+            prop["walkers"][k] = trial.dmrg_driver.td_dmrg(mpo=h1, ket=prop["walkers"][k], delta_t=self.dt/2., n_steps=1,final_mps_tag=prop["walkers"][k].info.tag)
+
+        overlaps_new = trial.calc_overlap(prop["walkers"], wave_data)
+
         imp_fun, theta = self.calc_imp_fun(
             -jnp.sqrt(self.dt) * shift_term
             + fb_term
