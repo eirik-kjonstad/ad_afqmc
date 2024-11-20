@@ -127,7 +127,7 @@ def prep_afqmc(
         chol0 = modified_cholesky(eri, chol_cut)
         nchol = chol0.shape[0]
         chol = np.zeros((nchol, norb, norb))
-        for i in range(nchol):
+        for i in range(nchol): # trying to get h1!
             for m in range(norb):
                 for n in range(m + 1):
                     triind = m * (m + 1) // 2 + n
@@ -147,6 +147,8 @@ def prep_afqmc(
             mol, mf.get_hcore(), basis_coeff, chol_cut, DFbas=DFbas
         )
         nbasis = h1e.shape[-1]
+        print("setting 2e part of hamiltonian to zero!")
+        chol = np.zeros_like(chol) # trying to set 2e part to zero
         nelec = mol.nelec
 
         if norb_frozen > 0:
