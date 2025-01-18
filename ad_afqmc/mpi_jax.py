@@ -135,8 +135,20 @@ def _prep_afqmc(options=None):
             trial_wave_data = {"ci1": ci1, "ci2": ci2}
             wave_data.update(trial_wave_data)
             trial = wavefunctions.cisd(norb, nelec_sp, n_batch=options["n_batch"])
+            #trial = wavefunctions.CISD(norb, nelec_sp, n_batch=options["n_batch"])
         except:
             raise ValueError("Trial specified as cisd, but amplitudes.npz not found.")
+    elif options["trial"] == "cisdt":
+        try:
+            amplitudes = np.load("amplitudes.npz")
+            ci1 = jnp.array(amplitudes["ci1"])
+            ci2 = jnp.array(amplitudes["ci2"])
+            ci3 = jnp.array(amplitudes["ci3"])
+            trial_wave_data = {"ci1": ci1, "ci2": ci2, "ci3": ci3}
+            wave_data.update(trial_wave_data)
+            trial = wavefunctions.CISDT(norb, nelec_sp, n_batch=options["n_batch"])
+        except:
+            raise ValueError("Trial specified as cisdt, but amplitudes.npz not found.")
     elif options["trial"] == "ucisd":
         try:
             amplitudes = np.load("amplitudes.npz")

@@ -53,7 +53,7 @@ def prep_afqmc(
     mf_or_cc: Union[scf.uhf.UHF, scf.rhf.RHF, CCSD, UCCSD],
     basis_coeff: Optional[np.ndarray] = None,
     norb_frozen: int = 0,
-    chol_cut: float = 1e-5,
+    chol_cut: float = 1e-8,
     integrals: Optional[dict] = None,
 ):
     """Prepare AFQMC calculation with mean field trial wavefunction. Writes integrals and mo coefficients to disk.

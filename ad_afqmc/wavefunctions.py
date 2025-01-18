@@ -1871,6 +1871,48 @@ class CISD(wave_function_auto):
 
 
 @dataclass
+class CISDT(wave_function_auto):
+    """This class contains functions for the CISDT wavefunction
+    |0> + c(ia) |ia> + c(ia jb) |ia jb> + c(ia jb kc)
+
+    . The wave_data need to store the coefficient C(ia), C(ia jb), and C(ia jb kc)
+    """
+
+    norb: int
+    nelec: Tuple[int, int]
+    eps: float = 1.0e-4  # finite difference step size in local energy calculations
+    n_batch: int = 1
+
+    @partial(jit, static_argnums=0)
+    def _calc_green_restricted(self, walker: jax.Array) -> jax.Array:
+        return (walker.dot(jnp.linalg.inv(walker[: walker.shape[1], :]))).T
+
+    @partial(jit, static_argnums=0)
+    def _calc_overlap_restricted(self, walker: jax.Array, wave_data: dict) -> complex:
+        nocc, ci1, ci2, ci3 = walker.shape[1], wave_data["ci1"], wave_data["ci2"], wave_data["ci3"]
+        GF = self._calc_green_restricted(walker)
+        o0 = jnp.linalg.det(walker[: walker.shape[1], :]) ** 2
+        o1 = jnp.einsum("ia,ia", ci1, GF[:, nocc:])
+        o2 = 2 * jnp.einsum(
+            "iajb, ia, jb", ci2, GF[:, nocc:], GF[:, nocc:]
+        ) - jnp.einsum("iajb, ib, ja", ci2, GF[:, nocc:], GF[:, nocc:])
+
+        o3_1 = ( 6 * jnp.einsum("iajbkc, ia, jb, kc", ci3, GF[:, nocc:], GF[:, nocc:], GF[:, nocc:]) 
+            - 4 * jnp.einsum("iajbkc, ia, kb, jc", ci3, GF[:, nocc:], GF[:, nocc:], GF[:, nocc:]) )
+
+        o3_2 = (- 4 * jnp.einsum("iajbkc, ja, ib, kc", ci3, GF[:, nocc:], GF[:, nocc:], GF[:, nocc:]) 
+                + 2 * jnp.einsum("iajbkc, ja, kb, ic", ci3, GF[:, nocc:], GF[:, nocc:], GF[:, nocc:]) )
+
+        o3_3 = (2 * jnp.einsum("iajbkc, ka, ib, jc", ci3, GF[:, nocc:], GF[:, nocc:], GF[:, nocc:])  
+            - 4 * jnp.einsum("iajbkc, ka, jb, ic", ci3, GF[:, nocc:], GF[:, nocc:], GF[:, nocc:]) )
+
+        return (1.0 + 2 * o1 + o2 + (1/6) * (o3_1 + o3_2 + o3_3)) * o0
+
+    def __hash__(self) -> int:
+        return hash(tuple(self.__dict__.values()))
+
+
+@dataclass
 class UCISD(wave_function_auto):
     """This class contains functions for the CISD wavefunction
     |0> + c(ia) |ia> + c(ia jb) |ia jb>
