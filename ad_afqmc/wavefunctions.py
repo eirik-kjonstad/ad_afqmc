@@ -2805,7 +2805,18 @@ class ucisdt(wave_function):
             + 0.5 * jnp.einsum("iajb, ia, jb", ci2BB, green_b, green_b)
             + jnp.einsum("iajb, ia, jb", ci2AB, green_a, green_b)
         )
-        return (1.0 + o1 + o2) * o0
+
+        ci3AAA = wave_data["ci3AAA"]
+        ci3AAB = wave_data["ci3AAB"]
+        ci3ABB = wave_data["ci3ABB"]
+        ci3BBB = wave_data["ci3BBB"]
+
+        o3 = (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, GFA[:, noccA:], GFA[:, noccA:], GFA[:, noccA:])
+        o3 =+ (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, GFB[:, noccB:], GFB[:, noccB:], GFB[:, noccB:])
+        o3 =+ (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, GFA[:, noccA:], GFA[:, noccA:], GFB[:, noccB:])
+        o3 =+ (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, GFA[:, noccA:], GFB[:, noccB:], GFB[:, noccB:])        
+
+        return (1.0 + o1 + o2 + o3) * o0
 
     @partial(jit, static_argnums=0)
     def _calc_force_bias(
