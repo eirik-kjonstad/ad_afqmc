@@ -419,7 +419,7 @@ def ao2mo_chol_copy(eri, C):
     return eri_copy
 
 
-def chunked_cholesky(mol, max_error=1e-6, verbose=False, cmax=10):
+def chunked_cholesky(mol, max_error=1e-6, verbose=False, cmax=100):
     """Modified cholesky decomposition from pyscf eris.
 
     See, e.g. [Motta17]_
