@@ -2811,10 +2811,10 @@ class ucisdt(wave_function):
         ci3ABB = wave_data["ci3ABB"]
         ci3BBB = wave_data["ci3BBB"]
 
-        o3 = (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, GFA[:, noccA:], GFA[:, noccA:], GFA[:, noccA:])
-        o3 =+ (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, GFB[:, noccB:], GFB[:, noccB:], GFB[:, noccB:])
-        o3 =+ (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, GFA[:, noccA:], GFA[:, noccA:], GFB[:, noccB:])
-        o3 =+ (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, GFA[:, noccA:], GFB[:, noccB:], GFB[:, noccB:])        
+        o3 = (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_a, green_a, green_a)
+        o3 =+ (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, green_b, green_b, green_b)
+        o3 =+ (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_a, green_a, green_b)
+        o3 =+ (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_a, green_b, green_b)  
 
         return (1.0 + o1 + o2 + o3) * o0
 
@@ -2885,7 +2885,77 @@ class ucisdt(wave_function):
         overlap_2 = gci2g
         overlap = 1.0 + overlap_1 + overlap_2
 
-        return (fb_0 + fb_1 + fb_2) / overlap
+        fb_3 = self.calc_force_bias_triples(wave_data, green_a, green_b, chol_a, chol_b)
+
+        return (fb_0 + fb_1 + fb_2 + fb_3) / overlap
+
+    def calc_force_bias_triples(self, wave_data, Ga, Gb, La, Lb):
+        #
+        # Ga and Gb: green's functions for a and b spin
+        # Dimensions (n_occ,n_mo) because first index is zero if virtual
+        #
+        # La and Lb: cholesky vector in a and b bases
+        # Dimensions are (n_chol,n_mo,n_mo)
+
+        print("ciao")
+        n_o_a = self.nelec[0]
+        n_o_b = self.nelec[1]
+        
+        Go_a = Ga[:, n_o_a:].copy()
+        Go_b = Gb[:, n_o_b:].copy()
+
+        Gp_a = jnp.vstack((Go_a, -jnp.eye(self.norb - n_o_a)))
+        Gp_b = jnp.vstack((Go_b, -jnp.eye(self.norb - n_o_b)))
+
+        Lo_a = La[:, :n_o_a, :] # (gamma,i,j) restricts i to occupied, j is free 
+        Lo_b = Lb[:, :n_o_b, :] # (gamma,i,j) restricts i to occupied, j is free 
+
+        Caaa = wave_data["ci3AAA"]
+        Caab = wave_data["ci3AAB"]
+        Cabb = wave_data["ci3ABB"]
+        Cbbb = wave_data["ci3BBB"]
+
+        # Let's make some intermediates
+        #
+        # X = (La)_gij (Ga)_gij + (Lb)_gij (Gb)_gij
+        #
+        Xa = jnp.einsum("gij,ij->g", Lo_a, Ga)
+        Xb = jnp.einsum("gij,ij->g", Lo_b, Gb)
+
+        X = Xa + Xb
+
+        # (Ys)_gpt = (Gs)_pj (Ls)_gij (Gps)_it
+        Ya = jnp.einsum("pj,gij,it->gpt", Ga, La, Gp_a) 
+        Yb = jnp.einsum("pj,gij,it->gpt", Gb, Lb, Gp_b) 
+
+        # (CGGs)_pt = C_ptqurs (Gs)_qu (Gs)_rs
+        CGGa = jnp.einsum("ptqurs,qu,rs->pt", Caaa, Go_a, Go_a)
+        CGGb = jnp.einsum("ptqurs,qu,rs->pt", Cbbb, Go_b, Go_b)
+
+        CGGGa = jnp.einsum("pt,pt->", CGGa, Go_a)
+        CGGGb = jnp.einsum("pt,pt->", CGGb, Go_b)
+
+        fb_aaa = (1/6) * CGGGa * Xa - (1/2) * jnp.einsum("pt,gpt->g", CGGa, Ya)
+        fb_bbb = (1/6) * CGGGb * Xb - (1/2) * jnp.einsum("pt,gpt->g", CGGb, Yb)
+
+        CaabGaGaGb = jnp.einsum("ptqurs,pt,qu,rs->", Caab, Go_a, Go_a, Go_b)
+        CaabGaGb = jnp.einsum("ptqurs,qu,rs->pt", Caab, Go_a, Go_b)
+
+        GaGaCaab = jnp.einsum("pt,qu,ptqurs->rs", Go_a, Go_a, Caab)
+
+        fb_aab = ( (1/2) * CaabGaGaGb * X - jnp.einsum("gpt,pt->g", Ya, CaabGaGb)
+                    - (1/2) * jnp.einsum("grs,rs->g", Yb, GaGaCaab) )
+
+        CabbGaGbGb = jnp.einsum("ptqurs,pt,qu,rs->", Cabb, Go_a, Go_b, Go_b)
+
+        GaCabbGb = jnp.einsum("pt,ptqurs,rs->qu", Go_a, Cabb, Go_b)
+
+        CabbGbGb = jnp.einsum("ptqurs,qu,rs->pt", Cabb, Go_b, Go_b)
+
+        fb_abb = ( (1/2) * CabbGaGbGb * X  - jnp.einsum("gqu,qu->g", Yb, GaCabbGb) 
+                    - (1/2) * jnp.einsum("gpt,pt->g", Ya, CabbGbGb) )
+
+        return fb_aaa + fb_bbb + fb_abb + fb_aab
 
     @partial(jit, static_argnums=0)
     def _calc_energy(
