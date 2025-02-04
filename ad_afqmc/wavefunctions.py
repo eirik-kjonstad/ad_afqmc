@@ -3149,6 +3149,16 @@ class ucisdt(wave_function):
         overlap_1 = ci1g  # jnp.einsum("ia,ia", ci1, green_occ)
         overlap_2 = gci2g
         overlap = 1.0 + overlap_1 + overlap_2
+
+        # triples
+        # we reuse force bias routine to calculate one-electron energy 
+        e3_1 = self.calc_force_bias_triples(wave_data, green_a, green_b, 
+            h1_a.reshape(1,self.norb,self.norb), h1_b.reshape(1,self.norb,self.norb))
+
+        e3 = e3_1 #+ e3_2
+
+        #print(f"one electron triples energy: {e3}")
+
         return (e1 + e2) / overlap + e0
 
     @partial(jit, static_argnums=0)
