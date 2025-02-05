@@ -2896,8 +2896,6 @@ class ucisdt(wave_function):
         #
         # La and Lb: cholesky vector in a and b bases
         # Dimensions are (n_chol,n_mo,n_mo)
-
-        print("ciao")
         n_o_a = self.nelec[0]
         n_o_b = self.nelec[1]
         
@@ -3157,9 +3155,177 @@ class ucisdt(wave_function):
 
         e3 = e3_1 #+ e3_2
 
-        #print(f"one electron triples energy: {e3}")
+        e3_2 = self.calc_2e_energy_triples(wave_data, green_a, green_b, chol_a, chol_b)
 
         return (e1 + e2) / overlap + e0
+
+    @partial(jit, static_argnums=0)
+    def calc_2e_energy_triples(self, wave_data, Ga, Gb, La, Lb):
+        #
+        # Ga and Gb: green's functions for a and b spin
+        # Dimensions (n_occ,n_mo) because first index is zero if virtual
+        #
+        # La and Lb: cholesky vector in a and b bases
+        # Dimensions are (n_chol,n_mo,n_mo)
+        n_o_a = self.nelec[0]
+        n_o_b = self.nelec[1]
+        
+        Go_a = Ga[:, n_o_a:].copy()
+        Go_b = Gb[:, n_o_b:].copy()
+
+        Gp_a = jnp.vstack((Go_a, -jnp.eye(self.norb - n_o_a)))
+        Gp_b = jnp.vstack((Go_b, -jnp.eye(self.norb - n_o_b)))
+
+        Lo_a = La[:, :n_o_a, :] # (gamma,i,j) restricts i to occupied, j is free 
+        Lo_b = Lb[:, :n_o_b, :] # (gamma,i,j) restricts i to occupied, j is free 
+
+        Caaa = wave_data["ci3AAA"]
+        Caab = wave_data["ci3AAB"]
+        Cabb = wave_data["ci3ABB"]
+        Cbbb = wave_data["ci3BBB"]
+
+        # Let's make some intermediates
+        #
+        # X = (La)_gij (Ga)_gij + (Lb)_gij (Gb)_gij
+        #
+        Xa = jnp.einsum("gij,ij->g", Lo_a, Ga)
+        Xb = jnp.einsum("gij,ij->g", Lo_b, Gb)
+
+        X = Xa + Xb
+
+        # (Ys)_gpt = (Gs)_pj (Ls)_gij (Gps)_it
+        Ya = jnp.einsum("pj,gij,it->gpt", Ga, La, Gp_a) 
+        Yb = jnp.einsum("pj,gij,it->gpt", Gb, Lb, Gp_b) 
+
+        # aaa & bbb
+        # 1. 
+        X2 = jnp.einsum("g,g->", X, X)
+
+        CaaaGa = jnp.einsum("ptqurs,rs->ptqu", Caaa, Go_a) 
+        CaaaGaGa = jnp.einsum("ptqurs,qu,rs->pt", Caaa, Go_a, Go_a) 
+        CaaaGaGaGa = jnp.einsum("pt,pt->", CaaaGaGa, Go_a)
+
+        CbbbGb = jnp.einsum("ptqurs,rs->ptqu", Cbbb, Go_b) 
+        CbbbGbGb = jnp.einsum("ptqurs,qu,rs->pt", Cbbb, Go_b, Go_b) 
+        CbbbGbGbGb = jnp.einsum("pt,pt->", CbbbGbGb, Go_b)
+
+        Eaaa1 = ( (1/12) * X2 * CaaaGaGaGa 
+            - (1/4) * jnp.einsum("g,gpt,pt->", X, Ya, CaaaGaGa) )
+
+        Ebbb1 = ( (1/12) * X2 * CbbbGbGbGb 
+            - (1/4) * jnp.einsum("g,gpt,pt->", X, Yb, CbbbGbGb) )
+
+        # 2.
+        GaLaGa = jnp.einsum("il,gij,kj->gkl", Ga, Lo_a, Ga)
+        GbLbGb = jnp.einsum("il,gij,kj->gkl", Gb, Lo_b, Gb)
+        
+        LaGaLaGa = jnp.einsum("gkl,gkl->", GaLaGa, Lo_a)
+        LbGbLbGb = jnp.einsum("gkl,gkl->", GbLbGb, Lo_b)
+
+        LGLG = LaGaLaGa + LbGbLbGb
+
+        # (GaLaGa)_gpl La_gkl Gpa_kt
+
+        GaLaGaLa = jnp.einsum("gpl,gkl->pk", GaLaGa, La)
+        GaLaGaLaGpa = jnp.einsum("pk,kt->pt", GaLaGaLa, Gp_a)
+
+        Eaaa2 = ( -(1/12) * CaaaGaGaGa * LGLG 
+                  +(1/4) * jnp.einsum("pt,pt->", GaLaGaLaGpa, CaaaGaGa) )
+
+        GbLbGbLb = jnp.einsum("gpl,gkl->pk", GbLbGb, Lb)
+        GbLbGbLbGpb = jnp.einsum("pk,kt->pt", GbLbGbLb, Gp_b)
+
+        Ebbb2 = ( -(1/12) * CbbbGbGbGb * LGLG 
+                  +(1/4) * jnp.einsum("pt,pt->", GbLbGbLbGpb, CbbbGbGb) )
+
+        # 3. 
+        LaGpa = jnp.einsum("gij,it->gjt", La, Gp_a)
+        LaGpa_GaLaGa = jnp.einsum("gjt,gpj->pt", LaGpa, GaLaGa)
+
+        YaYa = jnp.einsum("gpt,gqu->ptqu", Ya, Ya)
+
+        Eaaa3 = ( (1/4) * jnp.einsum("pt,pt->", LaGpa_GaLaGa, CaaaGaGa)
+                    + (1/2) * jnp.einsum("ptqu,ptqu", YaYa, CaaaGa)
+                    - (1/4) * jnp.einsum("gpt,pt,g->", Ya, CaaaGaGa, X) )
+
+        LbGpb = jnp.einsum("gij,it->gjt", Lb, Gp_b)
+        LbGpb_GbLbGb = jnp.einsum("gjt,gpj->pt", LbGpb, GbLbGb)
+
+        YbYb = jnp.einsum("gpt,gqu->ptqu", Yb, Yb)
+
+        Ebbb3 = ( (1/4) * jnp.einsum("pt,pt->", LbGpb_GbLbGb, CbbbGbGb)
+                    + (1/2) * jnp.einsum("ptqu,ptqu", YbYb, CbbbGb)
+                    - (1/4) * jnp.einsum("gpt,pt,g->", Yb, CbbbGbGb, X) )
+
+        Eaaa = Eaaa1 + Eaaa2 + Eaaa3
+        Ebbb = Ebbb1 + Ebbb2 + Ebbb3
+
+        # aab
+        # 1
+        CaabGaGb = jnp.einsum("ptqurs,qu,rs->pt", Caab, Go_a, Go_b)
+        CaabGaGaGb = jnp.einsum("pt,pt->", Go_a, CaabGaGb)
+        GaGaCaab = jnp.einsum("pt,qu,ptqurs->rs", Go_a, Go_a, Caab)
+
+        GaGaCaab = jnp.einsum("pt,qu,ptqurs->rs", Go_a, Go_a, Caab)
+
+        Eaab1 = ( (1/4) * X2 * CaabGaGaGb
+                    -(1/2) * jnp.einsum("pt,g,gpt->", CaabGaGb, X, Ya) 
+                    -(1/4) * jnp.einsum("g,grs,rs->", X, Yb, GaGaCaab) )
+
+        # 2
+        Eaab2 = ( -(1/4) * LGLG *  CaabGaGaGb 
+                    +(1/2) * jnp.einsum("gij,pj,git,pt->", Lo_a, Ga, Ya, CaabGaGb) 
+                    -(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab) )
+
+        CaabGb = jnp.einsum("ptqurs,rs->ptqu", Caab, Go_b)
+
+        GaCaab = jnp.einsum("pt,ptqurs->qurs", Go_a, Caab)
+
+        # 3 (note: 4=3, so multiplied by 2)
+        Eaab3 = ( (1/2) * jnp.einsum("gkt,gkl,pl,pt->", Ya, Lo_a, Ga, CaabGaGb) 
+                    -(1/2) * jnp.einsum("g,gpt,pt->", X, Ya, CaabGaGb) 
+                    +(1/2) * jnp.einsum("gpt,gqu,ptqu", Ya, Ya, CaabGb) 
+                    +(1/2) * jnp.einsum("gpt,grs,ptrs->", Ya, Yb, GaCaab) )
+
+        # 5
+        Eaab5 = ( (1/4) * jnp.einsum("gks,gkl,rl,rs->", Yb, Lo_b, Gb, GaGaCaab) 
+                    -(1/4) * jnp.einsum("g,grs,rs->", X, Yb, GaGaCaab) 
+                    +(1/2) * jnp.einsum("grs,gpt,ptrs->", Yb, Ya, GaCaab) )
+
+        Eaab = Eaab1 + Eaab2 + Eaab3 + Eaab5
+
+        # abb
+        CabbGb = jnp.einsum("ptqurs,rs->ptqu", Cabb, Go_b)
+        CabbGbGb = jnp.einsum("ptqu,qu->pt", CabbGb, Go_b)
+        CabbGaGbGb = jnp.einsum("pt,pt->", CabbGbGb, Go_a)
+
+        GaCabbGb = jnp.einsum("pt,ptqurs,rs->qu", Go_a, Cabb, Go_b)
+
+        Eabb1 = ( (1/4) * X2 * CabbGaGbGb 
+                    -(1/4) * jnp.einsum("g,pt,gpt->", X, CabbGbGb, Ya) 
+                    -(1/2) * jnp.einsum("g,qu,gqu->", X, GaCabbGb, Yb) )
+
+        Eabb2 = ( -(1/4) * CabbGaGbGb * LGLG 
+                    +(1/4) * jnp.einsum("pt,git,pj,gij->", CabbGbGb, Ya, Ga, Lo_a) 
+                    +(1/2) * jnp.einsum("qu,giu,gij,qj->", GaCabbGb, Yb, Lo_b, Gb) )
+
+        Eabb3 = ( (1/4) * jnp.einsum("gkt,pt,gkl,pl->", Ya, CabbGbGb, Lo_a, Ga) 
+                    -(1/4) * jnp.einsum("g,pt,gpt->", X, CabbGbGb, Ya) 
+                    +(1/2) * jnp.einsum("ptqu,gpt,gqu->", CabbGb, Ya, Yb) )
+
+        GaCabb = jnp.einsum("pt,ptqurs->qurs", Go_a, Cabb)
+
+        # 4, 4=5 so multiplied by 2
+        Eabb4 = ( (1/2) * jnp.einsum("qu,gku,gkl,ql->", GaCabbGb, Yb, Lo_b, Gb) 
+                    -(1/2) * jnp.einsum("g,gqu,qu->", X, Yb, GaCabbGb) 
+                    +(1/2) * jnp.einsum("ptqu,gqu,gpt->", CabbGb, Yb, Ya) 
+                    +(1/2) * jnp.einsum("qurs,gqu,grs->", GaCabb, Yb, Yb) )
+
+        Eabb = Eabb1 + Eabb2 + Eabb3 + Eabb4
+
+        E = Eaaa + Ebbb + Eaab + Eabb
+
+        return E
 
     @partial(jit, static_argnums=0)
     def _build_measurement_intermediates(self, ham_data: dict, wave_data: dict) -> dict:
