@@ -196,9 +196,9 @@ def _prep_afqmc(options=None):
             }
             wave_data.update(trial_wave_data)
             # autograd impl
-            #trial = wavefunctions.UCISDT(norb, nelec_sp, n_batch=options["n_batch"])
+            trial = wavefunctions.UCISDT(norb, nelec_sp, n_batch=options["n_batch"])
             # manual impl
-            trial = wavefunctions.ucisdt(norb, nelec_sp, n_batch=options["n_batch"])
+            #trial = wavefunctions.ucisdt(norb, nelec_sp, n_batch=options["n_batch"])
         except:
             raise ValueError("Trial specified as ucisdt, but amplitudes.npz not found.")
     else:

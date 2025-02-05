@@ -1629,6 +1629,17 @@ class wave_function_auto(wave_function):
             ham_data["normal_ordering_term"],
         )
 
+        # EFK hack
+        x = 0.0
+        # one body without normal ordering term
+        f1 = lambda a: self._overlap_with_single_rot(
+            a, h1, walker_up, walker_dn, wave_data
+        )
+        val1, dx1 = jvp(f1, [x], [1.0])
+        oneb_wo_no=dx1/val1
+        print(f"One-body energy wo n.o. term: {oneb_wo_no}")
+        # EFK hack
+
         x = 0.0
         # one body
         f1 = lambda a: self._overlap_with_single_rot(
@@ -1670,6 +1681,11 @@ class wave_function_auto(wave_function):
         #     / eps
         #     / eps
         # )
+
+        print(f"Zero-body: {h0}")
+        print(f"One-body energy: {dx1/val1}")
+        print(f"Two-body energy: {(jnp.sum(d_2_overlap) / 2.0) / val1}")
+        print(f"Two-body energy w n.o. term: {(jnp.sum(d_2_overlap) / 2.0) / val1 + dx1/val1-oneb_wo_no}")
 
         return (dx1 + jnp.sum(d_2_overlap) / 2.0) / val1 + h0
 
@@ -1977,10 +1993,10 @@ class UCISDT(wave_function_auto):
 
         # triples parts 
 
-        o3 = (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, GFA[:, noccA:], GFA[:, noccA:], GFA[:, noccA:])
-        o3 =+ (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, GFB[:, noccB:], GFB[:, noccB:], GFB[:, noccB:])
-        o3 =+ (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, GFA[:, noccA:], GFA[:, noccA:], GFB[:, noccB:])
-        o3 =+ (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, GFA[:, noccA:], GFB[:, noccB:], GFB[:, noccB:])
+        o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, GFA[:, noccA:], GFA[:, noccA:], GFA[:, noccA:])
+              +(1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, GFB[:, noccB:], GFB[:, noccB:], GFB[:, noccB:])
+              +(1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, GFA[:, noccA:], GFA[:, noccA:], GFB[:, noccB:])
+              +(1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, GFA[:, noccA:], GFB[:, noccB:], GFB[:, noccB:]))
 
         return (1.0 + o1 + o2 + o3) * o0
 
@@ -2745,6 +2761,11 @@ class ucisd(wave_function):
         overlap_1 = ci1g  # jnp.einsum("ia,ia", ci1, green_occ)
         overlap_2 = gci2g
         overlap = 1.0 + overlap_1 + overlap_2
+
+        print(f"Zero-body: {e0}")
+        print(f"One-body energy: {e1/overlap}")
+        print(f"Two-body energy: {e2/overlap}")
+
         return (e1 + e2) / overlap + e0
 
     @partial(jit, static_argnums=0)
@@ -2811,10 +2832,10 @@ class ucisdt(wave_function):
         ci3ABB = wave_data["ci3ABB"]
         ci3BBB = wave_data["ci3BBB"]
 
-        o3 = (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_a, green_a, green_a)
-        o3 =+ (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, green_b, green_b, green_b)
-        o3 =+ (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_a, green_a, green_b)
-        o3 =+ (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_a, green_b, green_b)  
+        o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_a, green_a, green_a)
+             + (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, green_b, green_b, green_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_a, green_a, green_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_a, green_b, green_b) ) 
 
         return (1.0 + o1 + o2 + o3) * o0
 
@@ -2885,6 +2906,20 @@ class ucisdt(wave_function):
         overlap_2 = gci2g
         overlap = 1.0 + overlap_1 + overlap_2
 
+        ci3AAA = wave_data["ci3AAA"]
+        ci3AAB = wave_data["ci3AAB"]
+        ci3ABB = wave_data["ci3ABB"]
+        ci3BBB = wave_data["ci3BBB"]
+
+        o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_occ_a, green_occ_a, green_occ_a)
+             + (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, green_occ_b, green_occ_b, green_occ_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_occ_a, green_occ_a, green_occ_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_occ_a, green_occ_b, green_occ_b) )
+
+        #print(f"triples ovlp: {o3}")
+
+        overlap = overlap + o3  # triples term in overlap
+
         fb_3 = self.calc_force_bias_triples(wave_data, green_a, green_b, chol_a, chol_b)
 
         return (fb_0 + fb_1 + fb_2 + fb_3) / overlap
@@ -2933,8 +2968,10 @@ class ucisdt(wave_function):
         CGGGa = jnp.einsum("pt,pt->", CGGa, Go_a)
         CGGGb = jnp.einsum("pt,pt->", CGGb, Go_b)
 
-        fb_aaa = (1/6) * CGGGa * Xa - (1/2) * jnp.einsum("pt,gpt->g", CGGa, Ya)
-        fb_bbb = (1/6) * CGGGb * Xb - (1/2) * jnp.einsum("pt,gpt->g", CGGb, Yb)
+        #fb_aaa = (1/6) * CGGGa * Xa - (1/2) * jnp.einsum("pt,gpt->g", CGGa, Ya)
+        #fb_bbb = (1/6) * CGGGb * Xb - (1/2) * jnp.einsum("pt,gpt->g", CGGb, Yb)
+        fb_aaa = (1/6) * CGGGa * X - (1/2) * jnp.einsum("pt,gpt->g", CGGa, Ya)
+        fb_bbb = (1/6) * CGGGb * X - (1/2) * jnp.einsum("pt,gpt->g", CGGb, Yb)
 
         CaabGaGaGb = jnp.einsum("ptqurs,pt,qu,rs->", Caab, Go_a, Go_a, Go_b)
         CaabGaGb = jnp.einsum("ptqurs,qu,rs->pt", Caab, Go_a, Go_b)
@@ -3153,11 +3190,35 @@ class ucisdt(wave_function):
         e3_1 = self.calc_force_bias_triples(wave_data, green_a, green_b, 
             h1_a.reshape(1,self.norb,self.norb), h1_b.reshape(1,self.norb,self.norb))
 
-        e3 = e3_1 #+ e3_2
-
         e3_2 = self.calc_2e_energy_triples(wave_data, green_a, green_b, chol_a, chol_b)
+      
+        e3 = e3_1 + e3_2
 
-        return (e1 + e2) / overlap + e0
+        # overlap is missing triples term!!
+
+        ci3AAA = wave_data["ci3AAA"]
+        ci3AAB = wave_data["ci3AAB"]
+        ci3ABB = wave_data["ci3ABB"]
+        ci3BBB = wave_data["ci3BBB"]
+
+        o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_occ_a, green_occ_a, green_occ_a)
+             + (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, green_occ_b, green_occ_b, green_occ_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_occ_a, green_occ_a, green_occ_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_occ_a, green_occ_b, green_occ_b) )
+
+        print(f"triples ovlp: {o3}")
+
+        overlap = overlap + o3  # triples term in overlap
+
+        #print(f"triples (1e): {e3_1}")
+        #print(f"triples (2e): {e3_2}")
+        #print(f"triples (ovlp): {o3}")
+
+        print(f"Zero-body: {e0}")
+        print(f"One-body energy: {(e1+e3_1)/overlap}")
+        print(f"Two-body energy: {(e2+e3_2)/overlap}")
+
+        return (e1 + e2 + e3) / overlap + e0
 
     @partial(jit, static_argnums=0)
     def calc_2e_energy_triples(self, wave_data, Ga, Gb, La, Lb):
