@@ -1687,6 +1687,8 @@ class wave_function_auto(wave_function):
         print(f"Two-body energy: {(jnp.sum(d_2_overlap) / 2.0) / val1}")
         print(f"Two-body energy w n.o. term: {(jnp.sum(d_2_overlap) / 2.0) / val1 + dx1/val1-oneb_wo_no}")
 
+        print(f"Total energy: {(dx1 + jnp.sum(d_2_overlap) / 2.0) / val1 + h0}")
+
         return (dx1 + jnp.sum(d_2_overlap) / 2.0) / val1 + h0
 
     @partial(jit, static_argnums=0)
@@ -3187,12 +3189,6 @@ class ucisdt(wave_function):
 
         # triples
         # we reuse force bias routine to calculate one-electron energy 
-        e3_1 = self.calc_force_bias_triples(wave_data, green_a, green_b, 
-            h1_a.reshape(1,self.norb,self.norb), h1_b.reshape(1,self.norb,self.norb))
-
-        e3_2 = self.calc_2e_energy_triples(wave_data, green_a, green_b, chol_a, chol_b)
-      
-        e3 = e3_1 + e3_2
 
         # overlap is missing triples term!!
 
@@ -3206,22 +3202,37 @@ class ucisdt(wave_function):
              + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_occ_a, green_occ_a, green_occ_b)
              + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_occ_a, green_occ_b, green_occ_b) )
 
-        print(f"triples ovlp: {o3}")
-
         overlap = overlap + o3  # triples term in overlap
+
+        eff_h1a = h1_a #- 0.5*jnp.einsum("gik,gjk->ij", chol_a, chol_a)
+        eff_h1b = h1_b #- 0.5*jnp.einsum("gik,gjk->ij", chol_b, chol_b)
+
+        e3_1 = self.calc_force_bias_triples(wave_data, green_a, green_b, 
+            eff_h1a.reshape(1,self.norb,self.norb), eff_h1b.reshape(1,self.norb,self.norb))
+
+        e3_2 = self.calc_2e_energy_triples(wave_data, green_a, green_b, chol_a, chol_b, overlap)
+      
+        e3 = e3_1 + e3_2
 
         #print(f"triples (1e): {e3_1}")
         #print(f"triples (2e): {e3_2}")
         #print(f"triples (ovlp): {o3}")
 
         print(f"Zero-body: {e0}")
+        # print(f"One-body energy wo triples: {(e1)/(overlap-o3)}")
         print(f"One-body energy: {(e1+e3_1)/overlap}")
+        # print(f"Two-body energy wo triples: {(e2)/(overlap-o3)}")
         print(f"Two-body energy: {(e2+e3_2)/overlap}")
+
+        print(f"T contr to 1-body energy: {(e3_1)/overlap}")
+        print(f"T contr to 2-body energy: {(e3_2)/overlap}")
+#
+        print(f"Total energy: {(e1 + e2 + e3) / overlap + e0}")
 
         return (e1 + e2 + e3) / overlap + e0
 
     @partial(jit, static_argnums=0)
-    def calc_2e_energy_triples(self, wave_data, Ga, Gb, La, Lb):
+    def calc_2e_energy_triples(self, wave_data, Ga, Gb, La, Lb, overlap):
         #
         # Ga and Gb: green's functions for a and b spin
         # Dimensions (n_occ,n_mo) because first index is zero if virtual
@@ -3291,13 +3302,15 @@ class ucisdt(wave_function):
         GaLaGaLaGpa = jnp.einsum("pk,kt->pt", GaLaGaLa, Gp_a)
 
         Eaaa2 = ( -(1/12) * CaaaGaGaGa * LGLG 
-                  +(1/4) * jnp.einsum("pt,pt->", GaLaGaLaGpa, CaaaGaGa) )
+                  +(1/4) * jnp.einsum("git,gij,pj,pt->", Ya, Lo_a, Ga, CaaaGaGa) )
+                  #+(1/4) * jnp.einsum("pt,pt->", GaLaGaLaGpa, CaaaGaGa) )
 
         GbLbGbLb = jnp.einsum("gpl,gkl->pk", GbLbGb, Lb)
         GbLbGbLbGpb = jnp.einsum("pk,kt->pt", GbLbGbLb, Gp_b)
 
-        Ebbb2 = ( -(1/12) * CbbbGbGbGb * LGLG 
-                  +(1/4) * jnp.einsum("pt,pt->", GbLbGbLbGpb, CbbbGbGb) )
+        Ebbb2 = ( -(1/12) * CbbbGbGbGb * LGLG
+                  +(1/4) * jnp.einsum("git,gij,pj,pt->", Yb, Lo_b, Gb, CbbbGbGb) ) 
+                  #+(1/4) * jnp.einsum("pt,pt->", GbLbGbLbGpb, CbbbGbGb) )
 
         # 3. 
         LaGpa = jnp.einsum("gij,it->gjt", La, Gp_a)
@@ -3305,7 +3318,8 @@ class ucisdt(wave_function):
 
         YaYa = jnp.einsum("gpt,gqu->ptqu", Ya, Ya)
 
-        Eaaa3 = ( (1/4) * jnp.einsum("pt,pt->", LaGpa_GaLaGa, CaaaGaGa)
+        # (1/4) * jnp.einsum("pt,pt->", LaGpa_GaLaGa, CaaaGaGa)
+        Eaaa3 = ( (1/4) * jnp.einsum("gkt,pt,gkl,pl->", Ya, CaaaGaGa, Lo_a, Ga)
                     + (1/2) * jnp.einsum("ptqu,ptqu", YaYa, CaaaGa)
                     - (1/4) * jnp.einsum("gpt,pt,g->", Ya, CaaaGaGa, X) )
 
@@ -3314,12 +3328,23 @@ class ucisdt(wave_function):
 
         YbYb = jnp.einsum("gpt,gqu->ptqu", Yb, Yb)
 
-        Ebbb3 = ( (1/4) * jnp.einsum("pt,pt->", LbGpb_GbLbGb, CbbbGbGb)
+        # (1/4) * jnp.einsum("pt,pt->", LbGpb_GbLbGb, CbbbGbGb)
+        Ebbb3 = ( (1/4) * jnp.einsum("gkt,pt,gkl,pl->", Yb, CbbbGbGb, Lo_b, Gb)
                     + (1/2) * jnp.einsum("ptqu,ptqu", YbYb, CbbbGb)
                     - (1/4) * jnp.einsum("gpt,pt,g->", Yb, CbbbGbGb, X) )
 
         Eaaa = Eaaa1 + Eaaa2 + Eaaa3
         Ebbb = Ebbb1 + Ebbb2 + Ebbb3
+
+        print(f"aaa energy: {Eaaa/overlap}")
+        # print(f"aaa1 energy: {Eaaa1}")
+        # print(f"aaa2 energy: {Eaaa2}")
+        # print(f"aaa3 energy: {Eaaa3}")
+       
+        print(f"bbb energy: {Ebbb/overlap}")
+        # print(f"bbb1 energy: {Ebbb1}")
+        # print(f"bbb2 energy: {Ebbb2}")
+        # print(f"bbb3 energy: {Ebbb3}")
 
         # aab
         # 1
@@ -3336,7 +3361,11 @@ class ucisdt(wave_function):
         # 2
         Eaab2 = ( -(1/4) * LGLG *  CaabGaGaGb 
                     +(1/2) * jnp.einsum("gij,pj,git,pt->", Lo_a, Ga, Ya, CaabGaGb) 
-                    -(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab) )
+                    +(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab) )
+                    #-(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab) )
+
+        #yes, symmetry?
+        #print(f"is this zero? {(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab)}")
 
         CaabGb = jnp.einsum("ptqurs,rs->ptqu", Caab, Go_b)
 
@@ -3354,6 +3383,8 @@ class ucisdt(wave_function):
                     +(1/2) * jnp.einsum("grs,gpt,ptrs->", Yb, Ya, GaCaab) )
 
         Eaab = Eaab1 + Eaab2 + Eaab3 + Eaab5
+
+        print(f"aab energy: {Eaab/overlap}")
 
         # abb
         CabbGb = jnp.einsum("ptqurs,rs->ptqu", Cabb, Go_b)
@@ -3383,6 +3414,8 @@ class ucisdt(wave_function):
                     +(1/2) * jnp.einsum("qurs,gqu,grs->", GaCabb, Yb, Yb) )
 
         Eabb = Eabb1 + Eabb2 + Eabb3 + Eabb4
+
+        print(f"abb energy: {Eabb/overlap}")
 
         E = Eaaa + Ebbb + Eaab + Eabb
 
