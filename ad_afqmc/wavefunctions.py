@@ -1630,14 +1630,14 @@ class wave_function_auto(wave_function):
         )
 
         # EFK hack
-        x = 0.0
-        # one body without normal ordering term
-        f1 = lambda a: self._overlap_with_single_rot(
-            a, h1, walker_up, walker_dn, wave_data
-        )
-        val1, dx1 = jvp(f1, [x], [1.0])
-        oneb_wo_no=dx1/val1
-        print(f"One-body energy wo n.o. term: {oneb_wo_no}")
+        # x = 0.0
+        # # one body without normal ordering term
+        # f1 = lambda a: self._overlap_with_single_rot(
+        #     a, h1, walker_up, walker_dn, wave_data
+        # )
+        # val1, dx1 = jvp(f1, [x], [1.0])
+        # oneb_wo_no=dx1/val1
+        # print(f"One-body energy wo n.o. term: {oneb_wo_no}")
         # EFK hack
 
         x = 0.0
@@ -1647,12 +1647,19 @@ class wave_function_auto(wave_function):
         )
         val1, dx1 = jvp(f1, [x], [1.0])
 
+        # HMMM: Can we use this to do exact differentiation for 2e energy?
+
         # two body
         # vmap_fun = vmap(
         #     self._overlap_with_double_rot, in_axes=(None, 0, None, None, None)
         # )
 
+        # end HMMM
+
         eps = self.eps
+
+        #eps=0.001
+        #print(f"epsilon: {eps}")
 
         # carry: [eps, walker, wave_data]
         def scanned_fun(carry, chol_i):
@@ -1672,20 +1679,23 @@ class wave_function_auto(wave_function):
         )
         d_2_overlap = (overlap_p - 2.0 * overlap_0 + overlap_m) / eps / eps
 
-        # dx2 = (
-        #     (
-        #         vmap_fun(eps, chol, walker_up, walker_dn, wave_data)
-        #         - 2.0 * vmap_fun(zero, chol, walker_up, walker_dn, wave_data)
-        #         + vmap_fun(-1.0 * eps, chol, walker_up, walker_dn, wave_data)
-        #     )
-        #     / eps
-        #     / eps
-        # )
+        # Let us try with a five point stencil:
+        # _, overlap_2m = lax.scan(
+        #     scanned_fun, (-2.0 * eps, walker_up, walker_dn, wave_data), chol
+        # )        
+
+        # _, overlap_2p = lax.scan(
+        #     scanned_fun, (2.0 * eps, walker_up, walker_dn, wave_data), chol
+        # )    
+
+        # d_2_overlap_5pt = (-overlap_2p + 16.0*overlap_p - 30.0*overlap_0 + 16.0*overlap_m - overlap_2m)/(12.0*eps**2)
 
         print(f"Zero-body: {h0}")
         print(f"One-body energy: {dx1/val1}")
         print(f"Two-body energy: {(jnp.sum(d_2_overlap) / 2.0) / val1}")
-        print(f"Two-body energy w n.o. term: {(jnp.sum(d_2_overlap) / 2.0) / val1 + dx1/val1-oneb_wo_no}")
+        #print(f"Two-body energy 5pt: {(jnp.sum(d_2_overlap_5pt) / 2.0) / val1}")
+        #print(f"Two-body energy w n.o. term: {(jnp.sum(d_2_overlap) / 2.0) / val1 + dx1/val1-oneb_wo_no}")
+        #print(f"Two-body energy w n.o. term 5pt: {(jnp.sum(d_2_overlap_5pt) / 2.0) / val1 + dx1/val1-oneb_wo_no}")
 
         print(f"Total energy: {(dx1 + jnp.sum(d_2_overlap) / 2.0) / val1 + h0}")
 
@@ -2833,6 +2843,32 @@ class ucisdt(wave_function):
         ci3AAB = wave_data["ci3AAB"]
         ci3ABB = wave_data["ci3ABB"]
         ci3BBB = wave_data["ci3BBB"]
+
+        # o3aaa with symmetries
+        #o3aaa = (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_a, green_a, green_a)
+
+        # o3aaa without symmetries
+        # o3aaa_wo = (1/36) * (
+        #         jnp.einsum("ptqurs,pt,qu,rs", ci3AAA, green_a, green_a, green_a)
+        #        -jnp.einsum("ptqurs,pt,qs,ru", ci3AAA, green_a, green_a, green_a)
+        #        -jnp.einsum("ptqurs,pu,qt,rs", ci3AAA, green_a, green_a, green_a)
+        #        +jnp.einsum("ptqurs,pu,qs,rt", ci3AAA, green_a, green_a, green_a)
+        #        +jnp.einsum("ptqurs,ps,qt,ru", ci3AAA, green_a, green_a, green_a)
+        #        -jnp.einsum("ptqurs,ps,qu,rt", ci3AAA, green_a, green_a, green_a)
+        #     )
+
+        # print(f"with sym: {o3aaa}")
+        # print(f"without sym: {o3aaa_wo}")
+
+        # o3aab = (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_a, green_a, green_b)
+
+        # o3aab_wo = (1/4) * (
+        #         jnp.einsum("ptqurs,rs,pt,qu", ci3AAB, green_b, green_a, green_a)
+        #        -jnp.einsum("ptqurs,rs,pu,qt", ci3AAB, green_b, green_a, green_a)
+        #     )
+
+        # print(f"with sym: {o3aab}")
+        # print(f"without sym: {o3aab_wo}") 
 
         o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_a, green_a, green_a)
              + (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, green_b, green_b, green_b)
