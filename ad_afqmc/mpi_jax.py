@@ -170,6 +170,35 @@ def _prep_afqmc(options=None):
             trial = wavefunctions.ucisd(norb, nelec_sp, n_batch=options["n_batch"])
         except:
             raise ValueError("Trial specified as ucisd, but amplitudes.npz not found.")
+    elif options["trial"] == "UCISDT":
+        try:
+            amplitudes = np.load(tmpdir + "/amplitudes.npz")
+            ci1a = jnp.array(amplitudes["ci1a"])
+            ci1b = jnp.array(amplitudes["ci1b"])
+            ci2aa = jnp.array(amplitudes["ci2aa"])
+            ci2ab = jnp.array(amplitudes["ci2ab"])
+            ci2bb = jnp.array(amplitudes["ci2bb"])
+            ci3aaa = jnp.array(amplitudes["ci3aaa"])
+            ci3aab = jnp.array(amplitudes["ci3aab"])
+            ci3abb = jnp.array(amplitudes["ci3abb"])
+            ci3bbb = jnp.array(amplitudes["ci3bbb"])
+
+            trial_wave_data = {
+                "ci1A": ci1a,
+                "ci1B": ci1b,
+                "ci2AA": ci2aa,
+                "ci2AB": ci2ab,
+                "ci2BB": ci2bb,
+                "ci3AAA": ci3aaa,
+                "ci3AAB": ci3aab,
+                "ci3ABB": ci3abb,
+                "ci3BBB": ci3bbb,
+                "mo_coeff": mo_coeff,
+            }
+            wave_data.update(trial_wave_data)
+            trial = wavefunctions.UCISDT(norb, nelec_sp, n_batch=options["n_batch"])
+        except:
+            raise ValueError("Trial specified as ucisdt, but something not found.")
     else:
         try:
             with open(tmpdir + "/trial.pkl", "rb") as f:
