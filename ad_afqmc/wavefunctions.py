@@ -3468,3 +3468,680 @@ class UCISDT(wave_function_auto):
     def __hash__(self) -> int:
         return hash(tuple(self.__dict__.values()))
 
+@dataclass
+class ucisdt(wave_function):
+    """Eirik's manual implementation of the UCISDT wave function."""
+
+    norb: int
+    nelec: Tuple[int, int]
+    n_batch: int = 1
+
+    @partial(jit, static_argnums=0)
+    def _calc_overlap(
+        self, walker_up: jax.Array, walker_dn: jax.Array, wave_data: dict
+    ) -> complex:
+        noccA, ci1A, ci2AA = self.nelec[0], wave_data["ci1A"], wave_data["ci2AA"]
+        noccB, ci1B, ci2BB = self.nelec[1], wave_data["ci1B"], wave_data["ci2BB"]
+        ci2AB = wave_data["ci2AB"]
+        _, moB = wave_data["mo_coeff"][0], wave_data["mo_coeff"][1]
+        walker_dn_B = moB.T.dot(walker_dn[:, :noccB])
+        green_a = (walker_up.dot(jnp.linalg.inv(walker_up[: walker_up.shape[1], :]))).T
+        green_b = (
+            walker_dn_B.dot(jnp.linalg.inv(walker_dn_B[: walker_dn_B.shape[1], :]))
+        ).T
+        green_a, green_b = green_a[:, noccA:], green_b[:, noccB:]
+        o0 = jnp.linalg.det(walker_up[:noccA, :]) * jnp.linalg.det(
+            walker_dn_B[:noccB, :]
+        )
+        o1 = jnp.einsum("ia,ia", ci1A, green_a) + jnp.einsum("ia,ia", ci1B, green_b)
+        o2 = (
+            0.5 * jnp.einsum("iajb, ia, jb", ci2AA, green_a, green_a)
+            + 0.5 * jnp.einsum("iajb, ia, jb", ci2BB, green_b, green_b)
+            + jnp.einsum("iajb, ia, jb", ci2AB, green_a, green_b)
+        )
+
+        ci3AAA = wave_data["ci3AAA"]
+        ci3AAB = wave_data["ci3AAB"]
+        ci3ABB = wave_data["ci3ABB"]
+        ci3BBB = wave_data["ci3BBB"]
+
+        # o3aaa with symmetries
+        #o3aaa = (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_a, green_a, green_a)
+
+        # o3aaa without symmetries
+        # o3aaa_wo = (1/36) * (
+        #         jnp.einsum("ptqurs,pt,qu,rs", ci3AAA, green_a, green_a, green_a)
+        #        -jnp.einsum("ptqurs,pt,qs,ru", ci3AAA, green_a, green_a, green_a)
+        #        -jnp.einsum("ptqurs,pu,qt,rs", ci3AAA, green_a, green_a, green_a)
+        #        +jnp.einsum("ptqurs,pu,qs,rt", ci3AAA, green_a, green_a, green_a)
+        #        +jnp.einsum("ptqurs,ps,qt,ru", ci3AAA, green_a, green_a, green_a)
+        #        -jnp.einsum("ptqurs,ps,qu,rt", ci3AAA, green_a, green_a, green_a)
+        #     )
+
+        # print(f"with sym: {o3aaa}")
+        # print(f"without sym: {o3aaa_wo}")
+
+        # o3aab = (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_a, green_a, green_b)
+
+        # o3aab_wo = (1/4) * (
+        #         jnp.einsum("ptqurs,rs,pt,qu", ci3AAB, green_b, green_a, green_a)
+        #        -jnp.einsum("ptqurs,rs,pu,qt", ci3AAB, green_b, green_a, green_a)
+        #     )
+
+        # print(f"with sym: {o3aab}")
+        # print(f"without sym: {o3aab_wo}") 
+
+        o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_a, green_a, green_a)
+             + (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, green_b, green_b, green_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_a, green_a, green_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_a, green_b, green_b) ) 
+
+        return (1.0 + o1 + o2 + o3) * o0
+
+    @partial(jit, static_argnums=0)
+    def _calc_force_bias(
+        self,
+        walker_up: jax.Array,
+        walker_dn: jax.Array,
+        ham_data: dict,
+        wave_data: dict,
+    ) -> jax.Array:
+        """Calculates force bias < psi_T | chol_gamma | walker > / < psi_T | walker >"""
+        nocc_a, ci1_a, ci2_aa = self.nelec[0], wave_data["ci1A"], wave_data["ci2AA"]
+        nocc_b, ci1_b, ci2_bb = self.nelec[1], wave_data["ci1B"], wave_data["ci2BB"]
+        ci2_ab = wave_data["ci2AB"]
+        walker_dn_b = wave_data["mo_coeff"][1].T.dot(walker_dn[:, :nocc_b])
+        green_a = (walker_up.dot(jnp.linalg.inv(walker_up[:nocc_a, :]))).T
+        green_b = (walker_dn_b.dot(jnp.linalg.inv(walker_dn_b[:nocc_b, :]))).T
+        green_occ_a = green_a[:, nocc_a:].copy()
+        green_occ_b = green_b[:, nocc_b:].copy()
+        greenp_a = jnp.vstack((green_occ_a, -jnp.eye(self.norb - nocc_a)))
+        greenp_b = jnp.vstack((green_occ_b, -jnp.eye(self.norb - nocc_b)))
+
+        chol_a = ham_data["chol"].reshape(-1, self.norb, self.norb)
+        chol_b = ham_data["chol_b"].reshape(-1, self.norb, self.norb)
+        rot_chol_a = chol_a[:, : self.nelec[0], :]
+        rot_chol_b = chol_b[:, : self.nelec[1], :]
+        lg_a = jnp.einsum("gpj,pj->g", rot_chol_a, green_a, optimize="optimal")
+        lg_b = jnp.einsum("gpj,pj->g", rot_chol_b, green_b, optimize="optimal")
+        lg = lg_a + lg_b
+
+        # ref
+        fb_0 = lg_a + lg_b
+
+        # single excitations
+        ci1g_a = jnp.einsum("pt,pt->", ci1_a, green_occ_a, optimize="optimal")
+        ci1g_b = jnp.einsum("pt,pt->", ci1_b, green_occ_b, optimize="optimal")
+        ci1g = ci1g_a + ci1g_b
+        fb_1_1 = ci1g * lg
+        ci1gp_a = jnp.einsum("pt,it->pi", ci1_a, greenp_a, optimize="optimal")
+        ci1gp_b = jnp.einsum("pt,it->pi", ci1_b, greenp_b, optimize="optimal")
+        gci1gp_a = jnp.einsum("pj,pi->ij", green_a, ci1gp_a, optimize="optimal")
+        gci1gp_b = jnp.einsum("pj,pi->ij", green_b, ci1gp_b, optimize="optimal")
+        fb_1_2 = -jnp.einsum(
+            "gij,ij->g", chol_a, gci1gp_a, optimize="optimal"
+        ) - jnp.einsum("gij,ij->g", chol_b, gci1gp_b, optimize="optimal")
+        fb_1 = fb_1_1 + fb_1_2
+
+        # double excitations
+        ci2g_a = jnp.einsum("ptqu,pt->qu", ci2_aa, green_occ_a)
+        ci2g_b = jnp.einsum("ptqu,pt->qu", ci2_bb, green_occ_b)
+        ci2g_ab_a = jnp.einsum("ptqu,qu->pt", ci2_ab, green_occ_b)
+        ci2g_ab_b = jnp.einsum("ptqu,pt->qu", ci2_ab, green_occ_a)
+        gci2g_a = 0.5 * jnp.einsum("qu,qu->", ci2g_a, green_occ_a, optimize="optimal")
+        gci2g_b = 0.5 * jnp.einsum("qu,qu->", ci2g_b, green_occ_b, optimize="optimal")
+        gci2g_ab = jnp.einsum("pt,pt->", ci2g_ab_a, green_occ_a, optimize="optimal")
+        gci2g = gci2g_a + gci2g_b + gci2g_ab
+        fb_2_1 = lg * gci2g
+        ci2_green_a = (greenp_a @ (ci2g_a + ci2g_ab_a).T) @ green_a
+        ci2_green_b = (greenp_b @ (ci2g_b + ci2g_ab_b).T) @ green_b
+        fb_2_2_a = -jnp.einsum("gij,ij->g", chol_a, ci2_green_a, optimize="optimal")
+        fb_2_2_b = -jnp.einsum("gij,ij->g", chol_b, ci2_green_b, optimize="optimal")
+        fb_2_2 = fb_2_2_a + fb_2_2_b
+        fb_2 = fb_2_1 + fb_2_2
+
+        # overlap
+        overlap_1 = ci1g
+        overlap_2 = gci2g
+        overlap = 1.0 + overlap_1 + overlap_2
+
+        ci3AAA = wave_data["ci3AAA"]
+        ci3AAB = wave_data["ci3AAB"]
+        ci3ABB = wave_data["ci3ABB"]
+        ci3BBB = wave_data["ci3BBB"]
+
+        o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_occ_a, green_occ_a, green_occ_a)
+             + (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, green_occ_b, green_occ_b, green_occ_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_occ_a, green_occ_a, green_occ_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_occ_a, green_occ_b, green_occ_b) )
+
+        #print(f"triples ovlp: {o3}")
+
+        overlap = overlap + o3  # triples term in overlap
+
+        fb_3 = self.calc_force_bias_triples(wave_data, green_a, green_b, chol_a, chol_b)
+
+        return (fb_0 + fb_1 + fb_2 + fb_3) / overlap
+
+    def calc_force_bias_triples(self, wave_data, Ga, Gb, La, Lb):
+        #
+        # Ga and Gb: green's functions for a and b spin
+        # Dimensions (n_occ,n_mo) because first index is zero if virtual
+        #
+        # La and Lb: cholesky vector in a and b bases
+        # Dimensions are (n_chol,n_mo,n_mo)
+        n_o_a = self.nelec[0]
+        n_o_b = self.nelec[1]
+        
+        Go_a = Ga[:, n_o_a:].copy()
+        Go_b = Gb[:, n_o_b:].copy()
+
+        Gp_a = jnp.vstack((Go_a, -jnp.eye(self.norb - n_o_a)))
+        Gp_b = jnp.vstack((Go_b, -jnp.eye(self.norb - n_o_b)))
+
+        Lo_a = La[:, :n_o_a, :] # (gamma,i,j) restricts i to occupied, j is free 
+        Lo_b = Lb[:, :n_o_b, :] # (gamma,i,j) restricts i to occupied, j is free 
+
+        Caaa = wave_data["ci3AAA"]
+        Caab = wave_data["ci3AAB"]
+        Cabb = wave_data["ci3ABB"]
+        Cbbb = wave_data["ci3BBB"]
+
+        # Let's make some intermediates
+        #
+        # X = (La)_gij (Ga)_gij + (Lb)_gij (Gb)_gij
+        #
+        Xa = jnp.einsum("gij,ij->g", Lo_a, Ga)
+        Xb = jnp.einsum("gij,ij->g", Lo_b, Gb)
+
+        X = Xa + Xb
+
+        # (Ys)_gpt = (Gs)_pj (Ls)_gij (Gps)_it
+        Ya = jnp.einsum("pj,gij,it->gpt", Ga, La, Gp_a) 
+        Yb = jnp.einsum("pj,gij,it->gpt", Gb, Lb, Gp_b) 
+
+        # (CGGs)_pt = C_ptqurs (Gs)_qu (Gs)_rs
+        CGGa = jnp.einsum("ptqurs,qu,rs->pt", Caaa, Go_a, Go_a)
+        CGGb = jnp.einsum("ptqurs,qu,rs->pt", Cbbb, Go_b, Go_b)
+
+        CGGGa = jnp.einsum("pt,pt->", CGGa, Go_a)
+        CGGGb = jnp.einsum("pt,pt->", CGGb, Go_b)
+
+        #fb_aaa = (1/6) * CGGGa * Xa - (1/2) * jnp.einsum("pt,gpt->g", CGGa, Ya)
+        #fb_bbb = (1/6) * CGGGb * Xb - (1/2) * jnp.einsum("pt,gpt->g", CGGb, Yb)
+        fb_aaa = (1/6) * CGGGa * X - (1/2) * jnp.einsum("pt,gpt->g", CGGa, Ya)
+        fb_bbb = (1/6) * CGGGb * X - (1/2) * jnp.einsum("pt,gpt->g", CGGb, Yb)
+
+        CaabGaGaGb = jnp.einsum("ptqurs,pt,qu,rs->", Caab, Go_a, Go_a, Go_b)
+        CaabGaGb = jnp.einsum("ptqurs,qu,rs->pt", Caab, Go_a, Go_b)
+
+        GaGaCaab = jnp.einsum("pt,qu,ptqurs->rs", Go_a, Go_a, Caab)
+
+        fb_aab = ( (1/2) * CaabGaGaGb * X - jnp.einsum("gpt,pt->g", Ya, CaabGaGb)
+                    - (1/2) * jnp.einsum("grs,rs->g", Yb, GaGaCaab) )
+
+        CabbGaGbGb = jnp.einsum("ptqurs,pt,qu,rs->", Cabb, Go_a, Go_b, Go_b)
+
+        GaCabbGb = jnp.einsum("pt,ptqurs,rs->qu", Go_a, Cabb, Go_b)
+
+        CabbGbGb = jnp.einsum("ptqurs,qu,rs->pt", Cabb, Go_b, Go_b)
+
+        fb_abb = ( (1/2) * CabbGaGbGb * X  - jnp.einsum("gqu,qu->g", Yb, GaCabbGb) 
+                    - (1/2) * jnp.einsum("gpt,pt->g", Ya, CabbGbGb) )
+
+        return fb_aaa + fb_bbb + fb_abb + fb_aab
+
+    @partial(jit, static_argnums=0)
+    def _calc_energy(
+        self,
+        walker_up: jax.Array,
+        walker_dn: jax.Array,
+        ham_data: dict,
+        wave_data: dict,
+    ) -> complex:
+        nocc_a, ci1_a, ci2_aa = self.nelec[0], wave_data["ci1A"], wave_data["ci2AA"]
+        nocc_b, ci1_b, ci2_bb = self.nelec[1], wave_data["ci1B"], wave_data["ci2BB"]
+        ci2_ab = wave_data["ci2AB"]
+        walker_dn_b = wave_data["mo_coeff"][1].T.dot(walker_dn[:, :nocc_b])
+        green_a = (walker_up.dot(jnp.linalg.inv(walker_up[:nocc_a, :]))).T
+        green_b = (walker_dn_b.dot(jnp.linalg.inv(walker_dn_b[:nocc_b, :]))).T
+        green_occ_a = green_a[:, nocc_a:].copy()
+        green_occ_b = green_b[:, nocc_b:].copy()
+        greenp_a = jnp.vstack((green_occ_a, -jnp.eye(self.norb - nocc_a)))
+        greenp_b = jnp.vstack((green_occ_b, -jnp.eye(self.norb - nocc_b)))
+
+        chol_a = ham_data["chol"].reshape(-1, self.norb, self.norb)
+        chol_b = ham_data["chol_b"].reshape(-1, self.norb, self.norb)
+        rot_chol_a = chol_a[:, :nocc_a, :]
+        rot_chol_b = chol_b[:, :nocc_b, :]
+        h1_a = (ham_data["h1"][0] + ham_data["h1"][1]) / 2.0
+        h1_b = ham_data["h1_b"]
+        hg_a = jnp.einsum("pj,pj->", h1_a[:nocc_a, :], green_a)
+        hg_b = jnp.einsum("pj,pj->", h1_b[:nocc_b, :], green_b)
+        hg = hg_a + hg_b
+
+        # 0 body energy
+        e0 = ham_data["h0"]
+
+        # 1 body energy
+        # ref
+        e1_0 = hg
+
+        # single excitations
+        ci1g_a = jnp.einsum("pt,pt->", ci1_a, green_occ_a, optimize="optimal")
+        ci1g_b = jnp.einsum("pt,pt->", ci1_b, green_occ_b, optimize="optimal")
+        ci1g = ci1g_a + ci1g_b
+        e1_1_1 = ci1g * hg
+        gpci1_a = greenp_a @ ci1_a.T
+        gpci1_b = greenp_b @ ci1_b.T
+        ci1_green_a = gpci1_a @ green_a
+        ci1_green_b = gpci1_b @ green_b
+        e1_1_2 = -(
+            jnp.einsum("ij,ij->", h1_a, ci1_green_a, optimize="optimal")
+            + jnp.einsum("ij,ij->", h1_b, ci1_green_b, optimize="optimal")
+        )
+        e1_1 = e1_1_1 + e1_1_2
+
+        # double excitations
+        ci2g_a = jnp.einsum("ptqu,pt->qu", ci2_aa, green_occ_a) / 4
+        ci2g_b = jnp.einsum("ptqu,pt->qu", ci2_bb, green_occ_b) / 4
+        ci2g_ab_a = jnp.einsum("ptqu,qu->pt", ci2_ab, green_occ_b)
+        ci2g_ab_b = jnp.einsum("ptqu,pt->qu", ci2_ab, green_occ_a)
+        gci2g_a = jnp.einsum("qu,qu->", ci2g_a, green_occ_a, optimize="optimal")
+        gci2g_b = jnp.einsum("qu,qu->", ci2g_b, green_occ_b, optimize="optimal")
+        gci2g_ab = jnp.einsum("pt,pt->", ci2g_ab_a, green_occ_a, optimize="optimal")
+        gci2g = 2 * (gci2g_a + gci2g_b) + gci2g_ab
+        e1_2_1 = hg * gci2g
+        ci2_green_a = (greenp_a @ ci2g_a.T) @ green_a
+        ci2_green_ab_a = (greenp_a @ ci2g_ab_a.T) @ green_a
+        ci2_green_b = (greenp_b @ ci2g_b.T) @ green_b
+        ci2_green_ab_b = (greenp_b @ ci2g_ab_b.T) @ green_b
+        e1_2_2_a = -jnp.einsum(
+            "ij,ij->", h1_a, 4 * ci2_green_a + ci2_green_ab_a, optimize="optimal"
+        )
+        e1_2_2_b = -jnp.einsum(
+            "ij,ij->", h1_b, 4 * ci2_green_b + ci2_green_ab_b, optimize="optimal"
+        )
+        e1_2_2 = e1_2_2_a + e1_2_2_b
+        e1_2 = e1_2_1 + e1_2_2
+
+        e1 = e1_0 + e1_1 + e1_2
+
+        # two body energy
+        # ref
+        lg_a = jnp.einsum("gpj,pj->g", rot_chol_a, green_a, optimize="optimal")
+        lg_b = jnp.einsum("gpj,pj->g", rot_chol_b, green_b, optimize="optimal")
+        e2_0_1 = ((lg_a + lg_b) @ (lg_a + lg_b)) / 2.0
+        lg1_a = jnp.einsum("gpj,qj->gpq", rot_chol_a, green_a, optimize="optimal")
+        lg1_b = jnp.einsum("gpj,qj->gpq", rot_chol_b, green_b, optimize="optimal")
+        e2_0_2 = (
+            -(
+                jnp.sum(vmap(lambda x: x * x.T)(lg1_a))
+                + jnp.sum(vmap(lambda x: x * x.T)(lg1_b))
+            )
+            / 2.0
+        )
+        e2_0 = e2_0_1 + e2_0_2
+
+        # single excitations
+        e2_1_1 = e2_0 * ci1g
+        lci1g_a = jnp.einsum("gij,ij->g", chol_a, ci1_green_a, optimize="optimal")
+        lci1g_b = jnp.einsum("gij,ij->g", chol_b, ci1_green_b, optimize="optimal")
+        e2_1_2 = -((lci1g_a + lci1g_b) @ (lg_a + lg_b))
+        ci1g1_a = ci1_a @ green_occ_a.T
+        ci1g1_b = ci1_b @ green_occ_b.T
+        e2_1_3_1 = jnp.einsum(
+            "gpq,gqr,rp->", lg1_a, lg1_a, ci1g1_a, optimize="optimal"
+        ) + jnp.einsum("gpq,gqr,rp->", lg1_b, lg1_b, ci1g1_b, optimize="optimal")
+        lci1g_a = jnp.einsum(
+            "gip,qi->gpq", ham_data["lci1_a"], green_a, optimize="optimal"
+        )
+        lci1g_b = jnp.einsum(
+            "gip,qi->gpq", ham_data["lci1_b"], green_b, optimize="optimal"
+        )
+        e2_1_3_2 = -jnp.einsum(
+            "gpq,gqp->", lci1g_a, lg1_a, optimize="optimal"
+        ) - jnp.einsum("gpq,gqp->", lci1g_b, lg1_b, optimize="optimal")
+        e2_1_3 = e2_1_3_1 + e2_1_3_2
+        e2_1 = e2_1_1 + e2_1_2 + e2_1_3
+
+        # double excitations
+        e2_2_1 = e2_0 * gci2g
+        lci2g_a = jnp.einsum(
+            "gij,ij->g",
+            chol_a,
+            8 * ci2_green_a + 2 * ci2_green_ab_a,
+            optimize="optimal",
+        )
+        lci2g_b = jnp.einsum(
+            "gij,ij->g",
+            chol_b,
+            8 * ci2_green_b + 2 * ci2_green_ab_b,
+            optimize="optimal",
+        )
+        e2_2_2_1 = -((lci2g_a + lci2g_b) @ (lg_a + lg_b)) / 2.0
+
+        def scanned_fun(carry, x):
+            chol_a_i, rot_chol_a_i, chol_b_i, rot_chol_b_i = x
+            gl_a_i = jnp.einsum("pj,ji->pi", green_a, chol_a_i, optimize="optimal")
+            gl_b_i = jnp.einsum("pj,ji->pi", green_b, chol_b_i, optimize="optimal")
+            lci2_green_a_i = jnp.einsum(
+                "pi,ji->pj",
+                rot_chol_a_i,
+                8 * ci2_green_a + 2 * ci2_green_ab_a,
+                optimize="optimal",
+            )
+            lci2_green_b_i = jnp.einsum(
+                "pi,ji->pj",
+                rot_chol_b_i,
+                8 * ci2_green_b + 2 * ci2_green_ab_b,
+                optimize="optimal",
+            )
+            carry[0] += 0.5 * (
+                jnp.einsum("pi,pi->", gl_a_i, lci2_green_a_i, optimize="optimal")
+                + jnp.einsum("pi,pi->", gl_b_i, lci2_green_b_i, optimize="optimal")
+            )
+            glgp_a_i = jnp.einsum(
+                "pi,it->pt", gl_a_i, greenp_a, optimize="optimal"
+            ).astype(jnp.complex64)
+            glgp_b_i = jnp.einsum(
+                "pi,it->pt", gl_b_i, greenp_b, optimize="optimal"
+            ).astype(jnp.complex64)
+            l2ci2_a = 0.5 * jnp.einsum(
+                "pt,qu,ptqu->",
+                glgp_a_i,
+                glgp_a_i,
+                ci2_aa.astype(jnp.float32),
+                optimize="optimal",
+            )
+            l2ci2_b = 0.5 * jnp.einsum(
+                "pt,qu,ptqu->",
+                glgp_b_i,
+                glgp_b_i,
+                ci2_bb.astype(jnp.float32),
+                optimize="optimal",
+            )
+            l2ci2_ab = jnp.einsum(
+                "pt,qu,ptqu->",
+                glgp_a_i,
+                glgp_b_i,
+                ci2_ab.astype(jnp.float32),
+                optimize="optimal",
+            )
+            carry[1] += l2ci2_a + l2ci2_b + l2ci2_ab
+            return carry, 0.0
+
+        [e2_2_2_2, e2_2_3], _ = lax.scan(
+            scanned_fun, [0.0, 0.0], (chol_a, rot_chol_a, chol_b, rot_chol_b)
+        )
+        e2_2_2 = e2_2_2_1 + e2_2_2_2
+        e2_2 = e2_2_1 + e2_2_2 + e2_2_3
+
+        e2 = e2_0 + e2_1 + e2_2
+
+        # overlap
+        overlap_1 = ci1g  # jnp.einsum("ia,ia", ci1, green_occ)
+        overlap_2 = gci2g
+        overlap = 1.0 + overlap_1 + overlap_2
+
+        # triples
+        # we reuse force bias routine to calculate one-electron energy 
+
+        # overlap is missing triples term!!
+
+        ci3AAA = wave_data["ci3AAA"]
+        ci3AAB = wave_data["ci3AAB"]
+        ci3ABB = wave_data["ci3ABB"]
+        ci3BBB = wave_data["ci3BBB"]
+
+        o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_occ_a, green_occ_a, green_occ_a)
+             + (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, green_occ_b, green_occ_b, green_occ_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_occ_a, green_occ_a, green_occ_b)
+             + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_occ_a, green_occ_b, green_occ_b) )
+
+        overlap = overlap + o3  # triples term in overlap
+
+        eff_h1a = h1_a #- 0.5*jnp.einsum("gik,gjk->ij", chol_a, chol_a)
+        eff_h1b = h1_b #- 0.5*jnp.einsum("gik,gjk->ij", chol_b, chol_b)
+
+        e3_1 = self.calc_force_bias_triples(wave_data, green_a, green_b, 
+            eff_h1a.reshape(1,self.norb,self.norb), eff_h1b.reshape(1,self.norb,self.norb))
+
+        e3_2 = self.calc_2e_energy_triples(wave_data, green_a, green_b, chol_a, chol_b, overlap)
+      
+        e3 = e3_1 + e3_2
+
+        #print(f"triples (1e): {e3_1}")
+        #print(f"triples (2e): {e3_2}")
+        #print(f"triples (ovlp): {o3}")
+
+        print(f"Zero-body: {e0}")
+        # print(f"One-body energy wo triples: {(e1)/(overlap-o3)}")
+        print(f"One-body energy: {(e1+e3_1)/overlap}")
+        # print(f"Two-body energy wo triples: {(e2)/(overlap-o3)}")
+        print(f"Two-body energy: {(e2+e3_2)/overlap}")
+
+        print(f"T contr to 1-body energy: {(e3_1)/overlap}")
+        print(f"T contr to 2-body energy: {(e3_2)/overlap}")
+#
+        print(f"Total energy: {(e1 + e2 + e3) / overlap + e0}")
+
+        return (e1 + e2 + e3) / overlap + e0
+
+    @partial(jit, static_argnums=0)
+    def calc_2e_energy_triples(self, wave_data, Ga, Gb, La, Lb, overlap):
+        #
+        # Ga and Gb: green's functions for a and b spin
+        # Dimensions (n_occ,n_mo) because first index is zero if virtual
+        #
+        # La and Lb: cholesky vector in a and b bases
+        # Dimensions are (n_chol,n_mo,n_mo)
+        n_o_a = self.nelec[0]
+        n_o_b = self.nelec[1]
+        
+        Go_a = Ga[:, n_o_a:].copy()
+        Go_b = Gb[:, n_o_b:].copy()
+
+        Gp_a = jnp.vstack((Go_a, -jnp.eye(self.norb - n_o_a)))
+        Gp_b = jnp.vstack((Go_b, -jnp.eye(self.norb - n_o_b)))
+
+        Lo_a = La[:, :n_o_a, :] # (gamma,i,j) restricts i to occupied, j is free 
+        Lo_b = Lb[:, :n_o_b, :] # (gamma,i,j) restricts i to occupied, j is free 
+
+        Caaa = wave_data["ci3AAA"]
+        Caab = wave_data["ci3AAB"]
+        Cabb = wave_data["ci3ABB"]
+        Cbbb = wave_data["ci3BBB"]
+
+        # Let's make some intermediates
+        #
+        # X = (La)_gij (Ga)_gij + (Lb)_gij (Gb)_gij
+        #
+        Xa = jnp.einsum("gij,ij->g", Lo_a, Ga)
+        Xb = jnp.einsum("gij,ij->g", Lo_b, Gb)
+
+        X = Xa + Xb
+
+        # (Ys)_gpt = (Gs)_pj (Ls)_gij (Gps)_it
+        Ya = jnp.einsum("pj,gij,it->gpt", Ga, La, Gp_a) 
+        Yb = jnp.einsum("pj,gij,it->gpt", Gb, Lb, Gp_b) 
+
+        # aaa & bbb
+        # 1. 
+        X2 = jnp.einsum("g,g->", X, X)
+
+        CaaaGa = jnp.einsum("ptqurs,rs->ptqu", Caaa, Go_a) 
+        CaaaGaGa = jnp.einsum("ptqurs,qu,rs->pt", Caaa, Go_a, Go_a) 
+        CaaaGaGaGa = jnp.einsum("pt,pt->", CaaaGaGa, Go_a)
+
+        CbbbGb = jnp.einsum("ptqurs,rs->ptqu", Cbbb, Go_b) 
+        CbbbGbGb = jnp.einsum("ptqurs,qu,rs->pt", Cbbb, Go_b, Go_b) 
+        CbbbGbGbGb = jnp.einsum("pt,pt->", CbbbGbGb, Go_b)
+
+        Eaaa1 = ( (1/12) * X2 * CaaaGaGaGa 
+            - (1/4) * jnp.einsum("g,gpt,pt->", X, Ya, CaaaGaGa) )
+
+        Ebbb1 = ( (1/12) * X2 * CbbbGbGbGb 
+            - (1/4) * jnp.einsum("g,gpt,pt->", X, Yb, CbbbGbGb) )
+
+        # 2.
+        GaLaGa = jnp.einsum("il,gij,kj->gkl", Ga, Lo_a, Ga)
+        GbLbGb = jnp.einsum("il,gij,kj->gkl", Gb, Lo_b, Gb)
+        
+        LaGaLaGa = jnp.einsum("gkl,gkl->", GaLaGa, Lo_a)
+        LbGbLbGb = jnp.einsum("gkl,gkl->", GbLbGb, Lo_b)
+
+        LGLG = LaGaLaGa + LbGbLbGb
+
+        # (GaLaGa)_gpl La_gkl Gpa_kt
+
+        GaLaGaLa = jnp.einsum("gpl,gkl->pk", GaLaGa, La)
+        GaLaGaLaGpa = jnp.einsum("pk,kt->pt", GaLaGaLa, Gp_a)
+
+        Eaaa2 = ( -(1/12) * CaaaGaGaGa * LGLG 
+                  +(1/4) * jnp.einsum("git,gij,pj,pt->", Ya, Lo_a, Ga, CaaaGaGa) )
+                  #+(1/4) * jnp.einsum("pt,pt->", GaLaGaLaGpa, CaaaGaGa) )
+
+        GbLbGbLb = jnp.einsum("gpl,gkl->pk", GbLbGb, Lb)
+        GbLbGbLbGpb = jnp.einsum("pk,kt->pt", GbLbGbLb, Gp_b)
+
+        Ebbb2 = ( -(1/12) * CbbbGbGbGb * LGLG
+                  +(1/4) * jnp.einsum("git,gij,pj,pt->", Yb, Lo_b, Gb, CbbbGbGb) ) 
+                  #+(1/4) * jnp.einsum("pt,pt->", GbLbGbLbGpb, CbbbGbGb) )
+
+        # 3. 
+        LaGpa = jnp.einsum("gij,it->gjt", La, Gp_a)
+        LaGpa_GaLaGa = jnp.einsum("gjt,gpj->pt", LaGpa, GaLaGa)
+
+        YaYa = jnp.einsum("gpt,gqu->ptqu", Ya, Ya)
+
+        # (1/4) * jnp.einsum("pt,pt->", LaGpa_GaLaGa, CaaaGaGa)
+        Eaaa3 = ( (1/4) * jnp.einsum("gkt,pt,gkl,pl->", Ya, CaaaGaGa, Lo_a, Ga)
+                    + (1/2) * jnp.einsum("ptqu,ptqu", YaYa, CaaaGa)
+                    - (1/4) * jnp.einsum("gpt,pt,g->", Ya, CaaaGaGa, X) )
+
+        LbGpb = jnp.einsum("gij,it->gjt", Lb, Gp_b)
+        LbGpb_GbLbGb = jnp.einsum("gjt,gpj->pt", LbGpb, GbLbGb)
+
+        YbYb = jnp.einsum("gpt,gqu->ptqu", Yb, Yb)
+
+        # (1/4) * jnp.einsum("pt,pt->", LbGpb_GbLbGb, CbbbGbGb)
+        Ebbb3 = ( (1/4) * jnp.einsum("gkt,pt,gkl,pl->", Yb, CbbbGbGb, Lo_b, Gb)
+                    + (1/2) * jnp.einsum("ptqu,ptqu", YbYb, CbbbGb)
+                    - (1/4) * jnp.einsum("gpt,pt,g->", Yb, CbbbGbGb, X) )
+
+        Eaaa = Eaaa1 + Eaaa2 + Eaaa3
+        Ebbb = Ebbb1 + Ebbb2 + Ebbb3
+
+        print(f"aaa energy: {Eaaa/overlap}")
+        # print(f"aaa1 energy: {Eaaa1}")
+        # print(f"aaa2 energy: {Eaaa2}")
+        # print(f"aaa3 energy: {Eaaa3}")
+       
+        print(f"bbb energy: {Ebbb/overlap}")
+        # print(f"bbb1 energy: {Ebbb1}")
+        # print(f"bbb2 energy: {Ebbb2}")
+        # print(f"bbb3 energy: {Ebbb3}")
+
+        # aab
+        # 1
+        CaabGaGb = jnp.einsum("ptqurs,qu,rs->pt", Caab, Go_a, Go_b)
+        CaabGaGaGb = jnp.einsum("pt,pt->", Go_a, CaabGaGb)
+        GaGaCaab = jnp.einsum("pt,qu,ptqurs->rs", Go_a, Go_a, Caab)
+
+        GaGaCaab = jnp.einsum("pt,qu,ptqurs->rs", Go_a, Go_a, Caab)
+
+        Eaab1 = ( (1/4) * X2 * CaabGaGaGb
+                    -(1/2) * jnp.einsum("pt,g,gpt->", CaabGaGb, X, Ya) 
+                    -(1/4) * jnp.einsum("g,grs,rs->", X, Yb, GaGaCaab) )
+
+        # 2
+        Eaab2 = ( -(1/4) * LGLG *  CaabGaGaGb 
+                    +(1/2) * jnp.einsum("gij,pj,git,pt->", Lo_a, Ga, Ya, CaabGaGb) 
+                    +(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab) )
+                    #-(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab) )
+
+        #yes, symmetry?
+        #print(f"is this zero? {(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab)}")
+
+        CaabGb = jnp.einsum("ptqurs,rs->ptqu", Caab, Go_b)
+
+        GaCaab = jnp.einsum("pt,ptqurs->qurs", Go_a, Caab)
+
+        # 3 (note: 4=3, so multiplied by 2)
+        Eaab3 = ( (1/2) * jnp.einsum("gkt,gkl,pl,pt->", Ya, Lo_a, Ga, CaabGaGb) 
+                    -(1/2) * jnp.einsum("g,gpt,pt->", X, Ya, CaabGaGb) 
+                    +(1/2) * jnp.einsum("gpt,gqu,ptqu", Ya, Ya, CaabGb) 
+                    +(1/2) * jnp.einsum("gpt,grs,ptrs->", Ya, Yb, GaCaab) )
+
+        # 5
+        Eaab5 = ( (1/4) * jnp.einsum("gks,gkl,rl,rs->", Yb, Lo_b, Gb, GaGaCaab) 
+                    -(1/4) * jnp.einsum("g,grs,rs->", X, Yb, GaGaCaab) 
+                    +(1/2) * jnp.einsum("grs,gpt,ptrs->", Yb, Ya, GaCaab) )
+
+        Eaab = Eaab1 + Eaab2 + Eaab3 + Eaab5
+
+        print(f"aab energy: {Eaab/overlap}")
+
+        # abb
+        CabbGb = jnp.einsum("ptqurs,rs->ptqu", Cabb, Go_b)
+        CabbGbGb = jnp.einsum("ptqu,qu->pt", CabbGb, Go_b)
+        CabbGaGbGb = jnp.einsum("pt,pt->", CabbGbGb, Go_a)
+
+        GaCabbGb = jnp.einsum("pt,ptqurs,rs->qu", Go_a, Cabb, Go_b)
+
+        Eabb1 = ( (1/4) * X2 * CabbGaGbGb 
+                    -(1/4) * jnp.einsum("g,pt,gpt->", X, CabbGbGb, Ya) 
+                    -(1/2) * jnp.einsum("g,qu,gqu->", X, GaCabbGb, Yb) )
+
+        Eabb2 = ( -(1/4) * CabbGaGbGb * LGLG 
+                    +(1/4) * jnp.einsum("pt,git,pj,gij->", CabbGbGb, Ya, Ga, Lo_a) 
+                    +(1/2) * jnp.einsum("qu,giu,gij,qj->", GaCabbGb, Yb, Lo_b, Gb) )
+
+        Eabb3 = ( (1/4) * jnp.einsum("gkt,pt,gkl,pl->", Ya, CabbGbGb, Lo_a, Ga) 
+                    -(1/4) * jnp.einsum("g,pt,gpt->", X, CabbGbGb, Ya) 
+                    +(1/2) * jnp.einsum("ptqu,gpt,gqu->", CabbGb, Ya, Yb) )
+
+        GaCabb = jnp.einsum("pt,ptqurs->qurs", Go_a, Cabb)
+
+        # 4, 4=5 so multiplied by 2
+        Eabb4 = ( (1/2) * jnp.einsum("qu,gku,gkl,ql->", GaCabbGb, Yb, Lo_b, Gb) 
+                    -(1/2) * jnp.einsum("g,gqu,qu->", X, Yb, GaCabbGb) 
+                    +(1/2) * jnp.einsum("ptqu,gqu,gpt->", CabbGb, Yb, Ya) 
+                    +(1/2) * jnp.einsum("qurs,gqu,grs->", GaCabb, Yb, Yb) )
+
+        Eabb = Eabb1 + Eabb2 + Eabb3 + Eabb4
+
+        print(f"abb energy: {Eabb/overlap}")
+
+        E = Eaaa + Ebbb + Eaab + Eabb
+
+        return E
+
+    @partial(jit, static_argnums=0)
+    def _build_measurement_intermediates(self, ham_data: dict, wave_data: dict) -> dict:
+        mo_coeff_b = wave_data["mo_coeff"][1]
+        ham_data["h1_b"] = mo_coeff_b.T @ ham_data["h1"][1] @ mo_coeff_b
+        ham_data["chol_b"] = jnp.einsum(
+            "pi,gij,jq->gpq",
+            mo_coeff_b.T,
+            ham_data["chol"].reshape(-1, self.norb, self.norb),
+            mo_coeff_b,
+        )
+        ham_data["lci1_a"] = jnp.einsum(
+            "git,pt->gip",
+            ham_data["chol"].reshape(-1, self.norb, self.norb)[:, :, self.nelec[0] :],
+            wave_data["ci1A"],
+            optimize="optimal",
+        )
+        ham_data["lci1_b"] = jnp.einsum(
+            "git,pt->gip",
+            ham_data["chol_b"].reshape(-1, self.norb, self.norb)[:, :, self.nelec[1] :],
+            wave_data["ci1B"],
+            optimize="optimal",
+        )
+        return ham_data
+
+    def __hash__(self):
+        return hash(tuple(self.__dict__.values()))
+
