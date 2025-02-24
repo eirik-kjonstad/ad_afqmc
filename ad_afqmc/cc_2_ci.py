@@ -1,8 +1,12 @@
 import numpy as np
 
 def ucisdt_from_ccpy(mf, ccpy_driver):
+
+    norb = len(mf.mo_occ[0])
     t1a = np.transpose(ccpy_driver.T.a, (1,0))
     t1b = np.transpose(ccpy_driver.T.b, (1,0))
+
+    nfrozen = norb - np.shape(t1a)[0] - np.shape(t1a)[1]
     
     t2aa = np.transpose(ccpy_driver.T.aa, (2,3,0,1)) / 2.0
     t2ab = np.transpose(ccpy_driver.T.ab, (2,3,0,1))
@@ -31,11 +35,15 @@ def ucisdt_from_ccpy(mf, ccpy_driver):
         "bbbbbb": t3bbb,
     }
     
-    ci = t2c_unrestricted(mf, t1, t2, t3)
+    ci = t2c_unrestricted(mf, nfrozen, t1, t2, t3)
 
     return ci
 
 def ucisdt_from_ebcc(mf, ebcc_obj):
+
+    norb = len(mf.mo_occ[0])
+    nfrozen = norb - np.shape(ebcc_obj.t1["aa"])[0] - np.shape(ebcc_obj.t1["aa"])[1]
+
     t1 = {
         "aa": ebcc_obj.t1["aa"],
         "bb": ebcc_obj.t1["bb"],
@@ -54,11 +62,11 @@ def ucisdt_from_ebcc(mf, ebcc_obj):
         "bbbbbb": ebcc_obj.t3["bbbbbb"],
     }
     
-    ci = t2c_unrestricted(mf, t1, t2, t3)
+    ci = t2c_unrestricted(mf, nfrozen, t1, t2, t3)
 
     return ci
 
-def t2c_unrestricted(mf, t1, t2, t3):
+def t2c_unrestricted(mf, nfrozen, t1, t2, t3):
 
     from ebcc import util
     from ebcc.ham import Space
@@ -82,18 +90,34 @@ def t2c_unrestricted(mf, t1, t2, t3):
         bbbbbb=t3["bbbbbb"],
     )
 
-    space = (
-        Space(
-            mf.mo_occ[0] > 0,
-            np.zeros_like(mf.mo_occ[0]),
-            np.ones_like(mf.mo_occ[0]),
-        ),
-        Space(
-            mf.mo_occ[1] > 0,
-            np.zeros_like(mf.mo_occ[1]),
-            np.ones_like(mf.mo_occ[1]),
-        ),
-    )
+    occupied_a = mf.mo_occ[0] > 0
+    frozen_a = np.zeros_like(mf.mo_occ[0])
+    active_a = np.ones_like(mf.mo_occ[0])
+    frozen_a[:nfrozen] = True
+    active_a[:nfrozen] = False
+    space_a = Space(occupied_a, frozen_a, active_a)
+
+    occupied_b = mf.mo_occ[1] > 0
+    frozen_b = np.zeros_like(mf.mo_occ[1])
+    active_b = np.ones_like(mf.mo_occ[1])
+    frozen_b[:nfrozen] = True
+    active_b[:nfrozen] = False
+    space_b = Space(occupied_b, frozen_b, active_b)
+
+    space = (space_a, space_b)
+
+    #space = (
+    #    Space(
+    #        mf.mo_occ[0] > 0,
+    #        np.zeros_like(mf.mo_occ[0]),
+    #        np.ones_like(mf.mo_occ[0]),
+    #    ),
+    #    Space(
+    #        mf.mo_occ[1] > 0,
+    #        np.zeros_like(mf.mo_occ[1]),
+    #        np.ones_like(mf.mo_occ[1]),
+    #    ),
+    #)
 
     ci = _amplitudes_to_coefficients_unrestricted(amps_uhf, max_order=3)
 
@@ -186,7 +210,7 @@ def debug_t2c(mf):
         "bbbbbb": ebcc.t3["bbbbbb"],
     }
     
-    ci_1 = t2c_unrestricted(mf, t1, t2, t3)
+    ci_1 = t2c_unrestricted(mf, 0, t1, t2, t3)
    
     t1_2 = {
         "aa": t1a,
@@ -206,7 +230,7 @@ def debug_t2c(mf):
         "bbbbbb": t3bbb,
     }
     
-    ci_2 = t2c_unrestricted(mf, t1_2, t2_2, t3_2)
+    ci_2 = t2c_unrestricted(mf, 0, t1_2, t2_2, t3_2)
     
     #print("T")
     #for e1, e2 in zip(t1, t1_2):
