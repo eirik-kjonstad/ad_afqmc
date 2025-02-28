@@ -198,7 +198,7 @@ def _prep_afqmc(options=None):
             wave_data.update(trial_wave_data)
             trial = wavefunctions.UCISDT(norb, nelec_sp, n_batch=options["n_batch"])
         except:
-            raise ValueError("Trial specified as ucisdt, but something not found.")
+            raise ValueError("Trial specified as UCISDT, but amplitudes.npz not found.")
     elif options["trial"] == "ucisdt":
         try:
             amplitudes = np.load(tmpdir + "/amplitudes.npz")
@@ -227,7 +227,7 @@ def _prep_afqmc(options=None):
             wave_data.update(trial_wave_data)
             trial = wavefunctions.ucisdt(norb, nelec_sp, n_batch=options["n_batch"])
         except:
-            raise ValueError("Trial specified as ucisdt, but something not found.")
+            raise ValueError("Trial specified as ucisdt, but amplitudes.npz not found.")
     else:
         try:
             with open(tmpdir + "/trial.pkl", "rb") as f:

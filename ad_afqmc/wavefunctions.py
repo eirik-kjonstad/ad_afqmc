@@ -966,8 +966,8 @@ class ghf(wave_function):
         return jnp.linalg.det(
             jnp.hstack(
                 [
-                    wave_data["mo_coeff"][: self.norb].T @ walker_up,
-                    wave_data["mo_coeff"][self.norb :].T @ walker_dn,
+                    wave_data["mo_coeff"][: self.norb].T.conj() @ walker_up,
+                    wave_data["mo_coeff"][self.norb :].T.conj() @ walker_dn,
                 ]
             )
         )
@@ -978,8 +978,8 @@ class ghf(wave_function):
     ) -> jax.Array:
         overlap_mat = jnp.hstack(
             [
-                wave_data["mo_coeff"][: self.norb].T @ walker_up,
-                wave_data["mo_coeff"][self.norb :].T @ walker_dn,
+                wave_data["mo_coeff"][: self.norb].T.conj() @ walker_up,
+                wave_data["mo_coeff"][self.norb :].T.conj() @ walker_dn,
             ]
         )
         inv = jnp.linalg.inv(overlap_mat)
@@ -1025,7 +1025,7 @@ class ghf(wave_function):
     def _calc_rdm1(self, wave_data: dict) -> jax.Array:
         dm = (
             wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]]
-            @ wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]].T
+            @ wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]].T.conj()
         )
         dm_up = dm[: self.norb, : self.norb]
         dm_dn = dm[self.norb :, self.norb :]
@@ -1069,13 +1069,14 @@ class ghf_cpmc(ghf, wave_function_cpmc):
     ) -> jnp.array:
         walker_ghf = jsp.linalg.block_diag(walker_up, walker_dn)
         overlap_mat = (
-            wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]].T @ walker_ghf
+            wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]].T.conj()
+            @ walker_ghf
         )
         inv = jnp.linalg.inv(overlap_mat)
         green = (
             walker_ghf
             @ inv
-            @ wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]].T
+            @ wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]].T.conj()
         ).diagonal()
         return jnp.array([green[: self.norb], green[self.norb :]])
 
@@ -1114,9 +1115,10 @@ class ghf_cpmc(ghf, wave_function_cpmc):
         green = (
             walker_ghf
             @ jnp.linalg.inv(
-                wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]].T @ walker_ghf
+                wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]].T.conj()
+                @ walker_ghf
             )
-            @ wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]].T
+            @ wave_data["mo_coeff"][:, : self.nelec[0] + self.nelec[1]].T.conj()
         ).T
         return green
 
@@ -2480,6 +2482,8 @@ class ucisd(wave_function):
     norb: int
     nelec: Tuple[int, int]
     n_batch: int = 1
+    mixed_real_dtype: DTypeLike = jnp.float32
+    mixed_complex_dtype: DTypeLike = jnp.complex64
 
     @partial(jit, static_argnums=0)
     def _calc_overlap(
@@ -2727,29 +2731,29 @@ class ucisd(wave_function):
             )
             glgp_a_i = jnp.einsum(
                 "pi,it->pt", gl_a_i, greenp_a, optimize="optimal"
-            ).astype(jnp.complex64)
+            ).astype(self.mixed_complex_dtype)
             glgp_b_i = jnp.einsum(
                 "pi,it->pt", gl_b_i, greenp_b, optimize="optimal"
-            ).astype(jnp.complex64)
+            ).astype(self.mixed_complex_dtype)
             l2ci2_a = 0.5 * jnp.einsum(
                 "pt,qu,ptqu->",
                 glgp_a_i,
                 glgp_a_i,
-                ci2_aa.astype(jnp.float32),
+                ci2_aa.astype(self.mixed_real_dtype),
                 optimize="optimal",
             )
             l2ci2_b = 0.5 * jnp.einsum(
                 "pt,qu,ptqu->",
                 glgp_b_i,
                 glgp_b_i,
-                ci2_bb.astype(jnp.float32),
+                ci2_bb.astype(self.mixed_real_dtype),
                 optimize="optimal",
             )
             l2ci2_ab = jnp.einsum(
                 "pt,qu,ptqu->",
                 glgp_a_i,
                 glgp_b_i,
-                ci2_ab.astype(jnp.float32),
+                ci2_ab.astype(self.mixed_real_dtype),
                 optimize="optimal",
             )
             carry[1] += l2ci2_a + l2ci2_b + l2ci2_ab
@@ -2872,6 +2876,79 @@ class cisd_eom_t_auto(wave_function_auto):
 
 
 @dataclass
+class cisd_eom_auto(wave_function_auto):
+    """(r1 + r2) (1 + c1 + c2) |0>, ad implementation"""
+
+    norb: int
+    nelec: Tuple[int, int]
+    eps: float = 1e-4
+    n_batch: int = 1
+
+    @partial(jit, static_argnums=0)
+    def _calc_overlap_restricted(self, walker: jax.Array, wave_data: dict) -> complex:
+        nocc, ci1, ci2, r1, r2 = (
+            walker.shape[1],
+            wave_data["ci1"],
+            wave_data["ci2"],
+            wave_data["r1"],
+            wave_data["r2"],
+        )
+        green = (walker.dot(jnp.linalg.inv(walker[: walker.shape[1], :]))).T
+        green_occ = green[:, nocc:]
+        # r1 terms
+        # r1 1
+        r1g = 2 * jnp.einsum("pt,pt", r1, green_occ)
+        r1_1 = r1g
+        # r1 c1
+        c1g = 2 * jnp.einsum("pt,pt", ci1, green_occ)
+        r1_c1_1 = r1g * c1g
+        r1_g = r1 @ green_occ.T
+        c1_g = ci1 @ green_occ.T
+        r1_c1_2 = -2 * jnp.einsum("pq,qp", r1_g, c1_g)
+        r1_c1 = r1_c1_1 + r1_c1_2
+        # r1 c2
+        c2g2 = 2 * jnp.einsum("ptqu,pt,qu", ci2, green_occ, green_occ) - jnp.einsum(
+            "ptqu,pu,qt", ci2, green_occ, green_occ
+        )
+        r1_c2_1 = r1g * c2g2
+        c2g_1 = jnp.einsum("ptqu,qu->pt", ci2, green_occ)
+        c2g_2 = 0.5 * jnp.einsum("ptqu,pu->qt", ci2, green_occ)
+        gc2_g = (c2g_1 - c2g_2) @ green_occ.T
+        r1_c2_2 = -4 * jnp.einsum("pq,qp", r1_g, gc2_g)
+        r1_c2 = r1_c2_1 + r1_c2_2
+
+        # r2 terms
+        # r2 1
+        r2g2 = 2 * jnp.einsum("ptqu,pt,qu", r2, green_occ, green_occ) - jnp.einsum(
+            "ptqu,pu,qt", r2, green_occ, green_occ
+        )
+        r2_1 = r2g2
+        # r2 c1
+        r2_c1_1 = r2g2 * c1g
+        r2g_1 = jnp.einsum("ptqu,qu->pt", r2, green_occ)
+        r2g_2 = 0.5 * jnp.einsum("ptqu,pu->qt", r2, green_occ)
+        gr2_g = (r2g_1 - r2g_2) @ green_occ.T
+        r2_c1_2 = -4 * jnp.einsum("pq,qp", gr2_g, c1_g)
+        r2_c1 = r2_c1_1 + r2_c1_2
+
+        # r2 c2
+        r2_c2_1 = r2g2 * c2g2
+        r2_c2_2 = -8 * jnp.einsum("pq,qp", gr2_g, gc2_g)
+        r2_int = jnp.einsum("ptqu,rt,su->prqs", r2, green_occ, green_occ)
+        c2_int = jnp.einsum("ptqu,rt,su->prqs", ci2, green_occ, green_occ)
+        r2_c2_3 = 2 * jnp.einsum("prqs,rpsq", r2_int, c2_int) - jnp.einsum(
+            "prqs,rqsp", r2_int, c2_int
+        )
+        r2_c2 = r2_c2_1 + r2_c2_2 + r2_c2_3
+
+        overlap_0 = jnp.linalg.det(walker[: walker.shape[1], :]) ** 2
+        return (r1_1 + r1_c1 + r1_c2 + r2_1 + r2_c1 + r2_c2) * overlap_0
+
+    def __hash__(self):
+        return hash(tuple(self.__dict__.values()))
+
+
+@dataclass
 class cisd_eom_t(wave_function):
     """(r1 + r2 + r1 c1 + r1 c2 + r2 c1) |0>, manual implementation"""
 
@@ -2927,16 +3004,6 @@ class cisd_eom_t(wave_function):
         gr2_g = (r2g_1 - r2g_2) @ green_occ.T
         r2_c1_2 = -4 * jnp.einsum("pq,qp", gr2_g, c1_g)
         r2_c1 = r2_c1_1 + r2_c1_2
-
-        # # r2 c2
-        # r2_c2_1 = r2g2 * c2g2
-        # r2_c2_2 = -8 * jnp.einsum("pq,qp", gr2_g, gc2_g)
-        # r2_int = jnp.einsum("ptqu,rt,su->prqs", r2, green_occ, green_occ)
-        # c2_int = jnp.einsum("ptqu,rt,su->prqs", ci2, green_occ, green_occ)
-        # r2_c2_3 = 2 * jnp.einsum("prqs,rpsq", r2_int, c2_int) - jnp.einsum(
-        #     "prqs,rqsp", r2_int, c2_int
-        # )
-        # r2_c2 = r2_c2_1 + r2_c2_2 + r2_c2_3
 
         overlap_0 = jnp.linalg.det(walker[: walker.shape[1], :]) ** 2
         return (r1_1 + r1_c1 + r1_c2 + r2_1 + r2_c1) * overlap_0
@@ -3152,41 +3219,6 @@ class cisd_eom_t(wave_function):
         e1_r1c2_2 = -2.0 * jnp.einsum("tp,pt", gp_h_g, r1_c2, optimize="optimal")
         e1_r1c2 = e1_r1c2_1 + e1_r1c2_2
 
-        # # r2 c2
-        # r2c2_c = r2g2 * c2g2
-        # # 2: spin
-        # r2c2_e_1 = -2.0 * jnp.einsum("pq,qp", r2g_g, c2g_g, optimize="optimal")
-        # # 0.5: r2
-        # r2_g = 0.5 * jnp.einsum("ptqu,rt->prqu", r2, green_occ)
-        # r2_g_g = jnp.einsum("prqu,su->prqs", r2_g, green_occ)
-        # # del r2_g
-        # # 0.5: c2
-        # c2_g = 0.5 * jnp.einsum("ptqu,rt->prqu", c2, green_occ)
-        # c2_g_g = jnp.einsum("prqu,su->prqs", c2_g, green_occ)
-        # # del c2_g
-        # # 4: spin, 2: permutation
-        # r2c2_e_2_c = 8.0 * jnp.einsum("prqs,rpsq", r2_g_g, c2_g_g, optimize="optimal")
-        # # 2: spin, 2: permutation
-        # r2c2_e_2_e = -4.0 * jnp.einsum("prqs,rqsp", r2_g_g, c2_g_g, optimize="optimal")
-        # r2c2_e_2 = r2c2_e_2_c + r2c2_e_2_e
-        # r2c2 = r2c2_c + r2c2_e_1 + r2c2_e_2
-        # e1_r2c2_1 = h1g * r2c2
-        # r2_c2 = r2g2 * c2g + r2g * c2g2 - r2g_g @ c2g - c2g_g @ r2g
-        # # 2: spin, 2: permutation
-        # r2_c2 -= 4.0 * jnp.einsum("pr,rpqu->qu", r2g_g, c2_g, optimize="optimal")
-        # r2_c2 -= 4.0 * jnp.einsum("pr,rpqu->qu", c2g_g, r2_g, optimize="optimal")
-        # # 2: permutation
-        # r2_c2 += 2.0 * jnp.einsum("pr,qpru->qu", r2g_g, c2_g, optimize="optimal")
-        # r2_c2 += 2.0 * jnp.einsum("pr,qpru->qu", c2g_g, r2_g, optimize="optimal")
-        # # 2: spin, 4: permutation
-        # r2_c2 += 8.0 * jnp.einsum("pqrs,qpst->rt", r2_g_g, c2_g, optimize="optimal")
-        # r2_c2 += 8.0 * jnp.einsum("pqrs,qpst->rt", c2_g_g, r2_g, optimize="optimal")
-        # # 4: permutation
-        # r2_c2 -= 4.0 * jnp.einsum("pqrs,spqt->rt", r2_g_g, c2_g, optimize="optimal")
-        # r2_c2 -= 4.0 * jnp.einsum("pqrs,spqt->rt", c2_g_g, r2_g, optimize="optimal")
-        # e1_r2c2_2 = -2.0 * jnp.einsum("tp,pt", gp_h_g, r2_c2, optimize="optimal")
-        # e1_r2c2 = e1_r2c2_1 + e1_r2c2_2
-
         e1 = e1_r1 + e1_r1c1 + e1_r2 + e1_r2c1 + e1_r1c2  # + e1_r2c2
 
         # 2 body energy
@@ -3393,12 +3425,716 @@ class cisd_eom_t(wave_function):
     def __hash__(self):
         return hash(tuple(self.__dict__.values()))
 
+
+@dataclass
+class cisd_eom(wave_function):
+    """(r1 + r2) (1 + c1 + c2) |0>, manual implementation
+
+    Mixed precision is only used for N^6 scaling terms in the energy calculation. Can be turned off by setting
+    mixed_real_dtype and mixed_complex_dtype to jnp.float64 and jnp.complex128 respectively.
+
+    Attributes:
+        norb: number of orbitals
+        nelec: number of electrons as tuple (alpha, beta)
+        n_batch: number of walkers in a batch
+        mixed_real_dtype: real dtype of the mixed precision
+        mixed_complex_dtype: complex dtype of the mixed precision
+    """
+
+    norb: int
+    nelec: Tuple[int, int]
+    n_batch: int = 1
+    mixed_real_dtype: DTypeLike = jnp.float32
+    mixed_complex_dtype: DTypeLike = jnp.complex64
+
+    @partial(jit, static_argnums=0)
+    def _calc_overlap_restricted(self, walker: jax.Array, wave_data: dict) -> complex:
+        nocc, ci1, ci2, r1, r2 = (
+            walker.shape[1],
+            wave_data["ci1"],
+            wave_data["ci2"],
+            wave_data["r1"],
+            wave_data["r2"],
+        )
+        green = (walker.dot(jnp.linalg.inv(walker[: walker.shape[1], :]))).T
+        green_occ = green[:, nocc:]
+        # r1 terms
+        # r1 1
+        r1g = 2 * jnp.einsum("pt,pt", r1, green_occ)
+        r1_1 = r1g
+        # r1 c1
+        c1g = 2 * jnp.einsum("pt,pt", ci1, green_occ)
+        r1_c1_1 = r1g * c1g
+        r1_g = r1 @ green_occ.T
+        c1_g = ci1 @ green_occ.T
+        r1_c1_2 = -2 * jnp.einsum("pq,qp", r1_g, c1_g)
+        r1_c1 = r1_c1_1 + r1_c1_2
+        # r1 c2
+        c2g2 = 2 * jnp.einsum("ptqu,pt,qu", ci2, green_occ, green_occ) - jnp.einsum(
+            "ptqu,pu,qt", ci2, green_occ, green_occ
+        )
+        r1_c2_1 = r1g * c2g2
+        c2g_1 = jnp.einsum("ptqu,qu->pt", ci2, green_occ)
+        c2g_2 = 0.5 * jnp.einsum("ptqu,pu->qt", ci2, green_occ)
+        gc2_g = (c2g_1 - c2g_2) @ green_occ.T
+        r1_c2_2 = -4 * jnp.einsum("pq,qp", r1_g, gc2_g)
+        r1_c2 = r1_c2_1 + r1_c2_2
+
+        # r2 terms
+        # r2 1
+        r2g2 = 2 * jnp.einsum("ptqu,pt,qu", r2, green_occ, green_occ) - jnp.einsum(
+            "ptqu,pu,qt", r2, green_occ, green_occ
+        )
+        r2_1 = r2g2
+        # r2 c1
+        r2_c1_1 = r2g2 * c1g
+        r2g_1 = jnp.einsum("ptqu,qu->pt", r2, green_occ)
+        r2g_2 = 0.5 * jnp.einsum("ptqu,pu->qt", r2, green_occ)
+        gr2_g = (r2g_1 - r2g_2) @ green_occ.T
+        r2_c1_2 = -4 * jnp.einsum("pq,qp", gr2_g, c1_g)
+        r2_c1 = r2_c1_1 + r2_c1_2
+
+        # r2 c2
+        r2_c2_1 = r2g2 * c2g2
+        r2_c2_2 = -8 * jnp.einsum("pq,qp", gr2_g, gc2_g)
+        r2_int = jnp.einsum("ptqu,rt,su->prqs", r2, green_occ, green_occ)
+        c2_int = jnp.einsum("ptqu,rt,su->prqs", ci2, green_occ, green_occ)
+        r2_c2_3 = 2 * jnp.einsum("prqs,rpsq", r2_int, c2_int) - jnp.einsum(
+            "prqs,rqsp", r2_int, c2_int
+        )
+        r2_c2 = r2_c2_1 + r2_c2_2 + r2_c2_3
+
+        overlap_0 = jnp.linalg.det(walker[: walker.shape[1], :]) ** 2
+        return (r1_1 + r1_c1 + r1_c2 + r2_1 + r2_c1 + r2_c2) * overlap_0
+
+    @partial(jit, static_argnums=0)
+    def _calc_force_bias_restricted(
+        self, walker: jax.Array, ham_data: dict, wave_data: dict
+    ) -> jax.Array:
+        c1, c2, r1, r2 = (
+            jnp.array(wave_data["ci1"]),
+            jnp.array(wave_data["ci2"]),
+            jnp.array(wave_data["r1"]),
+            jnp.array(wave_data["r2"]),
+        )
+        nocc = self.nelec[0]
+        nvirt = self.norb - nocc
+        green = (walker.dot(jnp.linalg.inv(walker[:nocc, :]))).T
+        green_occ = green[:, nocc:].copy()
+        greenp = jnp.vstack((green_occ, -jnp.eye(nvirt)))
+        chol = ham_data["chol"].reshape(-1, self.norb, self.norb)
+        rot_chol = chol[:, : self.nelec[0], :]
+
+        # r1
+        # 2: spin
+        r1g = 2 * jnp.einsum("pt,pt", r1, green_occ)
+        # 2: spin
+        lg = 2.0 * jnp.einsum("gpj,pj->g", rot_chol, green, optimize="optimal")
+        fb_r1_1 = r1g * lg
+        g_r1_gp = green.T @ (r1 @ greenp.T)
+        # 2: spin
+        fb_r1_2 = -2 * jnp.einsum("gij,ji", chol, g_r1_gp)
+        fb_r1 = fb_r1_1 + fb_r1_2
+
+        # r1 c1
+        # 2: spin
+        c1g = 2 * jnp.einsum("pt,pt", c1, green_occ)
+        r1c1_c = r1g * c1g
+        r1_g = r1 @ green_occ.T
+        c1_g = c1 @ green_occ.T
+        # 2: spin
+        r1c1_e = -2 * jnp.einsum("pq,qp", r1_g, c1_g)
+        r1c1 = r1c1_c + r1c1_e
+        fb_r1c1_1 = r1c1 * lg
+        r1_c1 = r1 * c1g + r1g * c1 - r1_g @ c1 - c1_g @ r1
+        g_r1_c1_gp = green.T @ (r1_c1 @ greenp.T)
+        # 2: spin
+        fb_r1c1_2 = -2 * jnp.einsum("gij,ji", chol, g_r1_c1_gp)
+        fb_r1c1 = fb_r1c1_1 + fb_r1c1_2
+
+        # r2
+        # 2: spin, 0.5: r2, 2: permutation
+        r2g_c = 2.0 * jnp.einsum("ptqu,pt->qu", r2, green_occ)
+        # 0.5: r2, 2: permutation
+        r2g_e = jnp.einsum("ptqu,pu->qt", r2, green_occ)
+        r2g = r2g_c - r2g_e
+        # 2: spin, 0.5: no permuation
+        r2g2 = jnp.einsum("qu,qu", r2g, green_occ, optimize="optimal")
+        fb_r2_1 = lg * r2g2
+        g_r2g_gp = green.T @ (r2g @ greenp.T)
+        # 2: spin
+        fb_r2_2 = -2.0 * jnp.einsum("gij,ji", chol, g_r2g_gp)
+        fb_r2 = fb_r2_1 + fb_r2_2
+
+        # r2 c1
+        r2c1_c = r2g2 * c1g
+        r2g_g = r2g @ green_occ.T
+        # 2: spin
+        r2c1_e = -2.0 * jnp.einsum("pq,qp", r2g_g, c1_g, optimize="optimal")
+        r2c1 = r2c1_c + r2c1_e
+        fb_r2c1_1 = lg * r2c1
+        r2_c1 = r2g * c1g + r2g2 * c1 - r2g_g @ c1 - c1_g @ r2g
+        g_c1_g = green_occ.T @ c1_g
+        # 2: spin, 2: permutation, 0.5: r2
+        r2_c1 -= 2.0 * jnp.einsum("tp,ptqu->qu", g_c1_g, r2, optimize="optimal")
+        # 2: permutation, 0.5: r2
+        r2_c1 += jnp.einsum("tq,ptqu->pu", g_c1_g, r2, optimize="optimal")
+        g_r2_c1_gp = green.T @ (r2_c1 @ greenp.T)
+        # 2: spin
+        fb_r2c1_2 = -2.0 * jnp.einsum("gij,ji", chol, g_r2_c1_gp)
+        fb_r2c1 = fb_r2c1_1 + fb_r2c1_2
+
+        # r1 c2
+        # 2: spin, 0.5: c2, 2: permutation
+        c2g_c = 2.0 * jnp.einsum("ptqu,pt->qu", c2, green_occ)
+        # 0.5: c2, 2: permutation
+        c2g_e = jnp.einsum("ptqu,pu->qt", c2, green_occ)
+        c2g = c2g_c - c2g_e
+        # 2: spin, 0.5: no permuation
+        c2g2 = jnp.einsum("qu,qu", c2g, green_occ, optimize="optimal")
+        r1c2_c = r1g * c2g2
+        c2g_g = c2g @ green_occ.T
+        # 2: spin
+        r1c2_e = -2.0 * jnp.einsum("pq,qp", r1_g, c2g_g, optimize="optimal")
+        r1c2 = r1c2_c + r1c2_e
+        fb_r1c2_1 = lg * r1c2
+        r1_c2 = r1 * c2g2 + r1g * c2g - r1_g @ c2g - c2g_g @ r1
+        g_r1_g = green_occ.T @ r1_g
+        # 2: spin, 2: permutation, 0.5: c2
+        r1_c2 -= 2.0 * jnp.einsum("tp,ptqu->qu", g_r1_g, c2, optimize="optimal")
+        # 2: permutation, 0.5: c2
+        r1_c2 += jnp.einsum("tq,ptqu->pu", g_r1_g, c2, optimize="optimal")
+        g_r1_c2_gp = green.T @ (r1_c2 @ greenp.T)
+        # 2: spin
+        fb_r1c2_2 = -2.0 * jnp.einsum("gij,ji", chol, g_r1_c2_gp)
+        fb_r1c2 = fb_r1c2_1 + fb_r1c2_2
+
+        # r2 c2
+        r2c2_c = r2g2 * c2g2
+        # 2: spin
+        r2c2_e_1 = -2.0 * jnp.einsum("pq,qp", r2g_g, c2g_g, optimize="optimal")
+        # 0.5: r2
+        r2_g = 0.5 * jnp.einsum("ptqu,rt->prqu", r2, green_occ)
+        r2_g_g = jnp.einsum("prqu,su->prqs", r2_g, green_occ)
+        # del r2_g
+        # 0.5: c2
+        c2_g = 0.5 * jnp.einsum("ptqu,rt->prqu", c2, green_occ)
+        c2_g_g = jnp.einsum("prqu,su->prqs", c2_g, green_occ)
+        # del c2_g
+        # 4: spin, 2: permutation
+        r2c2_e_2_c = 8.0 * jnp.einsum("prqs,rpsq", r2_g_g, c2_g_g, optimize="optimal")
+        # 2: spin, 2: permutation
+        r2c2_e_2_e = -4.0 * jnp.einsum("prqs,rqsp", r2_g_g, c2_g_g, optimize="optimal")
+        r2c2_e_2 = r2c2_e_2_c + r2c2_e_2_e
+        r2c2 = r2c2_c + r2c2_e_1 + r2c2_e_2
+        fb_r2c2_1 = lg * r2c2
+        r2_c2 = r2g2 * c2g + r2g * c2g2 - r2g_g @ c2g - c2g_g @ r2g
+        # 2: spin, 2: permutation
+        r2_c2 -= 4.0 * jnp.einsum("pr,rpqu->qu", r2g_g, c2_g, optimize="optimal")
+        r2_c2 -= 4.0 * jnp.einsum("pr,rpqu->qu", c2g_g, r2_g, optimize="optimal")
+        # 2: permutation
+        r2_c2 += 2.0 * jnp.einsum("pr,qpru->qu", r2g_g, c2_g, optimize="optimal")
+        r2_c2 += 2.0 * jnp.einsum("pr,qpru->qu", c2g_g, r2_g, optimize="optimal")
+        # 2: spin, 4: permutation
+        r2_c2 += 8.0 * jnp.einsum("pqrs,qpst->rt", r2_g_g, c2_g, optimize="optimal")
+        r2_c2 += 8.0 * jnp.einsum("pqrs,qpst->rt", c2_g_g, r2_g, optimize="optimal")
+        # 4: permutation
+        r2_c2 -= 4.0 * jnp.einsum("pqrs,spqt->rt", r2_g_g, c2_g, optimize="optimal")
+        r2_c2 -= 4.0 * jnp.einsum("pqrs,spqt->rt", c2_g_g, r2_g, optimize="optimal")
+        g_r2_c2_gp = green.T @ (r2_c2 @ greenp.T)
+        # 2: spin
+        fb_r2c2_2 = -2.0 * jnp.einsum("gij,ji", chol, g_r2_c2_gp)
+        fb_r2c2 = fb_r2c2_1 + fb_r2c2_2
+
+        overlap = r1g + r1c1 + r2g2 + r2c1 + r1c2 + r2c2
+        fb = (fb_r1 + fb_r1c1 + fb_r2 + fb_r2c1 + fb_r1c2 + fb_r2c2) / overlap
+        return fb
+
+    @partial(jit, static_argnums=0)
+    def _calc_energy_restricted(
+        self, walker: jax.Array, ham_data: dict, wave_data: dict
+    ) -> complex:
+        c1, c2, r1, r2 = (
+            jnp.array(wave_data["ci1"]),
+            jnp.array(wave_data["ci2"]),
+            jnp.array(wave_data["r1"]),
+            jnp.array(wave_data["r2"]),
+        )
+        nocc = self.nelec[0]
+        nvirt = self.norb - nocc
+        green = (walker.dot(jnp.linalg.inv(walker[:nocc, :]))).T
+        green_occ = green[:, nocc:].copy()
+        greenp = jnp.vstack((green_occ, -jnp.eye(nvirt)))
+        h1 = (ham_data["h1"][0] + ham_data["h1"][1]) / 2.0
+        chol = ham_data["chol"].reshape(-1, self.norb, self.norb)
+        rot_chol = chol[:, : self.nelec[0], :]
+
+        # 0 body energy
+        e0 = ham_data["h0"]
+
+        # 1 body energy
+        # r1
+        # 2: spin
+        r1g = 2 * jnp.einsum("pt,pt", r1, green_occ)
+        # 2: spin
+        h1g = 2 * jnp.einsum("pt,pt", h1[:nocc, :], green)
+        e1_r1_1 = r1g * h1g
+        gp_h_g = greenp.T @ (h1 @ green.T)
+        # 2: spin
+        e1_r1_2 = -2 * jnp.einsum("tp,pt", gp_h_g, r1)
+        e1_r1 = e1_r1_1 + e1_r1_2
+
+        # r1 c1
+        # 2: spin
+        c1g = 2 * jnp.einsum("pt,pt", c1, green_occ)
+        r1c1_c = r1g * c1g
+        r1_g = r1 @ green_occ.T
+        c1_g = c1 @ green_occ.T
+        # 2: spin
+        r1c1_e = -2 * jnp.einsum("pq,qp", r1_g, c1_g)
+        r1c1 = r1c1_c + r1c1_e
+        e1_r1c1_1 = r1c1 * h1g
+
+        r1_c1 = r1 * c1g + r1g * c1 - r1_g @ c1 - c1_g @ r1
+        # 2: spin
+        e1_r1c1_2 = -2 * jnp.einsum("tp,pt", gp_h_g, r1_c1)
+        e1_r1c1 = e1_r1c1_1 + e1_r1c1_2
+
+        # r2
+        # 2: spin, 0.5: r2, 2: permutation
+        r2g_c = 2.0 * jnp.einsum("ptqu,pt->qu", r2, green_occ)
+        # 0.5: r2, 2: permutation
+        r2g_e = jnp.einsum("ptqu,pu->qt", r2, green_occ)
+        r2g = r2g_c - r2g_e
+        # 2: spin, 0.5: no permuation
+        r2g2 = jnp.einsum("qu,qu", r2g, green_occ, optimize="optimal")
+        e1_r2_1 = h1g * r2g2
+        # 2: spin
+        e1_r2_2 = -2.0 * jnp.einsum("pt,tp", r2g, gp_h_g, optimize="optimal")
+        e1_r2 = e1_r2_1 + e1_r2_2
+
+        # r2 c1
+        r2c1_c = r2g2 * c1g
+        r2g_g = r2g @ green_occ.T
+        # 2: spin
+        r2c1_e = -2.0 * jnp.einsum("pq,qp", r2g_g, c1_g, optimize="optimal")
+        r2c1 = r2c1_c + r2c1_e
+        e1_r2c1_1 = h1g * r2c1
+        r2_c1 = r2g * c1g + r2g2 * c1 - r2g_g @ c1 - c1_g @ r2g
+        g_c1_g = green_occ.T @ c1_g
+        # 2: spin, 2: permutation, 0.5: r2
+        r2_c1 -= 2.0 * jnp.einsum("tp,ptqu->qu", g_c1_g, r2, optimize="optimal")
+        # 2: permutation, 0.5: r2
+        r2_c1 += jnp.einsum("tq,ptqu->pu", g_c1_g, r2, optimize="optimal")
+        # 2: spin
+        e1_r2c1_2 = -2.0 * jnp.einsum("tp,pt", gp_h_g, r2_c1, optimize="optimal")
+        e1_r2c1 = e1_r2c1_1 + e1_r2c1_2
+
+        # r1 c2
+        # 2: spin, 0.5: c2, 2: permutation
+        c2g_c = 2.0 * jnp.einsum("ptqu,pt->qu", c2, green_occ)
+        # 0.5: c2, 2: permutation
+        c2g_e = jnp.einsum("ptqu,pu->qt", c2, green_occ)
+        c2g = c2g_c - c2g_e
+        # 2: spin, 0.5: no permuation
+        c2g2 = jnp.einsum("qu,qu", c2g, green_occ, optimize="optimal")
+        r1c2_c = r1g * c2g2
+        c2g_g = c2g @ green_occ.T
+        # 2: spin
+        r1c2_e = -2.0 * jnp.einsum("pq,qp", r1_g, c2g_g, optimize="optimal")
+        r1c2 = r1c2_c + r1c2_e
+        e1_r1c2_1 = h1g * r1c2
+        r1_c2 = r1 * c2g2 + r1g * c2g - r1_g @ c2g - c2g_g @ r1
+        g_r1_g = green_occ.T @ r1_g
+        # 2: spin, 2: permutation, 0.5: c2
+        r1_c2 -= 2.0 * jnp.einsum("tp,ptqu->qu", g_r1_g, c2, optimize="optimal")
+        # 2: permutation, 0.5: c2
+        r1_c2 += jnp.einsum("tq,ptqu->pu", g_r1_g, c2, optimize="optimal")
+        # 2: spin
+        e1_r1c2_2 = -2.0 * jnp.einsum("tp,pt", gp_h_g, r1_c2, optimize="optimal")
+        e1_r1c2 = e1_r1c2_1 + e1_r1c2_2
+
+        # r2 c2
+        r2c2_c = r2g2 * c2g2
+        # 2: spin
+        r2c2_e_1 = -2.0 * jnp.einsum("pq,qp", r2g_g, c2g_g, optimize="optimal")
+        # 0.5: r2
+        r2_g = 0.5 * jnp.einsum("ptqu,rt->prqu", r2, green_occ)
+        r2_g_g = jnp.einsum("prqu,su->prqs", r2_g, green_occ)
+        # 0.5: c2
+        c2_g = 0.5 * jnp.einsum("ptqu,rt->prqu", c2, green_occ, optimize="optimal")
+        c2_g_g = jnp.einsum("prqu,su->prqs", c2_g, green_occ, optimize="optimal")
+        # 4: spin, 2: permutation
+        r2c2_e_2_c = 8.0 * jnp.einsum("prqs,rpsq", r2_g_g, c2_g_g, optimize="optimal")
+        # 2: spin, 2: permutation
+        r2c2_e_2_e = -4.0 * jnp.einsum("prqs,rqsp", r2_g_g, c2_g_g, optimize="optimal")
+        r2c2_e_2 = r2c2_e_2_c + r2c2_e_2_e
+        r2c2 = r2c2_c + r2c2_e_1 + r2c2_e_2
+        e1_r2c2_1 = h1g * r2c2
+        r2_c2 = r2g2 * c2g + r2g * c2g2 - r2g_g @ c2g - c2g_g @ r2g
+        # 2: spin, 2: permutation
+        r2_c2 -= 4.0 * jnp.einsum("pr,rpqu->qu", r2g_g, c2_g, optimize="optimal")
+        r2_c2 -= 4.0 * jnp.einsum("pr,rpqu->qu", c2g_g, r2_g, optimize="optimal")
+        # 2: permutation
+        r2_c2 += 2.0 * jnp.einsum("pr,qpru->qu", r2g_g, c2_g, optimize="optimal")
+        r2_c2 += 2.0 * jnp.einsum("pr,qpru->qu", c2g_g, r2_g, optimize="optimal")
+        # 2: spin, 4: permutation
+        r2_c2 += 8.0 * jnp.einsum("pqrs,qpst->rt", r2_g_g, c2_g, optimize="optimal")
+        r2_c2 += 8.0 * jnp.einsum("pqrs,qpst->rt", c2_g_g, r2_g, optimize="optimal")
+        # 4: permutation
+        r2_c2 -= 4.0 * jnp.einsum("pqrs,spqt->rt", r2_g_g, c2_g, optimize="optimal")
+        r2_c2 -= 4.0 * jnp.einsum("pqrs,spqt->rt", c2_g_g, r2_g, optimize="optimal")
+        e1_r2c2_2 = -2.0 * jnp.einsum("tp,pt", gp_h_g, r2_c2, optimize="optimal")
+        e1_r2c2 = e1_r2c2_1 + e1_r2c2_2
+
+        e1 = e1_r1 + e1_r1c1 + e1_r2 + e1_r2c1 + e1_r1c2 + e1_r2c2
+
+        # 2 body energy
+        # 2: spin
+        lg = 2.0 * jnp.einsum("gpj,pj->g", rot_chol, green, optimize="optimal")
+        l_g = jnp.einsum("gpj,qj->gpq", rot_chol, green, optimize="optimal")
+        # 0.5: coulomb
+        l2g2_c = 0.5 * (lg @ lg)
+        l2g2_e = -jnp.sum(vmap(lambda x: x * x.T)(l_g))
+        l2g2 = l2g2_c + l2g2_e
+
+        # doing this first to build intermediates
+        # r2
+        e2_r2_1 = l2g2 * r2g2
+
+        # carry: [e2_r2_, e2_c2_, e2_r1c1_, e2_r2c1_, e2_r1c2_, e2_r2c2_, l2g]
+        def loop_over_chol(carry, x):
+            chol_i, lg_i, l_g_i = x
+            # build intermediate
+            gp_l_g_i = greenp.T @ (chol_i @ green.T)
+            # 0.5: coulomb, 2: permutation
+            l2g_i_c = gp_l_g_i * lg_i
+            l2g_i_e = gp_l_g_i @ l_g_i
+            l2g_i = l2g_i_c - l2g_i_e
+            carry[6] += l2g_i
+
+            gp_l_g_i = gp_l_g_i.astype(self.mixed_complex_dtype)
+            # evaluate energy
+            # r2
+            # 4: spin, 2: permutation, 0.5: r2, 0.5: coulomb
+            l2r2_c = 2.0 * jnp.einsum(
+                "tp,uq,ptqu",
+                gp_l_g_i,
+                gp_l_g_i,
+                r2.astype(self.mixed_real_dtype),
+                optimize="optimal",
+            )
+            # 2: spin, 2: permutation, 0.5: r2, 0.5: coulomb
+            l2r2_e = jnp.einsum(
+                "up,tq,ptqu",
+                gp_l_g_i,
+                gp_l_g_i,
+                r2.astype(self.mixed_real_dtype),
+                optimize="optimal",
+            )
+            l2r2 = l2r2_c - l2r2_e
+            carry[0] += l2r2
+
+            # c2
+            # 4: spin, 2: permutation, 0.5: c2, 0.5: coulomb
+            l2c2_c = 2.0 * jnp.einsum(
+                "tp,uq,ptqu",
+                gp_l_g_i,
+                gp_l_g_i,
+                c2.astype(self.mixed_real_dtype),
+                optimize="optimal",
+            )
+            # 2: spin, 2: permutation, 0.5: c2, 0.5: coulomb
+            l2c2_e = jnp.einsum(
+                "up,tq,ptqu",
+                gp_l_g_i,
+                gp_l_g_i,
+                c2.astype(self.mixed_real_dtype),
+                optimize="optimal",
+            )
+            l2c2 = l2c2_c - l2c2_e
+            carry[1] += l2c2
+
+            # r1 c1
+            # 2: spin
+            lr1 = -2.0 * jnp.einsum("tp,pt", gp_l_g_i, r1, optimize="optimal")
+            lc1 = -2.0 * jnp.einsum("tp,pt", gp_l_g_i, c1, optimize="optimal")
+            # 2: permutation, 0.5: coulomb
+            l2r1c1_c = lr1 * lc1
+            # 2: spin, 2: permutation, 0.5: coulomb
+            l2r1c1_e = 2.0 * jnp.einsum(
+                "up,tq,pt,qu",
+                gp_l_g_i,
+                gp_l_g_i,
+                r1.astype(self.mixed_real_dtype),
+                c1.astype(self.mixed_real_dtype),
+                optimize="optimal",
+            )
+            l2r1c1 = l2r1c1_c - l2r1c1_e
+            carry[2] += l2r1c1
+
+            # r2 c1
+            # 2: spin
+            lr2g = -2.0 * jnp.einsum("tp,pt", gp_l_g_i, r2g, optimize="optimal")
+            # 2: permutation, 0.5: coulomb
+            l2r2c1_1_c = lc1 * lr2g
+            # 2: spin, 2: permutation, 0.5: coulomb
+            l2r2c1_1_e = 2.0 * jnp.einsum(
+                "up,tq,pt,qu",
+                gp_l_g_i,
+                gp_l_g_i,
+                r2g.astype(self.mixed_complex_dtype),
+                c1.astype(self.mixed_real_dtype),
+                optimize="optimal",
+            )
+            l2r2c1_1 = l2r2c1_1_c - l2r2c1_1_e
+
+            # 2: spin, 0.5: r2, 2: permutation
+            lr2_c = -2.0 * jnp.einsum(
+                "tp,ptqu->qu",
+                gp_l_g_i,
+                r2.astype(self.mixed_real_dtype),
+                optimize="optimal",
+            )
+            # 0.5: r2, 2: permutation
+            lr2_e = jnp.einsum(
+                "tp,puqt->qu",
+                gp_l_g_i,
+                r2.astype(self.mixed_real_dtype),
+                optimize="optimal",
+            )
+            lr2 = lr2_c + lr2_e
+            lr2_c1 = (lr2 @ green_occ.T) @ c1
+            c1_lr2 = c1_g @ lr2
+            # 2: spin, 2: permutation, 0.5: coulomb
+            l2r2c1_2 = 2.0 * jnp.einsum(
+                "tp,pt", gp_l_g_i, lr2_c1 + c1_lr2, optimize="optimal"
+            )
+            l2r2c1 = l2r2c1_1 + l2r2c1_2
+            carry[3] += l2r2c1
+
+            # r1 c2
+            # 2: spin
+            lc2g = -2.0 * jnp.einsum("tp,pt", gp_l_g_i, c2g, optimize="optimal")
+            # 2: permutation, 0.5: coulomb
+            l2r1c2_1_c = lr1 * lc2g
+            # 2: spin, 2: permutation, 0.5: coulomb
+            l2r1c2_1_e = 2.0 * jnp.einsum(
+                "up,tq,pt,qu",
+                gp_l_g_i,
+                gp_l_g_i,
+                r1.astype(self.mixed_real_dtype),
+                c2g.astype(self.mixed_complex_dtype),
+                optimize="optimal",
+            )
+            l2r1c2_1 = l2r1c2_1_c - l2r1c2_1_e
+
+            # 2: spin, 0.5: c2, 2: permutation
+            lc2_c = -2.0 * jnp.einsum(
+                "tp,ptqu->qu",
+                gp_l_g_i,
+                c2.astype(self.mixed_real_dtype),
+                optimize="optimal",
+            )
+            # 0.5: c2, 2: permutation
+            lc2_e = jnp.einsum(
+                "tp,puqt->qu",
+                gp_l_g_i,
+                c2.astype(self.mixed_real_dtype),
+                optimize="optimal",
+            )
+            lc2 = lc2_c + lc2_e
+            lc2_r1 = (lc2 @ green_occ.T) @ r1
+            r1_lc2 = r1_g @ lc2
+            # 2: spin, 2: permutation, 0.5: coulomb
+            l2r1c2_2 = 2.0 * jnp.einsum(
+                "tp,pt", gp_l_g_i, lc2_r1 + r1_lc2, optimize="optimal"
+            )
+            l2r1c2 = l2r1c2_1 + l2r1c2_2
+            carry[4] += l2r1c2
+
+            # r2 c2
+            # 2: permutation, 0.5: coulomb
+            l2r2c2_1_c = lr2g * lc2g
+            # 2: spin, 2: permutation, 0.5: coulomb
+            l2r2c2_1_e = -2.0 * jnp.einsum(
+                "up,tq,pt,qu",
+                gp_l_g_i,
+                gp_l_g_i,
+                r2g.astype(self.mixed_complex_dtype),
+                c2g.astype(self.mixed_complex_dtype),
+                optimize="optimal",
+            )
+            l2r2c2_1 = l2r2c2_1_c + l2r2c2_1_e
+
+            lr2_g = lr2 @ green_occ.T
+            lr2_c2g = lr2_g @ c2g
+            # 2: spin, 2: permutaion, 0.5: coulomb
+            l2r2c2_2_1 = 2.0 * jnp.einsum(
+                "tp,pt", gp_l_g_i, lr2_c2g, optimize="optimal"
+            )
+            c2g_lr2 = c2g_g @ lr2
+            # 2: spin, 2: permutation, 0.5: coulomb
+            l2r2c2_2_2 = 2.0 * jnp.einsum(
+                "tp,pt", gp_l_g_i, c2g_lr2, optimize="optimal"
+            )
+            lc2_g = lc2 @ green_occ.T
+            lc2_r2g = lc2_g @ r2g
+            # 2: spin, 2: permutation, 0.5: coulomb
+            l2r2c2_2_3 = 2.0 * jnp.einsum(
+                "tp,pt", gp_l_g_i, lc2_r2g, optimize="optimal"
+            )
+            r2g_lc2 = r2g_g @ lc2
+            # 2: spin, 2: permutation, 0.5: coulomb
+            l2r2c2_2_4 = 2.0 * jnp.einsum(
+                "tp,pt", gp_l_g_i, r2g_lc2, optimize="optimal"
+            )
+            l2r2c2_2 = l2r2c2_2_1 + l2r2c2_2_2 + l2r2c2_2_3 + l2r2c2_2_4
+
+            # 4: spin, 0.5: coulomb, 0.5: r2, 4: permutation
+            l2r2c2_3_1_1_c = 4.0 * jnp.einsum(
+                "vp,wq,rvsw,prqs",
+                gp_l_g_i,
+                gp_l_g_i,
+                r2.astype(self.mixed_real_dtype),
+                c2_g_g.astype(self.mixed_complex_dtype),
+                optimize="optimal",
+            )
+            # 2: spin, 0.5: coulomb, 0.5; r2, 4: permutation
+            l2r2c2_3_1_1_e = -2.0 * jnp.einsum(
+                "vp,wq,svrw,prqs",
+                gp_l_g_i,
+                gp_l_g_i,
+                r2.astype(self.mixed_real_dtype),
+                c2_g_g.astype(self.mixed_complex_dtype),
+                optimize="optimal",
+            )
+            l2r2c2_3_1_1 = l2r2c2_3_1_1_c + l2r2c2_3_1_1_e
+            # 4: spin, 0.5: coulomb, 0.5: c2, 4: permutation
+            l2r2c2_3_1_2_c = 4.0 * jnp.einsum(
+                "vp,wq,rvsw,prqs",
+                gp_l_g_i,
+                gp_l_g_i,
+                c2.astype(self.mixed_real_dtype),
+                r2_g_g.astype(self.mixed_complex_dtype),
+                optimize="optimal",
+            )
+            # 2: spin, 0.5: coulomb, 0.5: c2, 4: permutation
+            l2r2c2_3_1_2_e = -2.0 * jnp.einsum(
+                "vp,wq,svrw,prqs",
+                gp_l_g_i,
+                gp_l_g_i,
+                c2.astype(self.mixed_real_dtype),
+                r2_g_g.astype(self.mixed_complex_dtype),
+                optimize="optimal",
+            )
+            l2r2c2_3_1_2 = l2r2c2_3_1_2_c + l2r2c2_3_1_2_e
+            l2r2c2_3_1 = l2r2c2_3_1_1 + l2r2c2_3_1_2
+
+            # 4: spin, 8: permutation, 0.5: coulomb
+            l2r2c2_3_2 = 16.0 * jnp.einsum(
+                "vq,us,rpsv,prqu",
+                gp_l_g_i,
+                gp_l_g_i,
+                r2_g.astype(self.mixed_complex_dtype),
+                c2_g.astype(self.mixed_complex_dtype),
+                optimize="optimal",
+            )
+
+            # 2: spin, 8: permutation, 0.5: coulomb
+            l2r2c2_3_3_1 = -8.0 * jnp.einsum(
+                "vq,us,sprv,prqu",
+                gp_l_g_i,
+                gp_l_g_i,
+                r2_g.astype(self.mixed_complex_dtype),
+                c2_g.astype(self.mixed_complex_dtype),
+                optimize="optimal",
+            )
+            l2r2c2_3_3_2 = -8.0 * jnp.einsum(
+                "vq,us,sprv,prqu",
+                gp_l_g_i,
+                gp_l_g_i,
+                c2_g.astype(self.mixed_complex_dtype),
+                r2_g.astype(self.mixed_complex_dtype),
+                optimize="optimal",
+            )
+            l2r2c2_3_3 = l2r2c2_3_3_1 + l2r2c2_3_3_2
+
+            # 4: spin, 8: permutation, 0.5: coulomb
+            l2r2c2_3_4 = 16.0 * jnp.einsum(
+                "vp,us,sqrv,prqu",
+                gp_l_g_i,
+                gp_l_g_i,
+                r2_g.astype(self.mixed_complex_dtype),
+                c2_g.astype(self.mixed_complex_dtype),
+                optimize="optimal",
+            )
+
+            l2r2c2_3 = l2r2c2_3_1 + l2r2c2_3_2 + l2r2c2_3_3 + l2r2c2_3_4
+
+            # 2: spin, 2: permutation, 0.5: coulomb
+            l2r2c2_4 = -2.0 * jnp.einsum("pq,qp", lr2_g, lc2_g, optimize="optimal")
+
+            l2r2c2 = l2r2c2_1 + l2r2c2_2 + l2r2c2_3 + l2r2c2_4
+            carry[5] += l2r2c2
+
+            return carry, 0.0
+
+        l2g = jnp.zeros((nvirt, nocc)) + 0.0j
+        [e2_r2_3, e2_c2_3, e2_r1c1_3, e2_r2c1_3, e2_r1c2_3, e2_r2c2_3, l2g], _ = (
+            lax.scan(
+                loop_over_chol,
+                [0.0j, 0.0j, 0.0j, 0.0j, 0.0j, 0.0j, l2g],
+                (chol, lg, l_g),
+            )
+        )
+        e2_r2_2 = -2.0 * jnp.einsum("tp,pt->", l2g, r2g, optimize="optimal")
+        e2_r2 = e2_r2_1 + e2_r2_2 + e2_r2_3
+
+        # r1
+        e2_r1_1 = l2g2 * r1g
+        # 2: spin
+        e2_r1_2 = -2.0 * jnp.einsum("tp,pt->", l2g, r1, optimize="optimal")
+        e2_r1 = e2_r1_1 + e2_r1_2 + e2_r1c1_3
+
+        # r1 c1
+        e2_r1c1_1 = l2g2 * r1c1
+        e2_r1c1_2 = -2.0 * jnp.einsum("tp,pt", l2g, r1_c1, optimize="optimal")
+        e2_r1c1 = e2_r1c1_1 + e2_r1c1_2
+
+        # r2 c1
+        e2_r2c1_1 = l2g2 * r2c1
+        e2_r2c1_2 = -2.0 * jnp.einsum("tp,pt", l2g, r2_c1, optimize="optimal")
+        e2_r2c1_3 += e2_r2_3 * c1g
+        e2_r2c1 = e2_r2c1_1 + e2_r2c1_2 + e2_r2c1_3
+
+        # r1 c2
+        e2_r1c2_1 = l2g2 * r1c2
+        e2_r1c2_2 = -2.0 * jnp.einsum("tp,pt", l2g, r1_c2, optimize="optimal")
+        e2_r1c2_3 += r1g * e2_c2_3
+        e2_r1c2 = e2_r1c2_1 + e2_r1c2_2 + e2_r1c2_3
+
+        # r2 c2
+        e2_r2c2_1 = l2g2 * r2c2
+        e2_r2c2_2 = -2.0 * jnp.einsum("tp,pt", l2g, r2_c2, optimize="optimal")
+        e2_r2c2_3 += r2g2 * e2_c2_3
+        e2_r2c2_3 += c2g2 * e2_r2_3
+        e2_r2c2 = e2_r2c2_1 + e2_r2c2_2 + e2_r2c2_3
+
+        e2 = e2_r1 + e2_r2 + e2_r1c1 + e2_r2c1 + e2_r1c2 + e2_r2c2
+
+        overlap = r1g + r1c1 + r2g2 + r2c1 + r1c2 + r2c2
+        return (e1 + e2) / overlap + e0
+
+    def __hash__(self):
+        return hash(tuple(self.__dict__.values()))
+
 @dataclass
 class UCISDT(wave_function_auto):
-    """This class contains functions for the CISDT wavefunction
-    |0> + c(ia) |ia> + c(ia jb) |ia jb> + c(ia jb kc) |ia jb kc>
+    """This class contains functions for the UCISDT wavefunction
+    |0> + c(ia) |ia> + c(ia jb) |ia jb>
 
-    . The wave_data need to store the coefficient C(ia), C(ia jb) and C(ia jb kc)
+    . The wave_data need to store the coefficient C(ia) and C(ia jb)
     """
 
     norb: int
@@ -3423,12 +4159,13 @@ class UCISDT(wave_function_auto):
         noccA, ci1A, ci2AA = self.nelec[0], wave_data["ci1A"], wave_data["ci2AA"]
         noccB, ci1B, ci2BB = self.nelec[1], wave_data["ci1B"], wave_data["ci2BB"]
         ci2AB = wave_data["ci2AB"]
-        moA, moB = wave_data["mo_coeff"][0], wave_data["mo_coeff"][1]
 
         ci3AAA = wave_data["ci3AAA"]
         ci3AAB = wave_data["ci3AAB"]
         ci3ABB = wave_data["ci3ABB"]
         ci3BBB = wave_data["ci3BBB"]
+
+        moA, moB = wave_data["mo_coeff"][0], wave_data["mo_coeff"][1]
 
         walker_dn_B = moB.T.dot(
             walker_dn[:, :noccB]
@@ -3444,33 +4181,24 @@ class UCISDT(wave_function_auto):
             "ia,ia", ci1B, GFB[:, noccB:]
         )
 
-        # AA
         o2 = 0.5 * jnp.einsum("iajb, ia, jb", ci2AA, GFA[:, noccA:], GFA[:, noccA:])
-
-        # BB
         o2 += 0.5 * jnp.einsum("iajb, ia, jb", ci2BB, GFB[:, noccB:], GFB[:, noccB:])
-
-        # AB
         o2 += jnp.einsum("iajb, ia, jb", ci2AB, GFA[:, noccA:], GFB[:, noccB:])
 
-        # T
-        ## AAA
-        o3 = (1.0/6.0) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, GFA[:, noccA:], GFA[:, noccA:], GFA[:, noccA:])
-        ## BBB
-        o3 += (1.0/6.0) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, GFB[:, noccB:], GFB[:, noccB:], GFB[:, noccB:])
-        ## AAB
-        o3 += 0.5 * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, GFA[:, noccA:], GFA[:, noccA:], GFB[:, noccB:])
-        ## ABB
-        o3 += 0.5 * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, GFA[:, noccA:], GFB[:, noccB:], GFB[:, noccB:])
+        o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, GFA[:, noccA:], GFA[:, noccA:], GFA[:, noccA:])
+              +(1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, GFB[:, noccB:], GFB[:, noccB:], GFB[:, noccB:])
+              +(1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, GFA[:, noccA:], GFA[:, noccA:], GFB[:, noccB:])
+              +(1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, GFA[:, noccA:], GFB[:, noccB:], GFB[:, noccB:]))
 
         return (1.0 + o1 + o2 + o3) * o0
 
     def __hash__(self) -> int:
         return hash(tuple(self.__dict__.values()))
 
+
 @dataclass
 class ucisdt(wave_function):
-    """Eirik's manual implementation of the UCISDT wave function."""
+    """A manual implementation of the UCISDT wave function."""
 
     norb: int
     nelec: Tuple[int, int]
@@ -3504,32 +4232,6 @@ class ucisdt(wave_function):
         ci3AAB = wave_data["ci3AAB"]
         ci3ABB = wave_data["ci3ABB"]
         ci3BBB = wave_data["ci3BBB"]
-
-        # o3aaa with symmetries
-        #o3aaa = (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_a, green_a, green_a)
-
-        # o3aaa without symmetries
-        # o3aaa_wo = (1/36) * (
-        #         jnp.einsum("ptqurs,pt,qu,rs", ci3AAA, green_a, green_a, green_a)
-        #        -jnp.einsum("ptqurs,pt,qs,ru", ci3AAA, green_a, green_a, green_a)
-        #        -jnp.einsum("ptqurs,pu,qt,rs", ci3AAA, green_a, green_a, green_a)
-        #        +jnp.einsum("ptqurs,pu,qs,rt", ci3AAA, green_a, green_a, green_a)
-        #        +jnp.einsum("ptqurs,ps,qt,ru", ci3AAA, green_a, green_a, green_a)
-        #        -jnp.einsum("ptqurs,ps,qu,rt", ci3AAA, green_a, green_a, green_a)
-        #     )
-
-        # print(f"with sym: {o3aaa}")
-        # print(f"without sym: {o3aaa_wo}")
-
-        # o3aab = (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_a, green_a, green_b)
-
-        # o3aab_wo = (1/4) * (
-        #         jnp.einsum("ptqurs,rs,pt,qu", ci3AAB, green_b, green_a, green_a)
-        #        -jnp.einsum("ptqurs,rs,pu,qt", ci3AAB, green_b, green_a, green_a)
-        #     )
-
-        # print(f"with sym: {o3aab}")
-        # print(f"without sym: {o3aab_wo}") 
 
         o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, green_a, green_a, green_a)
              + (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, green_b, green_b, green_b)
@@ -3615,8 +4317,6 @@ class ucisdt(wave_function):
              + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_occ_a, green_occ_a, green_occ_b)
              + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_occ_a, green_occ_b, green_occ_b) )
 
-        #print(f"triples ovlp: {o3}")
-
         overlap = overlap + o3  # triples term in overlap
 
         fb_3 = self.calc_force_bias_triples(wave_data, green_a, green_b, chol_a, chol_b)
@@ -3667,8 +4367,6 @@ class ucisdt(wave_function):
         CGGGa = jnp.einsum("pt,pt->", CGGa, Go_a)
         CGGGb = jnp.einsum("pt,pt->", CGGb, Go_b)
 
-        #fb_aaa = (1/6) * CGGGa * Xa - (1/2) * jnp.einsum("pt,gpt->g", CGGa, Ya)
-        #fb_bbb = (1/6) * CGGGb * Xb - (1/2) * jnp.einsum("pt,gpt->g", CGGb, Yb)
         fb_aaa = (1/6) * CGGGa * X - (1/2) * jnp.einsum("pt,gpt->g", CGGa, Ya)
         fb_bbb = (1/6) * CGGGb * X - (1/2) * jnp.einsum("pt,gpt->g", CGGb, Yb)
 
@@ -3843,29 +4541,32 @@ class ucisdt(wave_function):
             )
             glgp_a_i = jnp.einsum(
                 "pi,it->pt", gl_a_i, greenp_a, optimize="optimal"
-            ).astype(jnp.complex64)
+            ).astype(jnp.complex128)
             glgp_b_i = jnp.einsum(
                 "pi,it->pt", gl_b_i, greenp_b, optimize="optimal"
-            ).astype(jnp.complex64)
+            ).astype(jnp.complex128)
             l2ci2_a = 0.5 * jnp.einsum(
                 "pt,qu,ptqu->",
                 glgp_a_i,
                 glgp_a_i,
-                ci2_aa.astype(jnp.float32),
+                ci2_aa.astype(jnp.float64),
+                #ci2_aa.astype(jnp.float32),
                 optimize="optimal",
             )
             l2ci2_b = 0.5 * jnp.einsum(
                 "pt,qu,ptqu->",
                 glgp_b_i,
                 glgp_b_i,
-                ci2_bb.astype(jnp.float32),
+                ci2_bb.astype(jnp.float64),
+                #ci2_bb.astype(jnp.float32),
                 optimize="optimal",
             )
             l2ci2_ab = jnp.einsum(
                 "pt,qu,ptqu->",
                 glgp_a_i,
                 glgp_b_i,
-                ci2_ab.astype(jnp.float32),
+                ci2_ab.astype(jnp.float64),
+                #ci2_ab.astype(jnp.float32),
                 optimize="optimal",
             )
             carry[1] += l2ci2_a + l2ci2_b + l2ci2_ab
@@ -3884,11 +4585,6 @@ class ucisdt(wave_function):
         overlap_2 = gci2g
         overlap = 1.0 + overlap_1 + overlap_2
 
-        # triples
-        # we reuse force bias routine to calculate one-electron energy 
-
-        # overlap is missing triples term!!
-
         ci3AAA = wave_data["ci3AAA"]
         ci3AAB = wave_data["ci3AAB"]
         ci3ABB = wave_data["ci3ABB"]
@@ -3899,37 +4595,19 @@ class ucisdt(wave_function):
              + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, green_occ_a, green_occ_a, green_occ_b)
              + (1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, green_occ_a, green_occ_b, green_occ_b) )
 
-        overlap = overlap + o3  # triples term in overlap
-
-        eff_h1a = h1_a #- 0.5*jnp.einsum("gik,gjk->ij", chol_a, chol_a)
-        eff_h1b = h1_b #- 0.5*jnp.einsum("gik,gjk->ij", chol_b, chol_b)
+        overlap = overlap + o3  
 
         e3_1 = self.calc_force_bias_triples(wave_data, green_a, green_b, 
-            eff_h1a.reshape(1,self.norb,self.norb), eff_h1b.reshape(1,self.norb,self.norb))
+            h1_a.reshape(1,self.norb,self.norb), h1_b.reshape(1,self.norb,self.norb))
 
-        e3_2 = self.calc_2e_energy_triples(wave_data, green_a, green_b, chol_a, chol_b, overlap)
+        e3_2 = self.calc_2e_energy_triples(wave_data, green_a, green_b, chol_a, chol_b)
       
         e3 = e3_1 + e3_2
-
-        #print(f"triples (1e): {e3_1}")
-        #print(f"triples (2e): {e3_2}")
-        #print(f"triples (ovlp): {o3}")
-
-        print(f"Zero-body: {e0}")
-        # print(f"One-body energy wo triples: {(e1)/(overlap-o3)}")
-        print(f"One-body energy: {(e1+e3_1)/overlap}")
-        # print(f"Two-body energy wo triples: {(e2)/(overlap-o3)}")
-        print(f"Two-body energy: {(e2+e3_2)/overlap}")
-
-        print(f"T contr to 1-body energy: {(e3_1)/overlap}")
-        print(f"T contr to 2-body energy: {(e3_2)/overlap}")
-#
-        print(f"Total energy: {(e1 + e2 + e3) / overlap + e0}")
 
         return (e1 + e2 + e3) / overlap + e0
 
     @partial(jit, static_argnums=0)
-    def calc_2e_energy_triples(self, wave_data, Ga, Gb, La, Lb, overlap):
+    def calc_2e_energy_triples(self, wave_data, Ga, Gb, La, Lb):
         #
         # Ga and Gb: green's functions for a and b spin
         # Dimensions (n_occ,n_mo) because first index is zero if virtual
@@ -4000,14 +4678,12 @@ class ucisdt(wave_function):
 
         Eaaa2 = ( -(1/12) * CaaaGaGaGa * LGLG 
                   +(1/4) * jnp.einsum("git,gij,pj,pt->", Ya, Lo_a, Ga, CaaaGaGa) )
-                  #+(1/4) * jnp.einsum("pt,pt->", GaLaGaLaGpa, CaaaGaGa) )
 
         GbLbGbLb = jnp.einsum("gpl,gkl->pk", GbLbGb, Lb)
         GbLbGbLbGpb = jnp.einsum("pk,kt->pt", GbLbGbLb, Gp_b)
 
         Ebbb2 = ( -(1/12) * CbbbGbGbGb * LGLG
                   +(1/4) * jnp.einsum("git,gij,pj,pt->", Yb, Lo_b, Gb, CbbbGbGb) ) 
-                  #+(1/4) * jnp.einsum("pt,pt->", GbLbGbLbGpb, CbbbGbGb) )
 
         # 3. 
         LaGpa = jnp.einsum("gij,it->gjt", La, Gp_a)
@@ -4015,7 +4691,6 @@ class ucisdt(wave_function):
 
         YaYa = jnp.einsum("gpt,gqu->ptqu", Ya, Ya)
 
-        # (1/4) * jnp.einsum("pt,pt->", LaGpa_GaLaGa, CaaaGaGa)
         Eaaa3 = ( (1/4) * jnp.einsum("gkt,pt,gkl,pl->", Ya, CaaaGaGa, Lo_a, Ga)
                     + (1/2) * jnp.einsum("ptqu,ptqu", YaYa, CaaaGa)
                     - (1/4) * jnp.einsum("gpt,pt,g->", Ya, CaaaGaGa, X) )
@@ -4025,23 +4700,12 @@ class ucisdt(wave_function):
 
         YbYb = jnp.einsum("gpt,gqu->ptqu", Yb, Yb)
 
-        # (1/4) * jnp.einsum("pt,pt->", LbGpb_GbLbGb, CbbbGbGb)
         Ebbb3 = ( (1/4) * jnp.einsum("gkt,pt,gkl,pl->", Yb, CbbbGbGb, Lo_b, Gb)
                     + (1/2) * jnp.einsum("ptqu,ptqu", YbYb, CbbbGb)
                     - (1/4) * jnp.einsum("gpt,pt,g->", Yb, CbbbGbGb, X) )
 
         Eaaa = Eaaa1 + Eaaa2 + Eaaa3
         Ebbb = Ebbb1 + Ebbb2 + Ebbb3
-
-        print(f"aaa energy: {Eaaa/overlap}")
-        # print(f"aaa1 energy: {Eaaa1}")
-        # print(f"aaa2 energy: {Eaaa2}")
-        # print(f"aaa3 energy: {Eaaa3}")
-       
-        print(f"bbb energy: {Ebbb/overlap}")
-        # print(f"bbb1 energy: {Ebbb1}")
-        # print(f"bbb2 energy: {Ebbb2}")
-        # print(f"bbb3 energy: {Ebbb3}")
 
         # aab
         # 1
@@ -4059,10 +4723,6 @@ class ucisdt(wave_function):
         Eaab2 = ( -(1/4) * LGLG *  CaabGaGaGb 
                     +(1/2) * jnp.einsum("gij,pj,git,pt->", Lo_a, Ga, Ya, CaabGaGb) 
                     +(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab) )
-                    #-(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab) )
-
-        #yes, symmetry?
-        #print(f"is this zero? {(1/4) * jnp.einsum("gij,rj,gis,rs->", Lo_b, Gb, Yb, GaGaCaab)}")
 
         CaabGb = jnp.einsum("ptqurs,rs->ptqu", Caab, Go_b)
 
@@ -4080,8 +4740,6 @@ class ucisdt(wave_function):
                     +(1/2) * jnp.einsum("grs,gpt,ptrs->", Yb, Ya, GaCaab) )
 
         Eaab = Eaab1 + Eaab2 + Eaab3 + Eaab5
-
-        print(f"aab energy: {Eaab/overlap}")
 
         # abb
         CabbGb = jnp.einsum("ptqurs,rs->ptqu", Cabb, Go_b)
@@ -4111,8 +4769,6 @@ class ucisdt(wave_function):
                     +(1/2) * jnp.einsum("qurs,gqu,grs->", GaCabb, Yb, Yb) )
 
         Eabb = Eabb1 + Eabb2 + Eabb3 + Eabb4
-
-        print(f"abb energy: {Eabb/overlap}")
 
         E = Eaaa + Ebbb + Eaab + Eabb
 
@@ -4144,4 +4800,3 @@ class ucisdt(wave_function):
 
     def __hash__(self):
         return hash(tuple(self.__dict__.values()))
-
