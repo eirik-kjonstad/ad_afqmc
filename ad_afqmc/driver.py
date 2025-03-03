@@ -386,32 +386,38 @@ def afqmc(
                 (global_block_weights, global_block_energies, global_block_observables)
             ).T,
         )
-        if options["ad_mode"] is not None and options["ad_mode"] != "2rdm":
-            samples_clean, idx = stat_utils.reject_outliers(
-                np.stack(
-                    (
-                        global_block_weights,
-                        global_block_energies,
-                        global_block_observables,
-                    )
-                ).T,
-                2,
-            )
-        else:
-            samples_clean, idx = stat_utils.reject_outliers(
-                np.stack(
-                    (
-                        global_block_weights,
-                        global_block_energies,
-                        global_block_observables,
-                    )
-                ).T,
-                1,
-            )
+        # EFK: temporary fix of outlier rejection for small number of walkers/process
+        # 
+        # if options["ad_mode"] is not None and options["ad_mode"] != "2rdm":
+        #     samples_clean, idx = stat_utils.reject_outliers(
+        #         np.stack(
+        #             (
+        #                 global_block_weights,
+        #                 global_block_energies,
+        #                 global_block_observables,
+        #             )
+        #         ).T,
+        #         2,
+        #     )
+        # else:
+        #     samples_clean, idx = stat_utils.reject_outliers(
+        #         np.stack(
+        #             (
+        #                 global_block_weights,
+        #                 global_block_energies,
+        #                 global_block_observables,
+        #             )
+        #         ).T,
+        #         1,
+        #     )
 
-        print(
-            f"# Number of outliers in post: {global_block_weights.size - samples_clean.shape[0]} "
-        )
+        # print(
+        #     f"# Number of outliers in post: {global_block_weights.size - samples_clean.shape[0]} "
+        # )
+        # => Replacing samples-clean with samples
+        samples_clean = np.stack(
+            (global_block_weights, global_block_energies, global_block_observables)
+        ).T 
         np.savetxt(tmpdir + "/samples.dat", samples_clean)
         global_block_weights = samples_clean[:, 0]
         global_block_energies = samples_clean[:, 1]
