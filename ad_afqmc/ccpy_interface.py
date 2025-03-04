@@ -166,7 +166,7 @@ def completely_antisymmetrize_3(X3):
 
 def completely_symmetrize_pairs_2(X2):
     Y2 = 0.5e0 * (X2 + X2.transpose(2,3,0,1))
-    return Y2 
+    return Y2
 
 def completely_antisymmetrize_2(X2):
     Y2 = 0.5 * (X2 - X2.transpose(0, 3, 2, 1))
