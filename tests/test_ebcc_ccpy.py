@@ -35,7 +35,6 @@ for mol in mols:
     mf = scf.UHF(mol)
     mf.conv_tol = 1e-12
     mf.kernel()
-    mf.mo_coeff = [mf.mo_coeff[0],mf.mo_coeff[0]]
     
     cc_2_ci.debug_amplitudes(mf, "CCSD", 3, 1e-7)
     cc_2_ci.debug_amplitudes(mf, "CCSDT", 3, 2e-5)

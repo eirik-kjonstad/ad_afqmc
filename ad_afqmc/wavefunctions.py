@@ -4132,9 +4132,9 @@ class cisd_eom(wave_function):
 @dataclass
 class UCISDT(wave_function_auto):
     """This class contains functions for the UCISDT wavefunction
-    |0> + c(ia) |ia> + c(ia jb) |ia jb>
+    |0> + c(ia) |ia> + c(ia jb) |ia jb> + c(ia jb kc) |ia jb kc>
 
-    . The wave_data need to store the coefficient C(ia) and C(ia jb)
+    . The wave_data need to store the coefficient C(ia), C(ia jb) and C(ia jb kc)
     """
 
     norb: int
@@ -4800,3 +4800,84 @@ class ucisdt(wave_function):
 
     def __hash__(self):
         return hash(tuple(self.__dict__.values()))
+
+@dataclass
+class UCISDTQ(wave_function_auto):
+    """This class contains functions for the UCISDT wavefunction
+    |0> + c(ia) |ia> + c(ia jb) |ia jb>  c(ia jb kc) |ia jb kc>
+    + c(ia jb kc ld) |ia jb kc ld>
+
+    . The wave_data need to store the coefficient C(ia), C(ia jb),
+    C(ia jb kc) and C(ia jb kc ld)
+    """
+
+    norb: int
+    nelec: Tuple[int, int]
+    eps: float = 1.0e-4  # finite difference step size in local energy calculations
+    n_batch: int = 1
+
+    @partial(jit, static_argnums=0)
+    def _calc_green(
+        self, walker_up: jax.Array, walker_dn: jax.Array
+    ) -> List[jax.Array]:
+
+        green_up = (walker_up.dot(jnp.linalg.inv(walker_up[: walker_up.shape[1], :]))).T
+        green_dn = (walker_dn.dot(jnp.linalg.inv(walker_dn[: walker_dn.shape[1], :]))).T
+        return [green_up, green_dn]
+
+    @partial(jit, static_argnums=0)
+    def _calc_overlap(
+        self, walker_up: jax.Array, walker_dn: jax.Array, wave_data: dict
+    ) -> complex:
+
+        noccA, ci1A, ci2AA = self.nelec[0], wave_data["ci1A"], wave_data["ci2AA"]
+        noccB, ci1B, ci2BB = self.nelec[1], wave_data["ci1B"], wave_data["ci2BB"]
+        ci2AB = wave_data["ci2AB"]
+
+        ci3AAA = wave_data["ci3AAA"]
+        ci3AAB = wave_data["ci3AAB"]
+        ci3ABB = wave_data["ci3ABB"]
+        ci3BBB = wave_data["ci3BBB"]
+
+        ci4AAAA = wave_data["ci4AAAA"]
+        ci4AAAB = wave_data["ci4AAAB"]
+        ci4AABB = wave_data["ci4AABB"]
+        ci4ABBB = wave_data["ci4ABBB"]
+        ci4BBBB = wave_data["ci4BBBB"]
+
+        moA, moB = wave_data["mo_coeff"][0], wave_data["mo_coeff"][1]
+
+        walker_dn_B = moB.T.dot(
+            walker_dn[:, :noccB]
+        )  # put walker_dn in the basis of alpha reference
+
+        GFA, GFB = self._calc_green(walker_up, walker_dn_B)
+
+        o0 = jnp.linalg.det(walker_up[:noccA, :]) * jnp.linalg.det(
+            walker_dn_B[:noccB, :]
+        )
+
+        o1 = jnp.einsum("ia,ia", ci1A, GFA[:, noccA:]) + jnp.einsum(
+            "ia,ia", ci1B, GFB[:, noccB:]
+        )
+
+        o2 = 0.5 * jnp.einsum("iajb, ia, jb", ci2AA, GFA[:, noccA:], GFA[:, noccA:])
+        o2 += 0.5 * jnp.einsum("iajb, ia, jb", ci2BB, GFB[:, noccB:], GFB[:, noccB:])
+        o2 += jnp.einsum("iajb, ia, jb", ci2AB, GFA[:, noccA:], GFB[:, noccB:])
+
+        o3 = ( (1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAA, GFA[:, noccA:], GFA[:, noccA:], GFA[:, noccA:])
+              +(1/6) * jnp.einsum("iajbkc, ia, jb, kc", ci3BBB, GFB[:, noccB:], GFB[:, noccB:], GFB[:, noccB:])
+              +(1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3AAB, GFA[:, noccA:], GFA[:, noccA:], GFB[:, noccB:])
+              +(1/2) * jnp.einsum("iajbkc, ia, jb, kc", ci3ABB, GFA[:, noccA:], GFB[:, noccB:], GFB[:, noccB:]))
+
+        o4 = ( (1/24) * jnp.einsum("iajbkcld, ia, jb, kc, ld", ci4AAAA, GFA[:, noccA:], GFA[:, noccA:], GFA[:, noccA:], GFA[:, noccA:])
+              +(1/24) * jnp.einsum("iajbkcld, ia, jb, kc, ld", ci4BBBB, GFB[:, noccB:], GFB[:, noccB:], GFB[:, noccB:], GFB[:, noccB:])
+              + (1/6) * jnp.einsum("iajbkcld, ia, jb, kc, ld", ci4ABBB, GFA[:, noccA:], GFB[:, noccB:], GFB[:, noccB:], GFB[:, noccB:])
+              + (1/4) * jnp.einsum("iajbkcld, ia, jb, kc, ld", ci4AABB, GFA[:, noccA:], GFA[:, noccA:], GFB[:, noccB:], GFB[:, noccB:])
+              + (1/6) * jnp.einsum("iajbkcld, ia, jb, kc, ld", ci4AAAB, GFA[:, noccA:], GFA[:, noccA:], GFA[:, noccA:], GFB[:, noccB:]))
+
+        return (1.0 + o1 + o2 + o3 + o4) * o0
+
+    def __hash__(self) -> int:
+        return hash(tuple(self.__dict__.values()))
+

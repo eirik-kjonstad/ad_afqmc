@@ -228,6 +228,84 @@ def _prep_afqmc(options=None):
             trial = wavefunctions.ucisdt(norb, nelec_sp, n_batch=options["n_batch"])
         except:
             raise ValueError("Trial specified as ucisdt, but amplitudes.npz not found.")
+    elif options["trial"] == "UCISDTQ":
+        try:
+            amplitudes = np.load(tmpdir + "/amplitudes.npz")
+            ci1a = jnp.array(amplitudes["ci1a"])
+            ci1b = jnp.array(amplitudes["ci1b"])
+            ci2aa = jnp.array(amplitudes["ci2aa"])
+            ci2ab = jnp.array(amplitudes["ci2ab"])
+            ci2bb = jnp.array(amplitudes["ci2bb"])
+            ci3aaa = jnp.array(amplitudes["ci3aaa"])
+            ci3aab = jnp.array(amplitudes["ci3aab"])
+            ci3abb = jnp.array(amplitudes["ci3abb"])
+            ci3bbb = jnp.array(amplitudes["ci3bbb"])
+            ci4aaaa = jnp.array(amplitudes["ci4aaaa"])
+            ci4aaab = jnp.array(amplitudes["ci4aaab"])
+            ci4aabb = jnp.array(amplitudes["ci4aabb"])
+            ci4abbb = jnp.array(amplitudes["ci4abbb"])
+            ci4bbbb = jnp.array(amplitudes["ci4bbbb"])
+
+            trial_wave_data = {
+                "ci1A": ci1a,
+                "ci1B": ci1b,
+                "ci2AA": ci2aa,
+                "ci2AB": ci2ab,
+                "ci2BB": ci2bb,
+                "ci3AAA": ci3aaa,
+                "ci3AAB": ci3aab,
+                "ci3ABB": ci3abb,
+                "ci3BBB": ci3bbb,
+                "ci4AAAA": ci4aaaa,
+                "ci4AAAB": ci4aaab,
+                "ci4AABB": ci4aabb,
+                "ci4ABBB": ci4abbb,
+                "ci4BBBB": ci4bbbb,
+                "mo_coeff": mo_coeff,
+            }
+            wave_data.update(trial_wave_data)
+            trial = wavefunctions.UCISDTQ(norb, nelec_sp, n_batch=options["n_batch"])
+        except:
+            raise ValueError("Trial specified as UCISDTQ, but amplitudes.npz not found.")
+    elif options["trial"] == "ucisdtq":
+        try:
+            amplitudes = np.load(tmpdir + "/amplitudes.npz")
+            ci1a = jnp.array(amplitudes["ci1a"])
+            ci1b = jnp.array(amplitudes["ci1b"])
+            ci2aa = jnp.array(amplitudes["ci2aa"])
+            ci2ab = jnp.array(amplitudes["ci2ab"])
+            ci2bb = jnp.array(amplitudes["ci2bb"])
+            ci3aaa = jnp.array(amplitudes["ci3aaa"])
+            ci3aab = jnp.array(amplitudes["ci3aab"])
+            ci3abb = jnp.array(amplitudes["ci3abb"])
+            ci3bbb = jnp.array(amplitudes["ci3bbb"])
+            ci4aaaa = jnp.array(amplitudes["ci4aaaa"])
+            ci4aaab = jnp.array(amplitudes["ci4aaab"])
+            ci4aabb = jnp.array(amplitudes["ci4aabb"])
+            ci4abbb = jnp.array(amplitudes["ci4abbb"])
+            ci4bbbb = jnp.array(amplitudes["ci4bbbb"])
+
+            trial_wave_data = {
+                "ci1A": ci1a,
+                "ci1B": ci1b,
+                "ci2AA": ci2aa,
+                "ci2AB": ci2ab,
+                "ci2BB": ci2bb,
+                "ci3AAA": ci3aaa,
+                "ci3AAB": ci3aab,
+                "ci3ABB": ci3abb,
+                "ci3BBB": ci3bbb,
+                "ci4AAAA": ci4aaaa,
+                "ci4AAAB": ci4aaab,
+                "ci4AABB": ci4aabb,
+                "ci4ABBB": ci4abbb,
+                "ci4BBBB": ci4bbbb,
+                "mo_coeff": mo_coeff,
+            }
+            wave_data.update(trial_wave_data)
+            trial = wavefunctions.ucisdtq(norb, nelec_sp, n_batch=options["n_batch"])
+        except:
+            raise ValueError("Trial specified as UCISDTQ, but amplitudes.npz not found.") 
     else:
         try:
             with open(tmpdir + "/trial.pkl", "rb") as f:

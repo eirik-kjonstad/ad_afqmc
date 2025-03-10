@@ -19,6 +19,13 @@ def uci_from_ccpy(mf, ccpy_driver, c_order):
         t3aba = np.transpose(ccpy_driver.T.aab, (3,5,4,0,2,1)) / 2.0
         t3bab = np.transpose(ccpy_driver.T.abb, (4,3,5,1,0,2)) / 2.0
         t3bbb = np.transpose(ccpy_driver.T.bbb, (3,4,5,0,1,2)) / 6.0
+
+    if t_order >= 4:
+        t4aaaa = np.transpose(ccpy_driver.T.aaaa, (4,5,6,7,0,1,2,3)) / 24.0
+        t4aaab = np.transpose(ccpy_driver.T.aaab, (4,5,6,7,0,1,2,3)) /  6.0
+        t4abab = np.transpose(ccpy_driver.T.aabb, (4,6,5,7,0,2,1,3)) /  4.0
+        t4abbb = np.transpose(ccpy_driver.T.abbb, (4,5,6,7,0,1,2,3)) /  6.0
+        t4bbbb = np.transpose(ccpy_driver.T.bbbb, (4,5,6,7,0,1,2,3)) / 24.0
     
     t1 = {
         "a": t1a,
@@ -42,10 +49,15 @@ def uci_from_ccpy(mf, ccpy_driver, c_order):
         t3 = None
 
     if t_order >= 4:
-        print("Not handle")
-        crash
-
-    t4 = None
+        t4 = {
+            "aaaa": t4aaaa,
+            "aaab": t4aaab,
+            "abab": t4abab,
+            "abbb": t4abbb,
+            "bbbb": t4bbbb,
+        }
+    else:
+        t4 = None
 
     t = (t1, t2, t3, t4)
     ci = t2c_unrestricted(mf, nfrozen, t1, t2, t3, t4, c_order)
@@ -152,8 +164,8 @@ def t2c_unrestricted(mf, nfrozen, t1, t2, t3, t4, c_order):
             aaaaaaaa=t4["aaaa"],
             aaabaaab=t4["aaab"],
             abababab=t4["abab"],
-            abbbabbb=t4["baaa"],
-            bbbbbbbb=t4["aaaa"],
+            abbbabbb=t4["abbb"],
+            bbbbbbbb=t4["bbbb"],
         )
     else:
         amps_uhf.t4 = util.Namespace(
@@ -220,6 +232,11 @@ def t2c_unrestricted(mf, nfrozen, t1, t2, t3, t4, c_order):
         ci4aabb = ci["c4"]["abababab"].transpose(0,4,2,6,1,5,3,7)
         ci4abbb = ci["c4"]["abbbabbb"].transpose(0,4,1,5,2,6,3,7)
         ci4bbbb = ci["c4"]["bbbbbbbb"].transpose(0,4,1,5,2,6,3,7)
+        #print("aaaa", np.max(np.abs(ci4aaaa)))
+        #print("aaab", np.max(np.abs(ci4aaab)))
+        #print("aabb", np.max(np.abs(ci4aabb)))
+        #print("abbb", np.max(np.abs(ci4abbb)))
+        #print("bbbb", np.max(np.abs(ci4bbbb)))
     else:
         ci4aaaa = None
         ci4aaab = None
@@ -246,9 +263,16 @@ def t2c_unrestricted(mf, nfrozen, t1, t2, t3, t4, c_order):
     )
 
     ci1 = (ci1a, ci1b)
-    ci2 = (ci2aa, ci2ab, ci2bb)
-    ci3 = (ci3aaa, ci3aab, ci3abb, ci3bbb)
-    ci4 = (ci4aaaa, ci4aaab, ci4aabb, ci4abbb, ci4bbbb)
+    ci2 = (ci2aa.transpose(0,2,1,3), ci2ab.transpose(0,2,1,3), ci2bb.transpose(0,2,1,3))
+    # NoneType objects can't be transpose
+    if c_order >= 3:
+        ci3 = (ci3aaa.transpose(0,2,4,1,3,5), ci3aab.transpose(0,2,4,1,3,5), ci3abb.transpose(0,2,4,1,3,5), ci3bbb.transpose(0,2,4,1,3,5))
+    else:
+        ci3 = (ci3aaa, ci3aab, ci3abb, ci3bbb)
+    if c_order >= 4:
+        ci4 = (ci4aaaa.transpose(0,2,4,6,1,3,5,7), ci4aaab.transpose(0,2,4,6,1,3,5,7), ci4aabb.transpose(0,2,4,6,1,3,5,7), ci4abbb.transpose(0,2,4,6,1,3,5,7), ci4bbbb.transpose(0,2,4,6,1,3,5,7))
+    else:
+        ci4 = (ci4aaaa, ci4aaab, ci4aabb, ci4abbb, ci4bbbb)
 
     return (ci1, ci2, ci3, ci4)
 
