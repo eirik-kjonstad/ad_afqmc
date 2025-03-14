@@ -75,7 +75,9 @@ def get_wavefunction_and_integrals():
 
     return trial, wave_data, ham_data, nelec_sp    
 
-def compute_and_test_reference_and_rotated_overlaps_energies(mol, nfrozen=0, rotated_eq_unrotated=False, compare_ebcc_manual=False):
+def compute_and_test_reference_and_rotated_overlaps_energies(mol, nfrozen=0, 
+    rotated_eq_unrotated=False, compare_ebcc_manual=False,
+    cc_method="ccsdtq", order=4):
     mol.verbose = 4
     mf = scf.UHF(mol)
     mf.max_cycle=300
@@ -92,18 +94,18 @@ def compute_and_test_reference_and_rotated_overlaps_energies(mol, nfrozen=0, rot
     driver.options["RHF_symmetry"] = False
     driver.system.print_info()
 
-    driver.run_cc(method="ccsdtq")
+    driver.run_cc(method=cc_method)
 
     # Prepare amplitudes
     from ad_afqmc import ccpy_interface
-    ci_amps = list(ccpy_interface.prepare_ucc_amplitudes_from_ccpy(driver, get_amps=True))
+    ci_amps = list(ccpy_interface.prepare_ucc_amplitudes_from_ccpy(driver, get_amps=True, order=order))
     ci_amps = [list(x) if isinstance(x, tuple) else [x] for x in ci_amps]
     ci_amps = [[x / ci_amps[0][0] for x in xs] for xs in ci_amps]
 
     if compare_ebcc_manual:
         # Get the CI amplitudes using ebcc and compare with manual conversion
         from ad_afqmc import cc_2_ci
-        t, (c1, c2, c3, c4) = cc_2_ci.uci_from_ccpy(mf, driver, 4)
+        t, (c1, c2, c3, c4) = cc_2_ci.uci_from_ccpy(mf, driver, order)
         ci_amps_e = list([np.float64(1.0), c1, c2, c3, c4])
         ci_amps_e = [list(x) if isinstance(x, tuple) else [x] for x in ci_amps_e]
         ci_amps_e = [[x / ci_amps_e[0][0] for x in xs] for xs in ci_amps_e]
@@ -212,6 +214,20 @@ def test_he4_ccsdtq():
     # tests all blocks in ebcc-manual conversion
     compute_and_test_reference_and_rotated_overlaps_energies(mol, compare_ebcc_manual=True)
 
+def test_he4_ccsdt_q():
+    mol = gto.M(atom="He 0 0 0; He 0 0 1.1; He 0 1.7 0; He 1.1 0 0", basis="6-31g", symmetry="c1", verbose=0, charge=0, spin=0)
+    # tests all blocks in ebcc-manual conversion
+    # ccsdt -> disconnected q
+    compute_and_test_reference_and_rotated_overlaps_energies(mol, 
+        compare_ebcc_manual=True, cc_method="ccsdt", order=4)
+
+def test_he4_ccsd_tq():
+    mol = gto.M(atom="He 0 0 0; He 0 0 1.1; He 0 1.7 0; He 1.1 0 0", basis="6-31g", symmetry="c1", verbose=0, charge=0, spin=0)
+    # tests all blocks in ebcc-manual conversion
+    # ccsd -> disconnected tq
+    compute_and_test_reference_and_rotated_overlaps_energies(mol, 
+        compare_ebcc_manual=True, cc_method="ccsd", order=4)
+
 
 if __name__ == "__main__":
     import jax
@@ -220,3 +236,5 @@ if __name__ == "__main__":
     test_heh2_ccsdtq()
     test_beh2_ccsdtq()
     test_he4_ccsdtq()
+    test_he4_ccsdt_q()
+    test_he4_ccsd_tq()

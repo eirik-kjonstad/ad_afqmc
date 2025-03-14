@@ -1,7 +1,11 @@
 import numpy as np
 
-def prepare_ucc_amplitudes_from_ccpy(driver, get_amps=False):
-    order = driver.operator_params["order"]
+def prepare_ucc_amplitudes_from_ccpy(driver, get_amps=False, order=-1):
+    if order == -1:
+        order = driver.operator_params["order"]
+
+    print(f"Order: {order}")
+    print(f"Order of CC calculation: {driver.operator_params["order"]}")
 
     print(f"Preparing amplitudes.npz for ad_afqmc. Order: {order}")
 
@@ -46,6 +50,26 @@ def prepare_ucc_amplitudes_from_ccpy(driver, get_amps=False):
     # ai,bj symmetries already fulfilled
     C2aa = completely_antisymmetrize_2(C2aa) 
     C2bb = completely_antisymmetrize_2(C2bb) 
+
+    # Set connected contributions to zero if user requests
+    # disconnected contributions of higher orders
+    no_a = np.shape(R.a)[0] 
+    nv_a = np.shape(R.a)[1] 
+    no_b = np.shape(R.b)[0] 
+    nv_b = np.shape(R.b)[1] 
+
+    if order > 2 and driver.operator_params["order"] < 3:
+        R.aaa = np.zeros((nv_a, nv_a, nv_a, no_a, no_a, no_a))
+        R.aab = np.zeros((nv_a, nv_a, nv_b, no_a, no_a, no_b))
+        R.abb = np.zeros((nv_a, nv_b, nv_b, no_a, no_b, no_b))
+        R.bbb = np.zeros((nv_b, nv_b, nv_b, no_b, no_b, no_b))
+
+    if order > 3 and driver.operator_params["order"] < 4:
+        R.aaaa = np.zeros((nv_a, nv_a, nv_a, nv_a, no_a, no_a, no_a, no_a))
+        R.aaab = np.zeros((nv_a, nv_a, nv_a, nv_b, no_a, no_a, no_a, no_b))
+        R.aabb = np.zeros((nv_a, nv_a, nv_b, nv_b, no_a, no_a, no_b, no_b))
+        R.abbb = np.zeros((nv_a, nv_b, nv_b, nv_b, no_a, no_b, no_b, no_b))
+        R.bbbb = np.zeros((nv_b, nv_b, nv_b, nv_b, no_b, no_b, no_b, no_b))
 
     if order == 2:
         np.savez(
