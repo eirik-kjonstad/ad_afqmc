@@ -544,12 +544,19 @@ def write_dqmc(
     ms=0,
     filename="FCIDUMP_chol",
     mo_coeffs=None,
+    hcore_a=None,
+    hcore_b=None,
 ):
     assert len(chol.shape) == 2
     with h5py.File(filename, "w") as fh5:
         fh5["header"] = np.array([nelec, nmo, ms, chol.shape[0]])
         fh5["hcore"] = hcore.flatten()
         fh5["hcore_mod"] = hcore_mod.flatten()
+        if hcore_a is not None and hcore_b is not None:
+            fh5["hcore_a"] = hcore_a.flatten()
+            fh5["hcore_b"] = hcore_b.flatten()
+        elif hcore_a is not None or hcore_b is not None:
+            raise ValueError("Both hcore_a and hcore_b must be provided together.")
         fh5["chol"] = chol.flatten()
         fh5["energy_core"] = enuc
         if mo_coeffs is not None:

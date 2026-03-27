@@ -101,7 +101,13 @@ def _prep_afqmc(options=None):
     ham = hamiltonian.hamiltonian(nmo)
     ham_data = {}
     ham_data["h0"] = h0
-    ham_data["h1"] = jnp.array([h1, h1])
+    try:
+        h1_spin = jnp.array(np.load(tmpdir + "/h1.npz")["h1"])
+        assert h1_spin.shape == (2, norb, norb)
+        ham_data["h1"] = h1_spin
+        print(f"# Read H1 from disk")
+    except:
+        ham_data["h1"] = jnp.array([h1, h1])
     ham_data["chol"] = chol.reshape(nchol, -1)
     ham_data["ene0"] = options["ene0"]
 
@@ -168,6 +174,26 @@ def _prep_afqmc(options=None):
             }
             wave_data.update(trial_wave_data)
             trial = wavefunctions.ucisd(norb, nelec_sp, n_batch=options["n_batch"])
+        except:
+            raise ValueError("Trial specified as ucisd, but amplitudes.npz not found.")
+    elif options["trial"] == "UCISD":
+        try:
+            amplitudes = np.load(tmpdir + "/amplitudes.npz")
+            ci1a = jnp.array(amplitudes["ci1a"])
+            ci1b = jnp.array(amplitudes["ci1b"])
+            ci2aa = jnp.array(amplitudes["ci2aa"])
+            ci2ab = jnp.array(amplitudes["ci2ab"])
+            ci2bb = jnp.array(amplitudes["ci2bb"])
+            trial_wave_data = {
+                "ci1A": ci1a,
+                "ci1B": ci1b,
+                "ci2AA": ci2aa,
+                "ci2AB": ci2ab,
+                "ci2BB": ci2bb,
+                "mo_coeff": mo_coeff,
+            }
+            wave_data.update(trial_wave_data)
+            trial = wavefunctions.UCISD(norb, nelec_sp, n_batch=options["n_batch"])
         except:
             raise ValueError("Trial specified as ucisd, but amplitudes.npz not found.")
     elif options["trial"] == "UCISDT":
