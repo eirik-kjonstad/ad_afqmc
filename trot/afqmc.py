@@ -95,6 +95,9 @@ class Afqmc:
         Number of walkers if params is not provided, by default None
     n_chunk : int | None, optional
         Number of chunks if params is not provided, by default 1
+    global_phaseless_projection : bool | None, optional
+        Use the ensemble-level coefficient-space phaseless projection instead of
+        the walker-local cosine projection.
     """
 
     params_cls = QmcParams
@@ -115,6 +118,10 @@ class Afqmc:
         dt: float | None = None,
         n_walkers: int | None = None,
         n_chunks: int | None = None,
+        global_phaseless_projection: bool | None = None,
+        global_phaseless_budget_scale: float | None = None,
+        global_phaseless_overlap_floor: float | None = None,
+        global_phaseless_gauge_fix: bool | None = None,
     ):
         self._obj = mf_or_cc
         self._cc: Any = None
@@ -149,6 +156,27 @@ class Afqmc:
         self.n_chunks = defaults.n_chunks if n_chunks is None else n_chunks
         if hasattr(defaults, "n_eql_blocks"):
             self.n_eql_blocks = defaults.n_eql_blocks if n_eql_blocks is None else n_eql_blocks
+        if hasattr(defaults, "global_phaseless_projection"):
+            self.global_phaseless_projection = (
+                defaults.global_phaseless_projection
+                if global_phaseless_projection is None
+                else global_phaseless_projection
+            )
+            self.global_phaseless_budget_scale = (
+                defaults.global_phaseless_budget_scale
+                if global_phaseless_budget_scale is None
+                else global_phaseless_budget_scale
+            )
+            self.global_phaseless_overlap_floor = (
+                defaults.global_phaseless_overlap_floor
+                if global_phaseless_overlap_floor is None
+                else global_phaseless_overlap_floor
+            )
+            self.global_phaseless_gauge_fix = (
+                defaults.global_phaseless_gauge_fix
+                if global_phaseless_gauge_fix is None
+                else global_phaseless_gauge_fix
+            )
 
         self._staged: StagedInputs | None = None
         self._job: Job | None = None
@@ -409,6 +437,10 @@ class Afqmc:
         dt: float | None = None,
         n_walkers: int | None = None,
         n_chunks: int = 1,
+        global_phaseless_projection: bool | None = None,
+        global_phaseless_budget_scale: float | None = None,
+        global_phaseless_overlap_floor: float | None = None,
+        global_phaseless_gauge_fix: bool | None = None,
     ) -> Afqmc:
         """
         Returns a new AFQMC object from a previously staged calculations
@@ -428,6 +460,10 @@ class Afqmc:
             dt=dt,
             n_walkers=n_walkers,
             n_chunks=n_chunks,
+            global_phaseless_projection=global_phaseless_projection,
+            global_phaseless_budget_scale=global_phaseless_budget_scale,
+            global_phaseless_overlap_floor=global_phaseless_overlap_floor,
+            global_phaseless_gauge_fix=global_phaseless_gauge_fix,
         )
 
 

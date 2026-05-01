@@ -35,8 +35,6 @@ def init_prop_state(
     n_walkers = params.n_walkers
     seed = params.seed
     key = jax.random.PRNGKey(int(seed))
-    weights = jnp.ones((n_walkers,))
-
     if initial_walkers is None:
         if rdm1 is None:
             rdm1 = trial_ops.get_rdm1(trial_data)
@@ -45,6 +43,10 @@ def init_prop_state(
     overlaps = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
         initial_walkers, trial_data
     )
+    if bool(getattr(params, "global_phaseless_projection", False)):
+        weights = jnp.ones((n_walkers,), dtype=jnp.result_type(overlaps, 1.0j))
+    else:
+        weights = jnp.ones((n_walkers,))
 
     e_est = None
     if initial_e_estimate is not None:
@@ -74,6 +76,52 @@ def init_prop_state(
         node_encounters=node_encounters,
     )
     return shard_prop_state(state, mesh)
+
+
+def coefficient_space_global_phaseless_projection(
+    preliminary_weights: jax.Array,
+    overlaps: jax.Array,
+    *,
+    dt: float,
+    budget_scale: float = 1.0,
+    overlap_floor: float = 1.0e-12,
+    gauge_fix: bool = False,
+) -> jax.Array:
+    """
+    Apply the recommended coefficient-space global phaseless projection.
+
+    The trust-region budget is ``budget_scale * dt * ||w_tilde / S||`` and the
+    correction is ``budget / ||S|| * exp(i arg(sum(w_tilde))) * |S_k|^2``.
+    """
+    complex_dtype = jnp.result_type(preliminary_weights, overlaps, 1.0j)
+    w_tilde = jnp.asarray(preliminary_weights, dtype=complex_dtype)
+    s = jnp.asarray(overlaps, dtype=complex_dtype)
+    real_dtype = jnp.result_type(jnp.real(w_tilde), jnp.real(s), 1.0)
+    eps = jnp.asarray(overlap_floor, dtype=real_dtype)
+
+    abs_s = jnp.abs(s)
+    safe_abs_s = jnp.maximum(abs_s, eps)
+    a_norm = jnp.sqrt(jnp.sum((jnp.abs(w_tilde) / safe_abs_s) ** 2))
+    budget = (
+        jnp.asarray(budget_scale, dtype=real_dtype) * jnp.asarray(dt, dtype=real_dtype) * a_norm
+    )
+
+    z0 = jnp.sum(w_tilde)
+    abs_z0 = jnp.abs(z0)
+    phase = jnp.where(abs_z0 > eps, z0 / abs_z0, jnp.asarray(1.0 + 0.0j, dtype=w_tilde.dtype))
+
+    s_norm = jnp.sqrt(jnp.sum(abs_s**2))
+    correction = (budget / jnp.where(s_norm > eps, s_norm, 1.0)) * phase * abs_s**2
+    weights = jnp.where(s_norm > eps, w_tilde + correction, w_tilde)
+
+    total = jnp.sum(weights)
+    abs_total = jnp.abs(total)
+    gauge = jnp.where(
+        abs_total > eps,
+        jnp.conj(total) / abs_total,
+        jnp.asarray(1.0 + 0.0j, dtype=weights.dtype),
+    )
+    return jnp.where(gauge_fix, weights * gauge, weights)
 
 
 def afqmc_step(
@@ -116,21 +164,41 @@ def afqmc_step(
     )
     imp_fun = jnp.exp(exponent) * ratio
 
-    theta = jnp.angle(jnp.exp(-prop_ctx.sqrt_dt * shift_term) * ratio)
-    imp_ph = jnp.abs(imp_fun) * jnp.cos(theta)
-
     w_floor = float(getattr(params, "weight_floor", 1.0e-3))
     w_cap = float(getattr(params, "weight_cap", 100.0))
 
-    imp_ph = jnp.where(~jnp.isfinite(imp_ph) | (imp_ph < w_floor), 0.0, imp_ph)
-    node_encounters_new = state.node_encounters + jnp.sum(imp_ph <= 0.0)
-    imp_ph = jnp.where(imp_ph > w_cap, 0.0, imp_ph)
+    if bool(getattr(params, "global_phaseless_projection", False)):
+        overlap_floor = float(getattr(params, "global_phaseless_overlap_floor", 1.0e-12))
+        preliminary_weights = state.weights * imp_fun
+        invalid = (
+            ~jnp.isfinite(preliminary_weights)
+            | ~jnp.isfinite(overlaps_new)
+            | (jnp.abs(overlaps_new) <= overlap_floor)
+            | (jnp.abs(preliminary_weights) > w_cap)
+        )
+        preliminary_weights = jnp.where(invalid, 0.0 + 0.0j, preliminary_weights)
+        node_encounters_new = state.node_encounters + jnp.sum(invalid)
+        weights_new = coefficient_space_global_phaseless_projection(
+            preliminary_weights,
+            overlaps_new,
+            dt=prop_ctx.dt,
+            budget_scale=float(getattr(params, "global_phaseless_budget_scale", 1.0)),
+            overlap_floor=overlap_floor,
+            gauge_fix=bool(getattr(params, "global_phaseless_gauge_fix", False)),
+        )
+    else:
+        theta = jnp.angle(jnp.exp(-prop_ctx.sqrt_dt * shift_term) * ratio)
+        imp_ph = jnp.abs(imp_fun) * jnp.cos(theta)
 
-    weights_new = state.weights * imp_ph
-    weights_new = jnp.where(weights_new > w_cap, 0.0, weights_new)
+        imp_ph = jnp.where(~jnp.isfinite(imp_ph) | (imp_ph < w_floor), 0.0, imp_ph)
+        node_encounters_new = state.node_encounters + jnp.sum(imp_ph <= 0.0)
+        imp_ph = jnp.where(imp_ph > w_cap, 0.0, imp_ph)
+
+        weights_new = state.weights * imp_ph
+        weights_new = jnp.where(weights_new > w_cap, 0.0, weights_new)
 
     damping = float(getattr(params, "pop_control_damping", 0.1))
-    avg_w = jnp.clip(jnp.mean(weights_new), min=1.0e-300)
+    avg_w = jnp.clip(jnp.mean(jnp.abs(weights_new)), min=1.0e-300)
     pop_shift_new = state.e_estimate - damping * (jnp.log(avg_w) / prop_ctx.dt)
 
     return PropState(

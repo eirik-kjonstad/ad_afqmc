@@ -5,7 +5,7 @@ import pytest
 from trot.core.ops import MeasOps
 from trot.core.system import System
 from trot.ham.chol import HamChol
-from trot.prop.afqmc import afqmc_step
+from trot.prop.afqmc import afqmc_step, coefficient_space_global_phaseless_projection
 from trot.prop.chol_afqmc_ops import _build_prop_ctx, make_trotter_ops
 from trot.prop.types import PropState, QmcParams
 from trot import testing
@@ -160,6 +160,89 @@ def test_step_matches_manual_walker_propagation_and_is_chunk_invariant():
     assert jnp.allclose(out2.weights, out1.weights)
     assert jnp.allclose(out2.overlaps, out1.overlaps)
     assert jnp.all(out2.rng_key == out1.rng_key)
+
+
+def test_coefficient_space_global_projection_matches_closed_form():
+    w_tilde = jnp.asarray([1.0 + 2.0j, -0.5 + 0.25j, 0.75 - 0.5j])
+    overlaps = jnp.asarray([2.0 + 0.0j, 1.0 - 1.0j, 0.5j])
+    dt = 0.2
+    r = 0.7
+
+    out = coefficient_space_global_phaseless_projection(
+        w_tilde,
+        overlaps,
+        dt=dt,
+        budget_scale=r,
+        gauge_fix=False,
+    )
+
+    a_norm = jnp.sqrt(jnp.sum(jnp.abs(w_tilde / overlaps) ** 2))
+    budget = r * dt * a_norm
+    phase = jnp.sum(w_tilde) / jnp.abs(jnp.sum(w_tilde))
+    s_norm = jnp.sqrt(jnp.sum(jnp.abs(overlaps) ** 2))
+    expected = w_tilde + (budget / s_norm) * phase * jnp.abs(overlaps) ** 2
+
+    assert jnp.allclose(out, expected)
+
+
+def test_global_projection_step_uses_complex_importance_without_local_cosine():
+    norb, nocc, nw, n_fields = 4, 2, 5, 3
+    ham = HamChol(
+        basis="restricted",
+        h0=jnp.asarray(0.0),
+        h1=jnp.zeros((norb, norb)),
+        chol=jnp.zeros((n_fields, norb, norb)),
+    )
+    sys = System(norb=norb, nelec=(nocc, nocc), walker_kind="restricted")
+
+    params = QmcParams(
+        dt=0.2,
+        n_chunks=1,
+        n_exp_terms=4,
+        pop_control_damping=0.1,
+        global_phaseless_projection=True,
+        global_phaseless_budget_scale=0.5,
+        global_phaseless_gauge_fix=False,
+    )
+
+    meas_ops = _make_dummy_meas_ops()
+    trial_data = {"rdm1": jnp.zeros((norb, norb))}
+    walkers = jnp.ones((nw, norb, nocc), dtype=jnp.complex64)
+    state = PropState(
+        walkers=walkers,
+        weights=jnp.ones((nw,), dtype=jnp.complex64),
+        overlaps=1.0j * jnp.ones((nw,), dtype=jnp.complex64),
+        rng_key=jax.random.PRNGKey(0),
+        pop_control_ene_shift=jnp.asarray(0.0),
+        e_estimate=jnp.asarray(0.0),
+        node_encounters=jnp.asarray(0),
+    )
+
+    trotter_ops = make_trotter_ops(ham.basis, sys.walker_kind)
+    prop_ctx = _build_prop_ctx(ham, trial_data["rdm1"], params.dt)
+    meas_ctx = meas_ops.build_meas_ctx(ham, trial_data)
+    out = afqmc_step(
+        state,
+        params=params,
+        ham_data=ham,
+        trial_data=trial_data,
+        meas_ops=meas_ops,
+        trotter_ops=trotter_ops,
+        prop_ctx=prop_ctx,
+        meas_ctx=meas_ctx,
+    )
+
+    preliminary = -1.0j * jnp.ones((nw,), dtype=jnp.complex64)
+    expected = coefficient_space_global_phaseless_projection(
+        preliminary,
+        jnp.ones((nw,), dtype=jnp.complex64),
+        dt=params.dt,
+        budget_scale=params.global_phaseless_budget_scale,
+        gauge_fix=False,
+    )
+
+    assert jnp.allclose(out.weights, expected)
+    assert jnp.all(jnp.abs(out.weights) > 0.0)
 
 
 if __name__ == "__main__":

@@ -249,6 +249,8 @@ def block(
     w_sum_safe = jnp.where(w_sum == 0, 1.0, w_sum)
     e_block = jnp.sum(weights * e_samples) / w_sum_safe
     e_block = jnp.where(w_sum == 0, e_ref, e_block)
+    e_block = jnp.real(e_block)
+    w_sum_real = jnp.real(w_sum)
 
     alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(e_block))
     state = state._replace(
@@ -281,7 +283,7 @@ def block(
     )
 
     obs = BlockObs(
-        scalars={"energy": e_block, "weight": w_sum},
+        scalars={"energy": e_block, "weight": w_sum_real},
         observables=obs_samples,
     )
     return state, obs
@@ -358,6 +360,8 @@ def block_mixed(
     guide_w_block_safe = jnp.where(guide_w_block == 0, 1.0, guide_w_block)
     guide_e_block = jnp.sum(guide_weights * guide_e_samples) / guide_w_block_safe
     guide_e_block = jnp.where(guide_w_block == 0, e_ref, guide_e_block)
+    guide_e_block = jnp.real(guide_e_block)
+    guide_w_block_real = jnp.real(guide_w_block)
 
     alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(guide_e_block))
     state = state._replace(
@@ -400,7 +404,7 @@ def block_mixed(
 
     obs = BlockObs(
         scalars={
-            "guide_weight": guide_w_block,
+            "guide_weight": guide_w_block_real,
             "guide_energy": guide_e_block,
             "trial_weight": trial_w_block,
             "trial_t2": trial_t2_block,
@@ -585,6 +589,8 @@ def block_mlmc(
 
     num0 = jnp.sum(weights * e0)
     e0_block = jnp.where(w_sum == 0, e_ref, num0 / w_sum_safe)
+    e0_block = jnp.real(e0_block)
+    w_sum_real = jnp.real(w_sum)
 
     # corrections: telescope with fixed-size subsamples
     # independent subsets per level increment
@@ -642,6 +648,7 @@ def block_mlmc(
 
     num_total = num0 + num_corr
     e_mlmc_block = jnp.where(w_sum == 0, e_ref, num_total / w_sum_safe)
+    e_mlmc_block = jnp.real(e_mlmc_block)
 
     alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(e_mlmc_block))
     state = state._replace(
@@ -665,7 +672,7 @@ def block_mlmc(
         scalars={
             "energy": e_mlmc_block,
             "energy_base": e0_block,  # optional: for debugging/monitoring
-            "weight": w_sum,
+            "weight": w_sum_real,
             "mlmc_delta": (
                 jnp.asarray(delta_blocks)
                 if delta_blocks

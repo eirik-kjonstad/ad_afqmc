@@ -45,6 +45,10 @@ class QmcParams(QmcParamsBase):
     weight_cap: float = 100.0
     shift_ema: float = 0.1
     n_eql_blocks: int = 20
+    global_phaseless_projection: bool = False
+    global_phaseless_budget_scale: float = 1.0
+    global_phaseless_overlap_floor: float = 1.0e-12
+    global_phaseless_gauge_fix: bool = True
 
 
 @dataclass(frozen=True)

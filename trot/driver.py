@@ -232,7 +232,7 @@ def run_qmc(
     block_w_eq = []
     block_obs_eq = {name: [] for name in observable_names}
     block_e_eq.append(state.e_estimate)
-    block_w_eq.append(jnp.sum(state.weights))
+    block_w_eq.append(jnp.real(jnp.sum(state.weights)))
     print("\nEquilibration:\n")
     if print_every:
         print(
@@ -245,8 +245,8 @@ def run_qmc(
         )
     print(
         f"[eql {0:4d}/{params.n_eql_blocks}]  "
-        f"{float(state.e_estimate):14.10f}  "
-        f"{float(jnp.sum(state.weights)):12.6e}  "
+        f"{float(jnp.real(state.e_estimate)):14.10f}  "
+        f"{float(jnp.real(jnp.sum(state.weights))):12.6e}  "
         f"{int(state.node_encounters):10d}  "
         f"{0.0:8.1f}"
     )
