@@ -73,6 +73,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Leave projected weights in their raw global complex phase.",
     )
+    parser.add_argument(
+        "--measure-energy-with-uhf",
+        action="store_true",
+        help="Use the embedded UHF determinant for reweighted block energy estimates.",
+    )
     return parser.parse_args()
 
 
@@ -137,13 +142,15 @@ def main() -> None:
     af.global_phaseless_projection = not args.standard_phaseless
     af.global_phaseless_budget_scale = args.budget_scale
     af.global_phaseless_gauge_fix = not args.no_gauge_fix
+    af.measure_energy_with_uhf = args.measure_energy_with_uhf
 
     projection = "global coefficient-space" if af.global_phaseless_projection else "standard local"
     print(f"\nccpy method        : {args.cc_method}")
     print(f"staged trial       : {staged.trial.kind}")
     print(f"phaseless update   : {projection}")
     print(f"budget scale       : {af.global_phaseless_budget_scale}")
-    print(f"global gauge fix   : {af.global_phaseless_gauge_fix}\n")
+    print(f"global gauge fix   : {af.global_phaseless_gauge_fix}")
+    print(f"measure with UHF   : {af.measure_energy_with_uhf}\n")
 
     mean, err = af.kernel()
     print(f"\nAFQMC/{staged.trial.kind.upper()} energy: {mean:.10f} +/- {err:.10f} Ha")

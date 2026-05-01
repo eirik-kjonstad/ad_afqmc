@@ -98,6 +98,9 @@ class Afqmc:
     global_phaseless_projection : bool | None, optional
         Use the ensemble-level coefficient-space phaseless projection instead of
         the walker-local cosine projection.
+    measure_energy_with_uhf : bool | None, optional
+        Measure block energies with the UHF determinant embedded in unrestricted
+        CC trials, reweighted by overlap_uhf / overlap_trial.
     """
 
     params_cls = QmcParams
@@ -122,6 +125,7 @@ class Afqmc:
         global_phaseless_budget_scale: float | None = None,
         global_phaseless_overlap_floor: float | None = None,
         global_phaseless_gauge_fix: bool | None = None,
+        measure_energy_with_uhf: bool | None = None,
     ):
         self._obj = mf_or_cc
         self._cc: Any = None
@@ -176,6 +180,11 @@ class Afqmc:
                 defaults.global_phaseless_gauge_fix
                 if global_phaseless_gauge_fix is None
                 else global_phaseless_gauge_fix
+            )
+            self.measure_energy_with_uhf = (
+                defaults.measure_energy_with_uhf
+                if measure_energy_with_uhf is None
+                else measure_energy_with_uhf
             )
 
         self._staged: StagedInputs | None = None
@@ -441,6 +450,7 @@ class Afqmc:
         global_phaseless_budget_scale: float | None = None,
         global_phaseless_overlap_floor: float | None = None,
         global_phaseless_gauge_fix: bool | None = None,
+        measure_energy_with_uhf: bool | None = None,
     ) -> Afqmc:
         """
         Returns a new AFQMC object from a previously staged calculations
@@ -464,6 +474,7 @@ class Afqmc:
             global_phaseless_budget_scale=global_phaseless_budget_scale,
             global_phaseless_overlap_floor=global_phaseless_overlap_floor,
             global_phaseless_gauge_fix=global_phaseless_gauge_fix,
+            measure_energy_with_uhf=measure_energy_with_uhf,
         )
 
 

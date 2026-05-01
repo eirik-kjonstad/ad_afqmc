@@ -5,9 +5,11 @@ import pytest
 from trot.core.ops import MeasOps
 from trot.core.system import System
 from trot.ham.chol import HamChol
+from trot.prop.blocks import _uhf_reweighted_block_energy
 from trot.prop.afqmc import afqmc_step, coefficient_space_global_phaseless_projection
 from trot.prop.chol_afqmc_ops import _build_prop_ctx, make_trotter_ops
 from trot.prop.types import PropState, QmcParams
+from trot.trial.uhf import UhfTrial
 from trot import testing
 
 
@@ -243,6 +245,47 @@ def test_global_projection_step_uses_complex_importance_without_local_cosine():
 
     assert jnp.allclose(out.weights, expected)
     assert jnp.all(jnp.abs(out.weights) > 0.0)
+
+
+def test_uhf_reweighted_block_energy_uses_overlap_fraction():
+    norb = 2
+    sys = System(norb=norb, nelec=(1, 1), walker_kind="unrestricted")
+    params = QmcParams(n_chunks=1, measure_energy_with_uhf=True)
+    ham = HamChol(
+        basis="restricted",
+        h0=jnp.asarray(0.5),
+        h1=jnp.asarray([[1.0, 2.0], [2.0, 3.0]]),
+        chol=jnp.zeros((1, norb, norb)),
+    )
+    trial_data = UhfTrial(
+        mo_coeff_a=jnp.eye(norb)[:, :1],
+        mo_coeff_b=jnp.eye(norb)[:, :1],
+    )
+    walkers = (
+        jnp.asarray([[[1.0], [0.0]], [[1.0], [0.5]]], dtype=jnp.complex64),
+        jnp.asarray([[[1.0], [0.0]], [[1.0], [-0.25]]], dtype=jnp.complex64),
+    )
+    weights = jnp.asarray([1.0 + 0.0j, 3.0 + 0.0j])
+
+    trial_overlaps = jnp.asarray([2.0 + 0.0j, 4.0 + 0.0j])
+    e_block, weights_out, n_invalid = _uhf_reweighted_block_energy(
+        walkers=walkers,
+        weights=weights,
+        trial_overlaps=trial_overlaps,
+        ham_data=ham,
+        trial_data=trial_data,
+        sys=sys,
+        params=params,
+        e_ref=jnp.asarray(0.0),
+    )
+
+    energies_uhf = jnp.asarray([2.5, 3.0])
+    fractions = jnp.asarray([0.5, 0.25])
+    expected = jnp.sum(weights.real * energies_uhf * fractions) / jnp.sum(weights.real * fractions)
+
+    assert jnp.allclose(e_block, expected)
+    assert jnp.allclose(weights_out, weights)
+    assert n_invalid == 0
 
 
 if __name__ == "__main__":

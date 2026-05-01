@@ -49,6 +49,7 @@ class QmcParams(QmcParamsBase):
     global_phaseless_budget_scale: float = 1.0
     global_phaseless_overlap_floor: float = 1.0e-12
     global_phaseless_gauge_fix: bool = True
+    measure_energy_with_uhf: bool = False
 
 
 @dataclass(frozen=True)

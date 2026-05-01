@@ -63,6 +63,78 @@ class BlockObs(NamedTuple):
     observables: dict[str, jax.Array]
 
 
+def _uhf_trial_from_trial_data(trial_data: Any):
+    from ..trial.uhf import UhfTrial
+
+    if not hasattr(trial_data, "mo_coeff_a") or not hasattr(trial_data, "mo_coeff_b"):
+        raise ValueError(
+            "measure_energy_with_uhf=True requires trial_data with mo_coeff_a/mo_coeff_b, "
+            "such as UHF, UCISD, UCISDT, or UCISDTQ trials."
+        )
+    if not hasattr(trial_data, "nocc"):
+        raise ValueError("measure_energy_with_uhf=True requires trial_data.nocc.")
+
+    nup, ndn = trial_data.nocc
+    return UhfTrial(
+        mo_coeff_a=trial_data.mo_coeff_a[:, :nup],
+        mo_coeff_b=trial_data.mo_coeff_b[:, :ndn],
+    )
+
+
+def _uhf_overlap_and_energy_kernels(walker_kind: str):
+    from ..meas.uhf import energy_kernel_gw_rh, energy_kernel_rw_rh, energy_kernel_uw_rh
+    from ..trial.uhf import overlap_g, overlap_r, overlap_u
+
+    wk_kind = walker_kind.lower()
+    if wk_kind == "restricted":
+        return overlap_r, energy_kernel_rw_rh
+    if wk_kind == "unrestricted":
+        return overlap_u, energy_kernel_uw_rh
+    if wk_kind == "generalized":
+        return overlap_g, energy_kernel_gw_rh
+    raise ValueError(f"unknown walker_kind: {walker_kind}")
+
+
+def _uhf_reweighted_block_energy(
+    *,
+    walkers: Any,
+    weights: jax.Array,
+    trial_overlaps: jax.Array,
+    ham_data: Any,
+    trial_data: Any,
+    sys: System,
+    params: QmcParams,
+    e_ref: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    from ..meas.uhf import build_meas_ctx
+
+    uhf_trial = _uhf_trial_from_trial_data(trial_data)
+    uhf_meas_ctx = build_meas_ctx(ham_data, uhf_trial)
+    uhf_overlap_kernel, uhf_energy_kernel = _uhf_overlap_and_energy_kernels(sys.walker_kind)
+
+    overlaps_uhf = wk.vmap_chunked(uhf_overlap_kernel, n_chunks=params.n_chunks, in_axes=(0, None))(
+        walkers, uhf_trial
+    )
+    energies_uhf = wk.vmap_chunked(
+        uhf_energy_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+    )(walkers, ham_data, uhf_meas_ctx, uhf_trial)
+
+    eps = jnp.asarray(1.0e-12, dtype=jnp.result_type(jnp.real(trial_overlaps), 1.0))
+    valid = (
+        jnp.isfinite(overlaps_uhf)
+        & jnp.isfinite(energies_uhf)
+        & jnp.isfinite(trial_overlaps)
+        & (jnp.abs(trial_overlaps) > eps)
+    )
+    weight_fraction = jnp.where(valid, overlaps_uhf / trial_overlaps, 0.0 + 0.0j)
+    weights_eff = weights * weight_fraction
+    denom = jnp.sum(jnp.real(weights_eff))
+    denom_safe = jnp.where(jnp.abs(denom) > eps, denom, 1.0)
+    numerator = jnp.sum(jnp.real(weights_eff * energies_uhf))
+    block_energy = jnp.where(jnp.abs(denom) > eps, numerator / denom_safe, jnp.real(e_ref))
+    return block_energy, jnp.where(valid, weights, 0.0), jnp.sum(~valid)
+
+
 def dump_prop_state_npz(
     state: PropState,
     path: str | Path,
@@ -233,29 +305,50 @@ def block(
     )
     state = state._replace(walkers=walkers_new, overlaps=overlaps_new)
 
-    e_kernel = meas_ops.require_kernel(k_energy)
-    e_samples = wk.vmap_chunked(e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None))(
-        state.walkers, ham_data, meas_ctx, trial_data
-    )
-    e_samples = jnp.real(e_samples)
-
-    thresh = jnp.sqrt(2.0 / jnp.asarray(params.dt))
     e_ref = state.e_estimate
-    is_nan = ~jnp.isfinite(e_samples)
-    e_samples = jnp.where(is_nan | (jnp.abs(e_samples - e_ref) > thresh), e_ref, e_samples)
+    measure_energy_with_uhf = bool(getattr(params, "measure_energy_with_uhf", False))
+    if measure_energy_with_uhf:
+        e_block, weights, _ = _uhf_reweighted_block_energy(
+            walkers=state.walkers,
+            weights=state.weights,
+            trial_overlaps=state.overlaps,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            sys=sys,
+            params=params,
+            e_ref=e_ref,
+        )
+        w_sum = jnp.sum(weights)
+        w_sum_safe = jnp.where(w_sum == 0, 1.0, w_sum)
+        w_sum_real = jnp.real(w_sum)
+    else:
+        e_kernel = meas_ops.require_kernel(k_energy)
+        e_samples = wk.vmap_chunked(
+            e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+        )(state.walkers, ham_data, meas_ctx, trial_data)
+        e_samples = jnp.real(e_samples)
 
-    weights = jnp.where(is_nan, 0.0, state.weights)
-    w_sum = jnp.sum(weights)
-    w_sum_safe = jnp.where(w_sum == 0, 1.0, w_sum)
-    e_block = jnp.sum(weights * e_samples) / w_sum_safe
-    e_block = jnp.where(w_sum == 0, e_ref, e_block)
-    e_block = jnp.real(e_block)
-    w_sum_real = jnp.real(w_sum)
+        thresh = jnp.sqrt(2.0 / jnp.asarray(params.dt))
+        is_nan = ~jnp.isfinite(e_samples)
+        e_samples = jnp.where(is_nan | (jnp.abs(e_samples - e_ref) > thresh), e_ref, e_samples)
+
+        weights = jnp.where(is_nan, 0.0, state.weights)
+        w_sum = jnp.sum(weights)
+        w_sum_safe = jnp.where(w_sum == 0, 1.0, w_sum)
+        e_block = jnp.sum(weights * e_samples) / w_sum_safe
+        e_block = jnp.where(w_sum == 0, e_ref, e_block)
+        e_block = jnp.real(e_block)
+        w_sum_real = jnp.real(w_sum)
 
     alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(e_block))
+    if measure_energy_with_uhf:
+        pop_control_ene_shift = (1.0 - alpha) * state.pop_control_ene_shift + alpha * e_block
+    else:
+        pop_control_ene_shift = state.pop_control_ene_shift
     state = state._replace(
         weights=weights,
         e_estimate=(1.0 - alpha) * state.e_estimate + alpha * e_block,
+        pop_control_ene_shift=pop_control_ene_shift,
     )
 
     obs_samples: dict[str, jax.Array] = {}
