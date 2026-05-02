@@ -7,7 +7,14 @@ import jax
 import jax.numpy as jnp
 from jax import tree_util
 
-from ..core.ops import MeasOps, k_energy, k_force_bias, o_density_corr, o_rdm1
+from ..core.ops import (
+    MeasOps,
+    k_energy,
+    k_force_bias,
+    k_force_bias_charge_sz,
+    o_density_corr,
+    o_rdm1,
+)
 from ..core.system import System
 from ..ham.chol import HamChol
 from ..trial.uhf import UhfTrial, overlap_g, overlap_r, overlap_u
@@ -57,6 +64,23 @@ def force_bias_kernel_uw_rh(
     return fb_u + fb_d
 
 
+def force_bias_charge_sz_kernel_uw_rh(
+    walker: tuple[jax.Array, jax.Array],
+    ham_data: HamChol,
+    meas_ctx: UhfMeasCtx,
+    trial_data: UhfTrial,
+) -> jax.Array:
+    wu, wd = walker
+    mu = trial_data.mo_coeff_a.conj().T @ wu
+    md = trial_data.mo_coeff_b.conj().T @ wd
+    gu = _half_green_from_overlap_matrix(wu, mu)
+    gd = _half_green_from_overlap_matrix(wd, md)
+
+    fb_u = jnp.einsum("gij,ij->g", meas_ctx.rot_chol_a, gu, optimize="optimal")
+    fb_d = jnp.einsum("gij,ij->g", meas_ctx.rot_chol_b, gd, optimize="optimal")
+    return jnp.stack([fb_u, fb_d, fb_u + fb_d, fb_u - fb_d], axis=-1)
+
+
 def force_bias_kernel_gw_rh(
     walker: jax.Array,
     ham_data: HamChol,
@@ -79,6 +103,26 @@ def force_bias_kernel_gw_rh(
     fb += jnp.einsum("gij,ij->g", rot_chol_bb, g_bb, optimize="optimal")
 
     return fb
+
+
+def force_bias_charge_sz_kernel_gw_rh(
+    walker: jax.Array,
+    ham_data: HamChol,
+    meas_ctx: UhfMeasCtx,
+    trial_data: UhfTrial,
+) -> jax.Array:
+    w = walker
+    norb = trial_data.norb
+    na, _ = trial_data.nocc
+
+    bra = _build_bra_generalized(trial_data)
+    g = _half_green_from_overlap_matrix(w, bra.T.conj() @ w)
+
+    g_aa, g_bb = g[:na, :norb], g[na:, norb:]
+
+    fb_u = jnp.einsum("gij,ij->g", meas_ctx.rot_chol_a, g_aa, optimize="optimal")
+    fb_d = jnp.einsum("gij,ij->g", meas_ctx.rot_chol_b, g_bb, optimize="optimal")
+    return jnp.stack([fb_u, fb_d, fb_u + fb_d, fb_u - fb_d], axis=-1)
 
 
 def rdm1_kernel_rw(
@@ -354,6 +398,7 @@ def make_uhf_meas_ops(sys: System) -> MeasOps:
         build_meas_ctx_fn = build_meas_ctx
         kernels = {
             k_force_bias: force_bias_kernel_uw_rh,
+            k_force_bias_charge_sz: force_bias_charge_sz_kernel_uw_rh,
             k_energy: energy_kernel_uw_rh,
         }
         observables = {
@@ -363,7 +408,11 @@ def make_uhf_meas_ops(sys: System) -> MeasOps:
     elif wk == "generalized":
         overlap_fn = overlap_g
         build_meas_ctx_fn = build_meas_ctx
-        kernels = {k_force_bias: force_bias_kernel_gw_rh, k_energy: energy_kernel_gw_rh}
+        kernels = {
+            k_force_bias: force_bias_kernel_gw_rh,
+            k_force_bias_charge_sz: force_bias_charge_sz_kernel_gw_rh,
+            k_energy: energy_kernel_gw_rh,
+        }
         observables = {
             o_rdm1: rdm1_kernel_gw,
             o_density_corr: density_corr_kernel_gw,

@@ -104,11 +104,13 @@ def _make_prop(
     sys: System | None = None,
     *,
     mixed_precision: bool,
+    hs_decomposition: str = "charge",
 ) -> Any:
     return make_prop_ops(
         ham_data.basis,
         walker_kind,
         mixed_precision=mixed_precision,
+        hs_decomposition=hs_decomposition,
     )
 
 

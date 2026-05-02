@@ -1,3 +1,11 @@
+"""
+UCISDT-guided AFQMC example using the charge/Sz Cholesky HS decomposition.
+
+This follows examples/ucisdt.py, but selects the optional two-channel
+charge/Sz auxiliary-field decomposition. The decomposition is spin block
+diagonal, so this example uses unrestricted walkers.
+"""
+
 from pyscf import gto, scf
 
 from trot.afqmc import Afqmc
@@ -8,13 +16,6 @@ try:
 except Exception as exc:
     raise RuntimeError(
         "This example requires ccpy. Please install ccpy to run it.") from exc
-
-mol = gto.M(
-    atom="H 0 0 0; F 1.7 0.0 0.0",
-    basis="6-31g",
-    symmetry="c1",
-    verbose=3,
-)
 
 
 def run_uhf(mol, *, dm0=None):
@@ -49,6 +50,13 @@ def rerun_from_stable_uhf_orbitals(mf):
     return mf
 
 
+mol = gto.M(
+    atom="H 0 0 0; F 1.7 0.0 0.0",
+    basis="6-31g",
+    symmetry="c1",
+    verbose=3,
+)
+
 mf = run_uhf(mol)
 mf = rerun_from_stable_uhf_orbitals(mf)
 
@@ -63,9 +71,11 @@ staged = stage_from_ccpy(cc_driver, mf, order=3,
 
 af = Afqmc(staged)
 af.walker_kind = "unrestricted"
+af.hs_decomposition = "charge_sz"
 af.n_walkers = 80
-af.n_eql_blocks = 40
-af.n_blocks = 100
+af.n_eql_blocks = 400
+af.n_blocks = 1000
+af.dt = 0.0005
 af.seed = 7
 mean, err = af.kernel()
-print(f"AFQMC/UCISDT energy: {mean:.10f} +/- {err:.10f} Ha")
+print(f"Charge/Sz AFQMC/UCISDT energy: {mean:.10f} +/- {err:.10f} Ha")

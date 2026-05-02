@@ -139,6 +139,8 @@ class Afqmc:
 
         self.walker_kind: WalkerKind | None = None  # resolved in kernel
         self.mixed_precision = True
+        self.hs_decomposition = "charge"
+        self.aux_field_decomposition = "charge"
 
         self.params: QmcParamsBase | None = None  # resolved in kernel
         defaults = self.params_cls()
@@ -152,6 +154,7 @@ class Afqmc:
 
         self._staged: StagedInputs | None = None
         self._job: Job | None = None
+        self._job_prop_key: tuple | None = None
         self._cache_key: tuple | None = None
 
         self.e_tot: Any = None
@@ -222,6 +225,7 @@ class Afqmc:
         print(f" chol_cut        = {chol_cut:g}")
         print(f" cache           = {str(self.cache) if self.cache else None}")
         print(f" walker_kind     = {sys.walker_kind}")
+        print(f" hs_decomposition= {getattr(self, 'hs_decomposition', 'charge')}")
         print(f" mixed_precision = {self.mixed_precision}\n")
         meas_cfg = self._resolve_meas_cfg(job)
         if meas_cfg is not None:
@@ -335,12 +339,27 @@ class Afqmc:
         """
         Assemble a runnable Job from current settings and staged inputs.
         """
-        if self._job is not None and not force and (mesh is None or self._job.mesh is mesh):
+        hs_decomposition = getattr(self, "hs_decomposition", "charge")
+        aux_decomposition = getattr(self, "aux_field_decomposition", hs_decomposition)
+        if aux_decomposition != "charge":
+            hs_decomposition = aux_decomposition
+        hs_decomposition = "charge_sz" if hs_decomposition == "spin_z" else hs_decomposition
+        job_prop_key = (hs_decomposition, self.mixed_precision, self.walker_kind)
+
+        if (
+            self._job is not None
+            and not force
+            and (mesh is None or self._job.mesh is mesh)
+            and self._job_prop_key == job_prop_key
+        ):
             return self._job
 
         staged = self.stage()
         qmc_params = self._make_params()
         self.params = qmc_params
+        prop_kwargs = dict(prop_kwargs or {})
+        prop_kwargs.setdefault("hs_decomposition", hs_decomposition)
+        self.hs_decomposition = hs_decomposition
 
         job = self.setup_fn(
             staged,
@@ -356,6 +375,7 @@ class Afqmc:
             prop_kwargs=prop_kwargs,
         )
         self._job = job
+        self._job_prop_key = job_prop_key
         return job
 
     def _coerce_result(self, value: Any) -> Any:

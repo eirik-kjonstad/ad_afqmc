@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax, tree_util, vmap
 
-from ..core.ops import MeasOps, k_energy, k_force_bias
+from ..core.ops import MeasOps, k_energy, k_force_bias, k_force_bias_charge_sz
 from ..core.system import System
 from ..ham.chol import HamChol
 from ..trial.ucisdt import UcisdtTrial, overlap_r, overlap_u
@@ -388,6 +388,62 @@ def _force_bias_triples(
     return fb_aaa + fb_bbb + fb_aab + fb_abb
 
 
+def _force_bias_triples_spin_components(
+    trial_data: UcisdtTrial,
+    green_a: jax.Array,  # (n_oa, norb)
+    green_b: jax.Array,  # (n_ob, norb)
+    go_a: jax.Array,  # (n_oa, n_va)
+    go_b: jax.Array,  # (n_ob, n_vb)
+    gp_a: jax.Array,  # (norb, n_va)
+    gp_b: jax.Array,  # (norb, n_vb)
+    chol_a: jax.Array,  # (n_chol, norb, norb)
+    chol_b: jax.Array,  # (n_chol, norb, norb)
+    low_memory: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Spin-resolved triples numerator for one-body Cholesky force bias."""
+    n_oa, n_ob = trial_data.nocc
+
+    lo_a = chol_a[:, :n_oa, :]
+    lo_b = chol_b[:, :n_ob, :]
+
+    c3aaa = trial_data.c3aaa
+    c3aab = trial_data.c3aab
+    c3abb = trial_data.c3abb
+    c3bbb = trial_data.c3bbb
+
+    xa = jnp.einsum("gij,ij->g", lo_a, green_a)
+    xb = jnp.einsum("gij,ij->g", lo_b, green_b)
+
+    ya = jnp.einsum("pj,gij,it->gpt", green_a, chol_a, gp_a)
+    yb = jnp.einsum("pj,gij,it->gpt", green_b, chol_b, gp_b)
+
+    cgg_a = _c3_contract_pt(c3aaa, go_a, go_a, low_memory=low_memory)
+    cggg_a = jnp.einsum("pt,pt->", cgg_a, go_a)
+    fb_aaa_a = (1 / 6) * cggg_a * xa - (1 / 2) * jnp.einsum("pt,gpt->g", cgg_a, ya)
+    fb_aaa_b = (1 / 6) * cggg_a * xb
+
+    cgg_b = _c3_contract_pt(c3bbb, go_b, go_b, low_memory=low_memory)
+    cggg_b = jnp.einsum("pt,pt->", cgg_b, go_b)
+    fb_bbb_a = (1 / 6) * cggg_b * xa
+    fb_bbb_b = (1 / 6) * cggg_b * xb - (1 / 2) * jnp.einsum("pt,gpt->g", cgg_b, yb)
+
+    caab_ga_gb = _c3_contract_pt(c3aab, go_a, go_b, low_memory=low_memory)
+    caab_ga_ga_gb = jnp.einsum("pt,pt->", caab_ga_gb, go_a)
+    ga_ga_caab = _c3_contract_rs(c3aab, go_a, go_a, low_memory=low_memory)
+    fb_aab_a = (1 / 2) * caab_ga_ga_gb * xa - jnp.einsum("gpt,pt->g", ya, caab_ga_gb)
+    fb_aab_b = (1 / 2) * caab_ga_ga_gb * xb - (1 / 2) * jnp.einsum("grs,rs->g", yb, ga_ga_caab)
+
+    cabb_ga_gb_gb = _c3_contract_scalar(c3abb, go_a, go_b, go_b, low_memory=low_memory)
+    ga_cabb_gb = _c3_contract_qu(c3abb, go_a, go_b, low_memory=low_memory)
+    cabb_gb_gb = _c3_contract_pt(c3abb, go_b, go_b, low_memory=low_memory)
+    fb_abb_a = (1 / 2) * cabb_ga_gb_gb * xa - (1 / 2) * jnp.einsum("gpt,pt->g", ya, cabb_gb_gb)
+    fb_abb_b = (1 / 2) * cabb_ga_gb_gb * xb - jnp.einsum("gqu,qu->g", yb, ga_cabb_gb)
+
+    fb_a = fb_aaa_a + fb_bbb_a + fb_aab_a + fb_abb_a
+    fb_b = fb_aaa_b + fb_bbb_b + fb_aab_b + fb_abb_b
+    return fb_a, fb_b
+
+
 # ---------------------------------------------------------------------------
 # Triples helper: one-body energy contribution from triples
 # ---------------------------------------------------------------------------
@@ -625,12 +681,12 @@ def force_bias_kernel_rw_rh(
     )
 
 
-def force_bias_kernel_uw_rh(
+def _force_bias_spin_components_uw_rh(
     walker: tuple[jax.Array, jax.Array],
     ham_data: HamChol,
     meas_ctx: UcisdtMeasCtx,
     trial_data: UcisdtTrial,
-) -> jax.Array:
+) -> tuple[jax.Array, jax.Array]:
     wa, wb = walker
     n_oa, n_ob = trial_data.nocc
     c1a = trial_data.c1a
@@ -661,32 +717,35 @@ def force_bias_kernel_uw_rh(
 
     lg_a = jnp.einsum("gpj,pj->g", rot_chol_a, green_a, optimize="optimal")
     lg_b = jnp.einsum("gpj,pj->g", rot_chol_b, green_b, optimize="optimal")
-    lg = lg_a + lg_b
 
     # ref
-    fb_0 = lg_a + lg_b
+    fb_0_a = lg_a
+    fb_0_b = lg_b
 
     # single excitations
     ci1g_a = jnp.einsum("pt,pt->", c1a, green_occ_a, optimize="optimal")
     ci1g_b = jnp.einsum("pt,pt->", c1b, green_occ_b, optimize="optimal")
     ci1g = ci1g_a + ci1g_b
-    fb_1_1 = ci1g * lg
+    fb_1_1_a = ci1g * lg_a
+    fb_1_1_b = ci1g * lg_b
     ci1gp_a = jnp.einsum("pt,it->pi", c1a, greenp_a, optimize="optimal")
     ci1gp_b = jnp.einsum("pt,it->pi", c1b, greenp_b, optimize="optimal")
     gci1gp_a = jnp.einsum("pj,pi->ij", green_a, ci1gp_a, optimize="optimal")
     gci1gp_b = jnp.einsum("pj,pi->ij", green_b, ci1gp_b, optimize="optimal")
-    fb_1_2 = -jnp.einsum(
+    fb_1_2_a = -jnp.einsum(
         "gij,ij->g",
         chol_a.astype(cfg.mixed_real_dtype),
         gci1gp_a.astype(cfg.mixed_complex_dtype),
         optimize="optimal",
-    ) - jnp.einsum(
+    )
+    fb_1_2_b = -jnp.einsum(
         "gij,ij->g",
         chol_b.astype(cfg.mixed_real_dtype),
         gci1gp_b.astype(cfg.mixed_complex_dtype),
         optimize="optimal",
     )
-    fb_1 = fb_1_1 + fb_1_2
+    fb_1_a = fb_1_1_a + fb_1_2_a
+    fb_1_b = fb_1_1_b + fb_1_2_b
 
     # double excitations
     ci2g_a = jnp.einsum(
@@ -713,7 +772,8 @@ def force_bias_kernel_uw_rh(
     gci2g_b = 0.5 * jnp.einsum("qu,qu->", ci2g_b, green_occ_b, optimize="optimal")
     gci2g_ab = jnp.einsum("pt,pt->", ci2g_ab_a, green_occ_a, optimize="optimal")
     gci2g = gci2g_a + gci2g_b + gci2g_ab
-    fb_2_1 = lg * gci2g
+    fb_2_1_a = lg_a * gci2g
+    fb_2_1_b = lg_b * gci2g
     ci2_green_a = (greenp_a @ (ci2g_a + ci2g_ab_a).T) @ green_a
     ci2_green_b = (greenp_b @ (ci2g_b + ci2g_ab_b).T) @ green_b
     fb_2_2_a = -jnp.einsum(
@@ -728,8 +788,8 @@ def force_bias_kernel_uw_rh(
         ci2_green_b.astype(cfg.mixed_complex_dtype),
         optimize="optimal",
     )
-    fb_2_2 = fb_2_2_a + fb_2_2_b
-    fb_2 = fb_2_1 + fb_2_2
+    fb_2_a = fb_2_1_a + fb_2_2_a
+    fb_2_b = fb_2_1_b + fb_2_2_b
 
     # overlap (singles + doubles + triples)
     o3 = _triples_overlap(
@@ -737,7 +797,7 @@ def force_bias_kernel_uw_rh(
     )
     overlap = 1.0 + ci1g + gci2g + o3
 
-    fb_3 = _force_bias_triples(
+    fb_3_a, fb_3_b = _force_bias_triples_spin_components(
         trial_data,
         green_a,
         green_b,
@@ -750,7 +810,29 @@ def force_bias_kernel_uw_rh(
         low_memory=(cfg.memory_mode == "low"),
     )
 
-    return (fb_0 + fb_1 + fb_2 + fb_3) / overlap
+    fb_a = fb_0_a + fb_1_a + fb_2_a + fb_3_a
+    fb_b = fb_0_b + fb_1_b + fb_2_b + fb_3_b
+    return fb_a / overlap, fb_b / overlap
+
+
+def force_bias_kernel_uw_rh(
+    walker: tuple[jax.Array, jax.Array],
+    ham_data: HamChol,
+    meas_ctx: UcisdtMeasCtx,
+    trial_data: UcisdtTrial,
+) -> jax.Array:
+    fb_a, fb_b = _force_bias_spin_components_uw_rh(walker, ham_data, meas_ctx, trial_data)
+    return fb_a + fb_b
+
+
+def force_bias_charge_sz_kernel_uw_rh(
+    walker: tuple[jax.Array, jax.Array],
+    ham_data: HamChol,
+    meas_ctx: UcisdtMeasCtx,
+    trial_data: UcisdtTrial,
+) -> jax.Array:
+    fb_a, fb_b = _force_bias_spin_components_uw_rh(walker, ham_data, meas_ctx, trial_data)
+    return jnp.stack([fb_a, fb_b, fb_a + fb_b, fb_a - fb_b], axis=-1)
 
 
 def energy_kernel_rw_rh(
@@ -1155,6 +1237,7 @@ def make_ucisdt_meas_ops(
     elif wk == "unrestricted":
         kernels = {
             k_force_bias: force_bias_kernel_uw_rh,
+            k_force_bias_charge_sz: force_bias_charge_sz_kernel_uw_rh,
             k_energy: energy_kernel_uw_rh,
         }
         overlap_fn = overlap_u

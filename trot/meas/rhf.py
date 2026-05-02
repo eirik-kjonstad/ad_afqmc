@@ -8,7 +8,15 @@ import jax.numpy as jnp
 from jax import lax, tree_util
 
 from ..prop.types import QmcParamsLno
-from ..core.ops import MeasOps, k_energy, k_force_bias, o_density_corr, o_rdm1, o_orb_corr
+from ..core.ops import (
+    MeasOps,
+    k_energy,
+    k_force_bias,
+    k_force_bias_charge_sz,
+    o_density_corr,
+    o_rdm1,
+    o_orb_corr,
+)
 from ..core.system import System
 from ..ham.chol import HamChol
 from ..meas.uhf import _density_corr_from_greens
@@ -153,6 +161,22 @@ def force_bias_kernel_uw_rh(
     return meas_ctx.rot_chol_flat @ g.reshape(-1)
 
 
+def force_bias_charge_sz_kernel_uw_rh(
+    walker: tuple[jax.Array, jax.Array],
+    ham_data: Any,
+    meas_ctx: RhfMeasCtx,
+    trial_data: RhfTrial,
+) -> jax.Array:
+    wu, wd = walker
+    mu = trial_data.mo_coeff.conj().T @ wu
+    md = trial_data.mo_coeff.conj().T @ wd
+    gu = _half_green_from_overlap_matrix(wu, mu)
+    gd = _half_green_from_overlap_matrix(wd, md)
+    fb_u = meas_ctx.rot_chol_flat @ gu.reshape(-1)
+    fb_d = meas_ctx.rot_chol_flat @ gd.reshape(-1)
+    return jnp.stack([fb_u, fb_d, fb_u + fb_d, fb_u - fb_d], axis=-1)
+
+
 def energy_kernel_uw_rh(
     walker: tuple[jax.Array, jax.Array],
     ham_data: HamChol,
@@ -186,6 +210,23 @@ def force_bias_kernel_gw_rh(
     g_dn = g_half[nocc:, norb:]
     g = g_up + g_dn
     return meas_ctx.rot_chol_flat @ g.reshape(-1)
+
+
+def force_bias_charge_sz_kernel_gw_rh(
+    walker: jax.Array, ham_data: Any, meas_ctx: RhfMeasCtx, trial_data: RhfTrial
+) -> jax.Array:
+    norb, nocc = trial_data.norb, trial_data.nocc
+    cH = trial_data.mo_coeff.conj().T
+    top = cH @ walker[:norb, :]
+    bot = cH @ walker[norb:, :]
+    m = jnp.vstack([top, bot])
+
+    g_half = _half_green_from_overlap_matrix(walker, m)
+    g_up = g_half[:nocc, :norb]
+    g_dn = g_half[nocc:, norb:]
+    fb_u = meas_ctx.rot_chol_flat @ g_up.reshape(-1)
+    fb_d = meas_ctx.rot_chol_flat @ g_dn.reshape(-1)
+    return jnp.stack([fb_u, fb_d, fb_u + fb_d, fb_u - fb_d], axis=-1)
 
 
 def rdm1_kernel_rw(
@@ -338,6 +379,7 @@ def make_rhf_meas_ops(sys: System, memory_mode: str = "high") -> MeasOps:
         build_meas_ctx_fn = lambda ham_data, trial_data: build_meas_ctx(ham_data, trial_data, cfg)
         kernels = {
             k_force_bias: force_bias_kernel_uw_rh,
+            k_force_bias_charge_sz: force_bias_charge_sz_kernel_uw_rh,
             k_energy: energy_kernel_uw_rh,
         }
         observables = {
@@ -349,6 +391,7 @@ def make_rhf_meas_ops(sys: System, memory_mode: str = "high") -> MeasOps:
         build_meas_ctx_fn = lambda ham_data, trial_data: build_meas_ctx(ham_data, trial_data, cfg)
         kernels = {
             k_force_bias: force_bias_kernel_gw_rh,
+            k_force_bias_charge_sz: force_bias_charge_sz_kernel_gw_rh,
         }
         observables = {
             o_rdm1: rdm1_kernel_gw,

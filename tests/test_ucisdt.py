@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import pytest
 
 from trot import testing
-from trot.core.ops import k_energy, k_force_bias
+from trot.core.ops import k_energy, k_force_bias, k_force_bias_charge_sz
 from trot.meas.ucisdt import (
     build_meas_ctx,
     energy_kernel_rw_rh,
@@ -18,6 +18,8 @@ from trot.meas.ucisdt import (
     force_bias_kernel_uw_rh,
     make_ucisdt_meas_ops,
 )
+from trot.prop.afqmc import _make_field_shifts
+from trot.prop.chol_afqmc_ops import _build_prop_ctx
 from trot.trial.ucisdt import UcisdtTrial, make_ucisdt_trial_ops
 
 
@@ -183,6 +185,55 @@ def test_auto_force_bias_matches_manual_ucisdt(walker_kind, norb, nup, ndn, n_ch
         v_m = fb_manual(wi, ham, ctx_manual, trial)
         v_a = fb_auto(wi, ham, ctx_auto, trial)
         assert jnp.allclose(v_a, v_m, rtol=1e-10, atol=1e-10), (v_a, v_m)
+
+
+def test_charge_sz_force_bias_channels_sum_to_charge_ucisdt():
+    key = jax.random.PRNGKey(3)
+    key, k_w = jax.random.split(key)
+    norb, nup, ndn, n_chol = 6, 3, 2, 7
+
+    sys, ham, trial, ctx = testing.make_common_manual_only(
+        key,
+        "unrestricted",
+        norb,
+        (nup, ndn),
+        n_chol,
+        make_trial_fn=_make_ucisdt_trial,
+        make_trial_fn_kwargs=dict(norb=norb, nup=nup, ndn=ndn),
+        make_trial_ops_fn=make_ucisdt_trial_ops,
+        build_meas_ctx_fn=build_meas_ctx,
+    )
+    meas_ops = make_ucisdt_meas_ops(sys, mixed_precision=False, testing=True)
+    fb_charge = meas_ops.require_kernel(k_force_bias)
+    fb_charge_sz = meas_ops.require_kernel(k_force_bias_charge_sz)
+
+    wi = testing.make_walkers(k_w, sys)
+    charge = fb_charge(wi, ham, ctx, trial)
+    channels = fb_charge_sz(wi, ham, ctx, trial)
+
+    assert channels.shape == (n_chol, 4)
+    assert jnp.allclose(channels[:, 0] + channels[:, 1], charge, rtol=1e-10, atol=1e-10)
+    assert jnp.allclose(channels[:, 2], charge, rtol=1e-10, atol=1e-10)
+    assert jnp.allclose(channels[:, 3], channels[:, 0] - channels[:, 1], rtol=1e-10, atol=1e-10)
+
+    prop_ctx = _build_prop_ctx(
+        ham,
+        jnp.zeros((2, norb, norb), dtype=ham.chol.dtype),
+        0.005,
+        hs_decomposition="charge_sz",
+    )
+    shifts = _make_field_shifts(channels[jnp.newaxis, :, :], prop_ctx)[0]
+    inv_sqrt2 = 1.0 / jnp.sqrt(jnp.asarray(2.0, dtype=prop_ctx.sqrt_dt.dtype))
+    expected = -prop_ctx.sqrt_dt * jnp.stack(
+        [
+            1.0j * channels[:, 0],
+            1.0j * channels[:, 1],
+            1.0j * inv_sqrt2 * charge,
+            inv_sqrt2 * (channels[:, 0] - channels[:, 1]),
+        ],
+        axis=-1,
+    )
+    assert jnp.allclose(shifts, expected, rtol=1e-10, atol=1e-10)
 
 
 @pytest.mark.parametrize(
@@ -362,6 +413,12 @@ def test_low_memory_matches_high_memory_ucisdt(walker_kind, norb, nup, ndn, n_ch
 
     fb_high = meas_high.require_kernel(k_force_bias)
     fb_low = meas_low.require_kernel(k_force_bias)
+    fb_charge_sz_high = (
+        meas_high.require_kernel(k_force_bias_charge_sz) if walker_kind == "unrestricted" else None
+    )
+    fb_charge_sz_low = (
+        meas_low.require_kernel(k_force_bias_charge_sz) if walker_kind == "unrestricted" else None
+    )
     e_high = meas_high.require_kernel(k_energy)
     e_low = meas_low.require_kernel(k_energy)
 
@@ -373,6 +430,13 @@ def test_low_memory_matches_high_memory_ucisdt(walker_kind, norb, nup, ndn, n_ch
         e_l = e_low(walker, ham, ctx_low, trial)
 
         assert jnp.allclose(fb_l, fb_h, rtol=1e-11, atol=1e-11), (fb_l, fb_h)
+        if fb_charge_sz_high is not None and fb_charge_sz_low is not None:
+            fb_sz_h = fb_charge_sz_high(walker, ham, ctx_high, trial)
+            fb_sz_l = fb_charge_sz_low(walker, ham, ctx_low, trial)
+            assert jnp.allclose(fb_sz_l, fb_sz_h, rtol=1e-11, atol=1e-11), (
+                fb_sz_l,
+                fb_sz_h,
+            )
         assert jnp.allclose(e_l, e_h, rtol=1e-11, atol=1e-11), (e_l, e_h)
 
 

@@ -116,6 +116,7 @@ class MeasKernel(Protocol):
 # usual kernel names
 k_energy = "energy"
 k_force_bias = "force_bias"
+k_force_bias_charge_sz = "force_bias_charge_sz"
 o_rdm1 = "rdm1"
 o_density_corr = "density_corr"
 o_orb_corr = "orb_corr"

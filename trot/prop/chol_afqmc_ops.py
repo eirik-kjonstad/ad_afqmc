@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, NamedTuple, Tuple
+from typing import Any, Callable, Literal, NamedTuple, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +11,16 @@ from ..ham.chol import HamChol
 from .utils import taylor_expm_action
 
 # contains low level details of AFQMC chol propagation
+
+HsDecomposition = Literal["charge", "charge_sz"]
+
+
+def _validate_hs_decomposition(hs_decomposition: str) -> HsDecomposition:
+    if hs_decomposition == "spin_z":
+        hs_decomposition = "charge_sz"
+    if hs_decomposition not in ("charge", "charge_sz"):
+        raise ValueError(f"unknown hs_decomposition: {hs_decomposition!r}")
+    return hs_decomposition  # type: ignore[return-value]
 
 
 @tree_util.register_pytree_node_class
@@ -23,6 +33,7 @@ class CholAfqmcCtx:
     h0_prop: jax.Array  # scalar
     chol_flat: jax.Array  # (n_fields, n*n)
     norb: int
+    hs_decomposition: HsDecomposition = "charge"
 
     def tree_flatten(self):
         return (
@@ -32,12 +43,12 @@ class CholAfqmcCtx:
             self.mf_shifts,
             self.h0_prop,
             self.chol_flat,
-        ), (self.norb,)
+        ), (self.norb, self.hs_decomposition)
 
     @classmethod
     def tree_unflatten(cls, aux, children):
         dt, sqrt_dt, exp_h1_half, mf_shifts, h0_prop, chol_flat = children
-        (norb,) = aux
+        norb, hs_decomposition = aux
 
         return cls(
             dt=dt,
@@ -47,6 +58,7 @@ class CholAfqmcCtx:
             h0_prop=h0_prop,
             chol_flat=chol_flat,
             norb=norb,
+            hs_decomposition=hs_decomposition,
         )
 
 
@@ -71,8 +83,11 @@ def _get_dm(rdm1: jax.Array, ham_basis: str) -> jax.Array:
     return dm
 
 
-def _mf_shifts(ham_data: HamChol, rdm1: jax.Array) -> jax.Array:
+def _mf_shifts(ham_data: HamChol, rdm1: jax.Array, hs_decomposition: HsDecomposition) -> jax.Array:
     dm = _get_dm(rdm1, ham_data.basis)
+    if hs_decomposition == "charge_sz":
+        nchol = ham_data.chol.shape[0]
+        return jnp.zeros((nchol, 4), dtype=jnp.result_type(ham_data.chol, dm, 1.0j))
     return 1.0j * jnp.einsum("gij,ji->g", ham_data.chol, dm, optimize="optimal")
 
 
@@ -87,11 +102,40 @@ def _make_vhs_split_flat(*, chol_flat: jax.Array, x: jax.Array, n: int) -> jax.A
     return lax.complex(v_re, v_im).reshape(n, n)
 
 
-def _get_h1_eff(ham_data: HamChol, mf: jax.Array) -> jax.Array:
+def _make_charge_sz_vhs_split_flat(
+    *, chol_flat: jax.Array, field: jax.Array, sqrt_dt: jax.Array, n: int
+) -> tuple[jax.Array, jax.Array]:
+    x_up = field[:, 0]
+    x_dn = field[:, 1]
+    x_charge = field[:, 2]
+    x_sz = field[:, 3]
+    inv_sqrt2 = 1.0 / jnp.sqrt(jnp.asarray(2.0, dtype=sqrt_dt.dtype))
+    coeff_up = sqrt_dt * (1.0j * x_up + inv_sqrt2 * (1.0j * x_charge + x_sz))
+    coeff_dn = sqrt_dt * (1.0j * x_dn + inv_sqrt2 * (1.0j * x_charge - x_sz))
+    v_up = _make_vhs_split_flat(chol_flat=chol_flat, x=coeff_up, n=n)
+    v_dn = _make_vhs_split_flat(chol_flat=chol_flat, x=coeff_dn, n=n)
+    return v_up, v_dn
+
+
+def _force_bias_charge_sz_from_halves(
+    chol_a: jax.Array,
+    chol_b: jax.Array,
+    green_a: jax.Array,
+    green_b: jax.Array,
+) -> jax.Array:
+    fb_u = jnp.einsum("gij,ij->g", chol_a, green_a, optimize="optimal")
+    fb_d = jnp.einsum("gij,ij->g", chol_b, green_b, optimize="optimal")
+    return jnp.stack([fb_u, fb_d, fb_u + fb_d, fb_u - fb_d], axis=-1)
+
+
+def _get_h1_eff(ham_data: HamChol, mf: jax.Array, hs_decomposition: HsDecomposition) -> jax.Array:
     match ham_data.basis:
         case "restricted" | "generalized":
             v0m = 0.5 * jnp.einsum("gik,gkj->ij", ham_data.chol, ham_data.chol, optimize="optimal")
-            mf_r = (1.0j * mf).real
+            if hs_decomposition == "charge_sz":
+                mf_r = jnp.zeros((ham_data.chol.shape[0],), dtype=v0m.dtype)
+            else:
+                mf_r = (1.0j * mf).real
             v1m = jnp.einsum("g,gik->ik", mf_r, ham_data.chol, optimize="optimal")
             h1_eff = ham_data.h1 - v0m - v1m
         case _:
@@ -105,13 +149,15 @@ def _build_prop_ctx(
     rdm1: jax.Array,
     dt: float,
     chol_flat_precision: jnp.dtype = jnp.float64,
+    hs_decomposition: str = "charge",
 ) -> CholAfqmcCtx:
+    hs = _validate_hs_decomposition(hs_decomposition)
     dt_a = jnp.array(dt)
     sqrt_dt = jnp.sqrt(dt_a)
 
-    mf = _mf_shifts(ham_data, rdm1)
+    mf = _mf_shifts(ham_data, rdm1, hs)
     h0_prop = -ham_data.h0 - 0.5 * jnp.sum(mf**2)
-    h1_eff = _get_h1_eff(ham_data, mf)
+    h1_eff = _get_h1_eff(ham_data, mf, hs)
 
     exp_h1_half = _build_exp_h1_half_from_h1(h1_eff, dt_a)
     chol_flat = ham_data.chol.reshape(ham_data.chol.shape[0], -1).astype(chol_flat_precision)
@@ -124,6 +170,7 @@ def _build_prop_ctx(
         h0_prop=h0_prop,
         chol_flat=chol_flat,
         norb=norb,
+        hs_decomposition=hs,
     )
 
 
@@ -237,12 +284,63 @@ def _apply_trotter_g_from_restricted(
     return _apply_one_body_half_generalized_from_restricted(w2, prop_ctx)
 
 
-def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = False) -> TrotterOps:
+def _apply_two_body_charge_sz_unrestricted(
+    w_ud: Tuple[jax.Array, jax.Array],
+    field: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    n_terms: int,
+) -> Tuple[jax.Array, jax.Array]:
+    wu, wd = w_ud
+    v_up, v_dn = _make_charge_sz_vhs_split_flat(
+        chol_flat=prop_ctx.chol_flat,
+        field=field,
+        sqrt_dt=prop_ctx.sqrt_dt,
+        n=prop_ctx.norb,
+    )
+    one = jnp.asarray(1.0, dtype=wu.dtype)
+    return (
+        taylor_expm_action(one, v_up.astype(wu.dtype), wu, n_terms),
+        taylor_expm_action(one, v_dn.astype(wd.dtype), wd, n_terms),
+    )
+
+
+def _apply_trotter_charge_sz_u(
+    w_ud: Tuple[jax.Array, jax.Array],
+    field: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    n_terms: int,
+) -> Tuple[jax.Array, jax.Array]:
+    w1 = _apply_one_body_half_unrestricted(w_ud, prop_ctx)
+    w2 = _apply_two_body_charge_sz_unrestricted(w1, field, prop_ctx, n_terms)
+    return _apply_one_body_half_unrestricted(w2, prop_ctx)
+
+
+def _apply_trotter_charge_sz_g_from_restricted(
+    w: jax.Array,
+    field: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    n_terms: int,
+) -> jax.Array:
+    w1 = _apply_one_body_half_generalized_from_restricted(w, prop_ctx)
+    norb = w1.shape[0] // 2
+    up, dn = _apply_two_body_charge_sz_unrestricted(
+        (w1[:norb, :], w1[norb:, :]), field, prop_ctx, n_terms
+    )
+    return _apply_one_body_half_generalized_from_restricted(jnp.vstack([up, dn]), prop_ctx)
+
+
+def make_trotter_ops(
+    ham_basis: str,
+    walker_kind: str,
+    mixed_precision: bool = False,
+    hs_decomposition: str = "charge",
+) -> TrotterOps:
     assert isinstance(ham_basis, str)
     assert isinstance(walker_kind, str)
     assert isinstance(mixed_precision, bool)
 
     walker_kind = walker_kind.lower()
+    hs = _validate_hs_decomposition(hs_decomposition)
 
     if mixed_precision:
         vhs_complex_dtype = jnp.complex64
@@ -261,6 +359,19 @@ def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = F
 
     if ham_basis not in ("restricted", "generalized"):
         raise ValueError(f"unknown ham_basis: {ham_basis}")
+
+    if hs == "charge_sz":
+        if ham_basis != "restricted":
+            raise NotImplementedError("charge_sz HS decomposition requires restricted HamChol.")
+        match walker_kind:
+            case "unrestricted":
+                return TrotterOps(_apply_trotter_charge_sz_u)
+            case "generalized":
+                return TrotterOps(_apply_trotter_charge_sz_g_from_restricted)
+            case "restricted":
+                raise NotImplementedError(
+                    "charge_sz HS decomposition requires unrestricted or generalized walkers."
+                )
 
     match ham_basis, walker_kind:
         case "restricted", "restricted":
