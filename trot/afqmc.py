@@ -99,6 +99,9 @@ class Afqmc:
         Hubbard-Stratonovich decomposition used by Cholesky AFQMC propagation.
         The spin decomposition is currently opt-in and restricted to unrestricted walkers
         with UHF-family trials.
+    energy_estimator : {"trial", "uhf_bra"}, optional
+        Block-energy estimator. ``"uhf_bra"`` keeps propagation guided by the configured
+        correlated trial but measures scalar block energies with the underlying UHF bra.
     """
 
     params_cls = QmcParams
@@ -120,6 +123,7 @@ class Afqmc:
         n_walkers: int | None = None,
         n_chunks: int | None = None,
         hs_decomposition: str = "charge",
+        energy_estimator: str = "trial",
     ):
         self._obj = mf_or_cc
         self._cc: Any = None
@@ -145,6 +149,7 @@ class Afqmc:
         self.walker_kind: WalkerKind | None = None  # resolved in kernel
         self.mixed_precision = True
         self.hs_decomposition = hs_decomposition.lower()
+        self.energy_estimator = energy_estimator.lower()
 
         self.params: QmcParamsBase | None = None  # resolved in kernel
         defaults = self.params_cls()
@@ -229,6 +234,7 @@ class Afqmc:
         print(f" cache           = {str(self.cache) if self.cache else None}")
         print(f" walker_kind     = {sys.walker_kind}")
         print(f" hs_decomposition= {job.hs_decomposition}")
+        print(f" energy_estimator= {job.energy_estimator}")
         print(f" mixed_precision = {self.mixed_precision}\n")
         meas_cfg = self._resolve_meas_cfg(job)
         if meas_cfg is not None:
@@ -347,6 +353,7 @@ class Afqmc:
             and not force
             and (mesh is None or self._job.mesh is mesh)
             and self._job.hs_decomposition == self.hs_decomposition
+            and self._job.energy_estimator == self.energy_estimator
         ):
             return self._job
 
@@ -367,6 +374,7 @@ class Afqmc:
             block_fn=block_fn,
             prop_kwargs=prop_kwargs,
             hs_decomposition=self.hs_decomposition,
+            energy_estimator=self.energy_estimator,
         )
         self._job = job
         return job

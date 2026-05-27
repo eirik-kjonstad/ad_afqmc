@@ -19,6 +19,7 @@ from .core.system import System, WalkerKind
 from .ham.chol import HamChol
 from .prop.afqmc import make_prop_ops
 from .prop.blocks import block as default_block
+from .prop.blocks import block_uhf_bra_energy
 from .prop.types import PropOps, PropState, QmcParams, QmcParamsBase
 from .runtime_layout import RuntimeLayout, make_runtime_layout
 from .staging import StagedInputs, _resolve_stage_frozen_arg, load, stage
@@ -111,6 +112,48 @@ def _make_prop(
         walker_kind,
         mixed_precision=mixed_precision,
         hs_decomposition=hs_decomposition,
+    )
+
+
+def _make_uhf_bra_block_fn(
+    *,
+    sys: System,
+    ham_data: HamChol,
+    trial_data: Any,
+    trial_kind: str,
+) -> Callable[..., Any]:
+    trial_kind = trial_kind.lower()
+    if trial_kind not in {"ucisd", "ucisdt", "ucisdtq"}:
+        raise NotImplementedError(
+            "UHF-bra energy estimation currently supports unrestricted correlated trials: "
+            "ucisd, ucisdt, and ucisdtq."
+        )
+    if sys.walker_kind != "unrestricted":
+        raise NotImplementedError("UHF-bra energy estimation requires unrestricted walkers.")
+    if ham_data.basis != "restricted":
+        raise NotImplementedError(
+            "UHF-bra energy estimation requires a restricted-basis Cholesky Hamiltonian."
+        )
+    if not hasattr(trial_data, "mo_coeff_a") or not hasattr(trial_data, "mo_coeff_b"):
+        raise TypeError("UHF-bra energy estimation requires trial reference MO coefficients.")
+    if not hasattr(trial_data, "nocc"):
+        raise TypeError("UHF-bra energy estimation requires trial occupation metadata.")
+
+    from .meas.uhf import make_uhf_meas_ops
+    from .trial.uhf import UhfTrial
+
+    nup, ndn = trial_data.nocc
+    uhf_trial_data = UhfTrial(
+        trial_data.mo_coeff_a[:, :nup],
+        trial_data.mo_coeff_b[:, :ndn],
+    )
+    uhf_meas_ops = make_uhf_meas_ops(sys)
+    uhf_meas_ctx = uhf_meas_ops.build_meas_ctx(ham_data, uhf_trial_data)
+    return partial(
+        block_uhf_bra_energy,
+        uhf_trial_data=uhf_trial_data,
+        uhf_meas_ops=uhf_meas_ops,
+        uhf_meas_ctx=uhf_meas_ctx,
     )
 
 
@@ -268,6 +311,7 @@ class Job:
     block_fn: Callable[..., Any]
     runtime_layout: RuntimeLayout
     hs_decomposition: str = "charge"
+    energy_estimator: str = "trial"
     mesh: Mesh | None = None
     _runtime_prop_ctx: object | None = field(default=None, init=False, repr=False)
     _runtime_meas_ctx: object | None = field(default=None, init=False, repr=False)
@@ -356,6 +400,7 @@ def _assemble_job(
     params_kwargs: dict[str, Any] | None = None,
     prop_kwargs: dict[str, Any] | None = None,
     hs_decomposition: str = "charge",
+    energy_estimator: str = "trial",
     params_builder: Callable[..., QmcParamsBase],
     prop_builder: Callable[..., Any],
     default_block_fn: Callable[..., Any],
@@ -389,6 +434,9 @@ def _assemble_job(
     hs_decomposition = hs_decomposition.lower()
     if hs_decomposition not in ("charge", "spin"):
         raise ValueError(f"unknown HS decomposition: {hs_decomposition!r}")
+    energy_estimator = energy_estimator.lower()
+    if energy_estimator not in ("trial", "uhf_bra"):
+        raise ValueError(f"unknown energy estimator: {energy_estimator!r}")
 
     qmc_params = params_builder(params=params, **(params_kwargs or {}))
 
@@ -427,6 +475,7 @@ def _assemble_job(
     if prop_ops is None:
         resolved_prop_kwargs = dict(prop_kwargs or {})
         resolved_prop_kwargs.setdefault("hs_decomposition", hs_decomposition)
+        resolved_prop_kwargs = _filter_kwargs_for(prop_builder, resolved_prop_kwargs)
         prop_ops = prop_builder(
             ham_data,
             sys.walker_kind,
@@ -435,7 +484,19 @@ def _assemble_job(
             **resolved_prop_kwargs,
         )
 
-    if block_fn is None:
+    if energy_estimator == "uhf_bra":
+        if block_fn is not None:
+            raise ValueError(
+                "energy_estimator='uhf_bra' provides its own block function; "
+                "do not pass block_fn at the same time."
+            )
+        block_fn = _make_uhf_bra_block_fn(
+            sys=sys,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            trial_kind=staged.trial.kind,
+        )
+    elif block_fn is None:
         block_fn = default_block_fn
 
     return job_cls(
@@ -450,6 +511,7 @@ def _assemble_job(
         block_fn=block_fn,
         runtime_layout=runtime_layout,
         hs_decomposition=hs_decomposition,
+        energy_estimator=energy_estimator,
         mesh=mesh,
     )
 
@@ -480,6 +542,7 @@ def setup(
     params_kwargs: dict[str, Any] | None = None,
     prop_kwargs: dict[str, Any] | None = None,
     hs_decomposition: str = "charge",
+    energy_estimator: str = "trial",
 ) -> Job:
     """
     Assemble a runnable AFQMC Job from either:
@@ -516,6 +579,7 @@ def setup(
         params_kwargs=params_kwargs,
         prop_kwargs=prop_kwargs,
         hs_decomposition=hs_decomposition,
+        energy_estimator=energy_estimator,
         params_builder=_make_params,
         prop_builder=_make_prop,
         default_block_fn=default_block,

@@ -287,6 +287,130 @@ def block(
     return state, obs
 
 
+def block_uhf_bra_energy(
+    state: PropState,
+    *,
+    sys: System,
+    params: QmcParams,
+    ham_data: Any,
+    trial_data: Any,
+    trial_ops: TrialOps,
+    meas_ops: MeasOps,
+    meas_ctx: Any,
+    prop_ops: PropOps,
+    prop_ctx: Any,
+    uhf_trial_data: Any,
+    uhf_meas_ops: MeasOps,
+    uhf_meas_ctx: Any,
+    sr_fn: Callable = wk.stochastic_reconfiguration,
+    observable_names: tuple[str, ...] = (),
+) -> tuple[PropState, BlockObs]:
+    """
+    Propagate with the configured trial, but measure block energy with a UHF bra.
+    """
+    step = lambda st: prop_ops.step(
+        st,
+        params=params,
+        ham_data=ham_data,
+        trial_data=trial_data,
+        trial_ops=trial_ops,
+        meas_ops=meas_ops,
+        prop_ctx=prop_ctx,
+        meas_ctx=meas_ctx,
+    )
+
+    def _scan_step(carry: PropState, _x: Any):
+        carry = step(carry)
+        return carry, None
+
+    state, _ = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
+
+    walkers_new = wk.orthonormalize(state.walkers, sys.walker_kind)
+    overlaps_new = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
+        walkers_new, trial_data
+    )
+    state = state._replace(walkers=walkers_new, overlaps=overlaps_new)
+
+    e_kernel = meas_ops.require_kernel(k_energy)
+    e_samples = wk.vmap_chunked(e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None))(
+        state.walkers, ham_data, meas_ctx, trial_data
+    )
+    e_samples = jnp.real(e_samples)
+
+    thresh = jnp.sqrt(2.0 / jnp.asarray(params.dt))
+    e_ref = state.e_estimate
+    is_nan = ~jnp.isfinite(e_samples)
+    e_samples = jnp.where(is_nan | (jnp.abs(e_samples - e_ref) > thresh), e_ref, e_samples)
+
+    weights = jnp.where(is_nan, 0.0, state.weights)
+    w_sum = jnp.sum(weights)
+    w_sum_safe = jnp.where(w_sum == 0, 1.0, w_sum)
+
+    uhf_overlap = wk.vmap_chunked(
+        uhf_meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
+    )(state.walkers, uhf_trial_data)
+    uhf_e_kernel = uhf_meas_ops.require_kernel(k_energy)
+    uhf_energies = wk.vmap_chunked(
+        uhf_e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+    )(state.walkers, ham_data, uhf_meas_ctx, uhf_trial_data)
+    f_weight_fraction = uhf_overlap / state.overlaps
+
+    reweighted_den_terms = jnp.real(weights * f_weight_fraction)
+    reweighted_num_terms = jnp.real(weights * uhf_energies * f_weight_fraction)
+    finite_reweighted = jnp.isfinite(reweighted_den_terms) & jnp.isfinite(reweighted_num_terms)
+    reweighted_den = jnp.sum(jnp.where(finite_reweighted, reweighted_den_terms, 0.0))
+    reweighted_num = jnp.sum(jnp.where(finite_reweighted, reweighted_num_terms, 0.0))
+    e_uhf_block = reweighted_num / jnp.where(reweighted_den == 0, 1.0, reweighted_den)
+    e_uhf_block = jnp.where(
+        (reweighted_den == 0) | ~jnp.isfinite(e_uhf_block),
+        e_ref,
+        e_uhf_block,
+    )
+    e_trial_block = jnp.sum(weights * e_samples) / w_sum_safe
+    e_trial_block = jnp.where(w_sum == 0, e_ref, e_trial_block)
+    e_block = e_uhf_block
+
+    alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(e_block))
+    state = state._replace(
+        weights=weights,
+        e_estimate=(1.0 - alpha) * state.e_estimate + alpha * e_block,
+    )
+
+    obs_samples: dict[str, jax.Array] = {}
+    for name in observable_names:
+        kernel = meas_ops.require_observable(name)
+        samples = wk.vmap_chunked(kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None))(
+            state.walkers, ham_data, meas_ctx, trial_data
+        )
+        w_shape = (weights.shape[0],) + (1,) * max(samples.ndim - 1, 0)
+        num = jnp.sum(weights.reshape(w_shape) * samples, axis=0)
+        zero = jnp.zeros_like(num)
+        obs_samples[name] = jnp.where(w_sum == 0, zero, num / w_sum_safe)
+
+    key, subkey = jax.random.split(state.rng_key)
+    zeta = jax.random.uniform(subkey)
+    w_sr, weights_sr = sr_fn(state.walkers, state.weights, zeta, sys.walker_kind)
+    overlaps_sr = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
+        w_sr, trial_data
+    )
+    state = state._replace(
+        walkers=w_sr,
+        weights=weights_sr,
+        overlaps=overlaps_sr,
+        rng_key=key,
+    )
+
+    obs = BlockObs(
+        scalars={
+            "energy": e_block,
+            "weight": w_sum,
+            "trial_energy": e_trial_block,
+        },
+        observables=obs_samples,
+    )
+    return state, obs
+
+
 def block_mixed(
     state: PropState,
     *,

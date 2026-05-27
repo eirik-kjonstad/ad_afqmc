@@ -34,8 +34,8 @@ staged = stage_from_ccpy(cc_driver, mf, order=3,
 # Spin decomposition uses the generic AD force-bias wrapper for UCISDT.
 af = Afqmc(staged, hs_decomposition="spin")
 af.walker_kind = "unrestricted"
-af.n_walkers = 80
-af.n_eql_blocks = 5
+af.n_walkers = 200
+af.n_eql_blocks = 100
 af.n_blocks = 200
 af.seed = 7
 mean, err = af.kernel()
