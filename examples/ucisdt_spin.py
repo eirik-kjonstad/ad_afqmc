@@ -31,11 +31,12 @@ cc_driver.run_cc(method="ccsdt")
 staged = stage_from_ccpy(cc_driver, mf, order=3,
                          chol_cut=1.0e-14, verbose=False)
 
-af = Afqmc(staged)
+# Spin decomposition uses the generic AD force-bias wrapper for UCISDT.
+af = Afqmc(staged, hs_decomposition="spin")
 af.walker_kind = "unrestricted"
 af.n_walkers = 80
 af.n_eql_blocks = 5
 af.n_blocks = 200
 af.seed = 7
 mean, err = af.kernel()
-print(f"AFQMC/UCISDT energy: {mean:.10f} +/- {err:.10f} Ha")
+print(f"AFQMC/UCISDT spin-decomposed energy: {mean:.10f} +/- {err:.10f} Ha")

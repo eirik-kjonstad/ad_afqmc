@@ -171,6 +171,12 @@ def _build_restricted_prop_ctx_from_host(
         sqrt_dt = replicate(np.asarray(np.sqrt(dt)), mesh)
         exp_h1_half = replicate(exp_h1_half_np, mesh)
         mf_shifts = shard_model_axis(mf, mesh, announce_padding=False)
+        fb_scale_dtype = np.complex64 if mixed_precision else np.complex128
+        force_bias_scales = shard_model_axis(
+            np.full((n_chol,), 1.0j, dtype=fb_scale_dtype),
+            mesh,
+            announce_padding=False,
+        )
         chol_flat_a = shard_model_axis(
             chol_flat,
             mesh,
@@ -183,6 +189,8 @@ def _build_restricted_prop_ctx_from_host(
         sqrt_dt = jnp.asarray(np.sqrt(dt))
         exp_h1_half = jnp.asarray(exp_h1_half_np)
         mf_shifts = jnp.asarray(mf)
+        fb_scale_dtype = jnp.complex64 if mixed_precision else jnp.complex128
+        force_bias_scales = jnp.full((n_chol,), 1.0j, dtype=fb_scale_dtype)
         chol_flat_a = jnp.asarray(chol_flat, dtype=chol_flat_dtype)
         h0_prop_a = jnp.asarray(h0_prop)
 
@@ -191,6 +199,7 @@ def _build_restricted_prop_ctx_from_host(
         sqrt_dt=sqrt_dt,
         exp_h1_half=exp_h1_half,
         mf_shifts=mf_shifts,
+        force_bias_scales=force_bias_scales,
         h0_prop=h0_prop_a,
         chol_flat=chol_flat_a,
         norb=norb,

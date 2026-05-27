@@ -104,11 +104,13 @@ def _make_prop(
     sys: System | None = None,
     *,
     mixed_precision: bool,
+    hs_decomposition: str = "charge",
 ) -> Any:
     return make_prop_ops(
         ham_data.basis,
         walker_kind,
         mixed_precision=mixed_precision,
+        hs_decomposition=hs_decomposition,
     )
 
 
@@ -265,6 +267,7 @@ class Job:
     prop_ops: PropOps
     block_fn: Callable[..., Any]
     runtime_layout: RuntimeLayout
+    hs_decomposition: str = "charge"
     mesh: Mesh | None = None
     _runtime_prop_ctx: object | None = field(default=None, init=False, repr=False)
     _runtime_meas_ctx: object | None = field(default=None, init=False, repr=False)
@@ -352,6 +355,7 @@ def _assemble_job(
     block_fn: Callable[..., Any] | None = None,
     params_kwargs: dict[str, Any] | None = None,
     prop_kwargs: dict[str, Any] | None = None,
+    hs_decomposition: str = "charge",
     params_builder: Callable[..., QmcParamsBase],
     prop_builder: Callable[..., Any],
     default_block_fn: Callable[..., Any],
@@ -380,6 +384,11 @@ def _assemble_job(
 
     resolved_walker_kind = walker_kind_resolver(ham, walker_kind)
     sys = System(norb=int(ham.norb), nelec=ham.nelec, walker_kind=resolved_walker_kind)
+    if prop_kwargs is not None and "hs_decomposition" in prop_kwargs:
+        hs_decomposition = str(prop_kwargs["hs_decomposition"])
+    hs_decomposition = hs_decomposition.lower()
+    if hs_decomposition not in ("charge", "spin"):
+        raise ValueError(f"unknown HS decomposition: {hs_decomposition!r}")
 
     qmc_params = params_builder(params=params, **(params_kwargs or {}))
 
@@ -388,6 +397,19 @@ def _assemble_job(
         trial_data = td if trial_data is None else trial_data
         trial_ops = to if trial_ops is None else trial_ops
         meas_ops = mo if meas_ops is None else meas_ops
+
+    if hs_decomposition == "spin":
+        from .meas.spin_decomp import wrap_spin_decomp_meas_ops
+
+        if ham.basis != "restricted":
+            raise NotImplementedError(
+                "Spin decomposition requires a restricted-basis Cholesky Hamiltonian."
+            )
+        meas_ops = wrap_spin_decomp_meas_ops(
+            meas_ops,
+            sys=sys,
+            trial_kind=staged.trial.kind,
+        )
 
     runtime_layout = make_runtime_layout(
         staged=staged,
@@ -403,12 +425,14 @@ def _assemble_job(
     _setup_end(t_ham_runtime, "runtime Hamiltonian ready")
 
     if prop_ops is None:
+        resolved_prop_kwargs = dict(prop_kwargs or {})
+        resolved_prop_kwargs.setdefault("hs_decomposition", hs_decomposition)
         prop_ops = prop_builder(
             ham_data,
             sys.walker_kind,
             sys=sys,
             mixed_precision=mixed_precision,
-            **(prop_kwargs or {}),
+            **resolved_prop_kwargs,
         )
 
     if block_fn is None:
@@ -425,6 +449,7 @@ def _assemble_job(
         prop_ops=prop_ops,
         block_fn=block_fn,
         runtime_layout=runtime_layout,
+        hs_decomposition=hs_decomposition,
         mesh=mesh,
     )
 
@@ -454,6 +479,7 @@ def setup(
     # extra kwargs
     params_kwargs: dict[str, Any] | None = None,
     prop_kwargs: dict[str, Any] | None = None,
+    hs_decomposition: str = "charge",
 ) -> Job:
     """
     Assemble a runnable AFQMC Job from either:
@@ -489,6 +515,7 @@ def setup(
         block_fn=block_fn,
         params_kwargs=params_kwargs,
         prop_kwargs=prop_kwargs,
+        hs_decomposition=hs_decomposition,
         params_builder=_make_params,
         prop_builder=_make_prop,
         default_block_fn=default_block,
