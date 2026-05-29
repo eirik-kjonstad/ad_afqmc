@@ -46,6 +46,16 @@ def force_bias_kernel_uw_rh(
     meas_ctx: UhfMeasCtx,
     trial_data: UhfTrial,
 ) -> jax.Array:
+    fb_u, fb_d = _force_bias_components_uw_rh(walker, ham_data, meas_ctx, trial_data)
+    return fb_u + fb_d
+
+
+def _force_bias_components_uw_rh(
+    walker: tuple[jax.Array, jax.Array],
+    ham_data: HamChol,
+    meas_ctx: UhfMeasCtx,
+    trial_data: UhfTrial,
+) -> tuple[jax.Array, jax.Array]:
     wu, wd = walker
     mu = trial_data.mo_coeff_a.conj().T @ wu
     md = trial_data.mo_coeff_b.conj().T @ wd
@@ -54,7 +64,17 @@ def force_bias_kernel_uw_rh(
 
     fb_u = jnp.einsum("gij,ij->g", meas_ctx.rot_chol_a, gu, optimize="optimal")
     fb_d = jnp.einsum("gij,ij->g", meas_ctx.rot_chol_b, gd, optimize="optimal")
-    return fb_u + fb_d
+    return fb_u, fb_d
+
+
+def force_bias_kernel_uw_rh_spin(
+    walker: tuple[jax.Array, jax.Array],
+    ham_data: HamChol,
+    meas_ctx: UhfMeasCtx,
+    trial_data: UhfTrial,
+) -> jax.Array:
+    fb_u, fb_d = _force_bias_components_uw_rh(walker, ham_data, meas_ctx, trial_data)
+    return jnp.concatenate([fb_u, fb_d, fb_u - fb_d])
 
 
 def force_bias_kernel_gw_rh(
@@ -336,9 +356,18 @@ def build_meas_ctx(ham_data: HamChol, trial_data: UhfTrial) -> UhfMeasCtx:
     )
 
 
-def make_uhf_meas_ops(sys: System) -> MeasOps:
+def make_uhf_meas_ops(sys: System, hs_decomposition: str = "charge") -> MeasOps:
     wk = sys.walker_kind.lower()
+    hs_decomposition = hs_decomposition.lower()
+    if hs_decomposition not in ("charge", "spin"):
+        raise ValueError(f"Unknown HS decomposition: {hs_decomposition}")
+
     if wk == "restricted":
+        if hs_decomposition == "spin":
+            raise NotImplementedError(
+                "Spin HS decomposition for UHF measurements is only implemented "
+                "with unrestricted walkers."
+            )
         overlap_fn = overlap_r
         build_meas_ctx_fn = build_meas_ctx
         kernels = {
@@ -352,8 +381,13 @@ def make_uhf_meas_ops(sys: System) -> MeasOps:
     elif wk == "unrestricted":
         overlap_fn = overlap_u
         build_meas_ctx_fn = build_meas_ctx
+        force_bias_kernel = (
+            force_bias_kernel_uw_rh_spin
+            if hs_decomposition == "spin"
+            else force_bias_kernel_uw_rh
+        )
         kernels = {
-            k_force_bias: force_bias_kernel_uw_rh,
+            k_force_bias: force_bias_kernel,
             k_energy: energy_kernel_uw_rh,
         }
         observables = {
@@ -361,6 +395,11 @@ def make_uhf_meas_ops(sys: System) -> MeasOps:
             o_density_corr: density_corr_kernel_uw,
         }
     elif wk == "generalized":
+        if hs_decomposition == "spin":
+            raise NotImplementedError(
+                "Spin HS decomposition for UHF measurements is only implemented "
+                "with unrestricted walkers."
+            )
         overlap_fn = overlap_g
         build_meas_ctx_fn = build_meas_ctx
         kernels = {k_force_bias: force_bias_kernel_gw_rh, k_energy: energy_kernel_gw_rh}

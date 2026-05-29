@@ -20,6 +20,7 @@ class CholAfqmcCtx:
     sqrt_dt: jax.Array
     exp_h1_half: jax.Array  # (n,n) or (ns,ns)
     mf_shifts: jax.Array  # (n_fields,)
+    force_bias_scales: jax.Array  # (n_fields,)
     h0_prop: jax.Array  # scalar
     chol_flat: jax.Array  # (n_fields, n*n)
     norb: int
@@ -30,13 +31,14 @@ class CholAfqmcCtx:
             self.sqrt_dt,
             self.exp_h1_half,
             self.mf_shifts,
+            self.force_bias_scales,
             self.h0_prop,
             self.chol_flat,
         ), (self.norb,)
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        dt, sqrt_dt, exp_h1_half, mf_shifts, h0_prop, chol_flat = children
+        dt, sqrt_dt, exp_h1_half, mf_shifts, force_bias_scales, h0_prop, chol_flat = children
         (norb,) = aux
 
         return cls(
@@ -44,6 +46,7 @@ class CholAfqmcCtx:
             sqrt_dt=sqrt_dt,
             exp_h1_half=exp_h1_half,
             mf_shifts=mf_shifts,
+            force_bias_scales=force_bias_scales,
             h0_prop=h0_prop,
             chol_flat=chol_flat,
             norb=norb,
@@ -76,6 +79,44 @@ def _mf_shifts(ham_data: HamChol, rdm1: jax.Array) -> jax.Array:
     return 1.0j * jnp.einsum("gij,ji->g", ham_data.chol, dm, optimize="optimal")
 
 
+def _spin_l_contractions(ham_data: HamChol, rdm1: jax.Array) -> tuple[jax.Array, jax.Array]:
+    if ham_data.basis != "restricted":
+        raise ValueError("Spin HS decomposition requires a restricted-basis Cholesky Hamiltonian.")
+    if rdm1.ndim != 3 or rdm1.shape[0] != 2:
+        raise ValueError(
+            "Spin HS decomposition requires a spin-resolved RDM1 with shape (2, norb, norb)."
+        )
+
+    dm_a, dm_b = rdm1[0], rdm1[1]
+    l_a = jnp.einsum("gij,ji->g", ham_data.chol, dm_a, optimize="optimal")
+    l_b = jnp.einsum("gij,ji->g", ham_data.chol, dm_b, optimize="optimal")
+    return l_a, l_b
+
+
+def _mf_shifts_spin(ham_data: HamChol, rdm1: jax.Array) -> jax.Array:
+    l_a, l_b = _spin_l_contractions(ham_data, rdm1)
+    rt2 = jnp.sqrt(jnp.asarray(2.0, dtype=jnp.real(l_a).dtype))
+    return jnp.concatenate(
+        [
+            1.0j * rt2 * l_a,
+            1.0j * rt2 * l_b,
+            -(l_a - l_b),
+        ]
+    )
+
+
+def _force_bias_scales_charge(mf: jax.Array) -> jax.Array:
+    return 1.0j * jnp.ones_like(mf)
+
+
+def _force_bias_scales_spin(chol: jax.Array) -> jax.Array:
+    nchol = chol.shape[0]
+    dtype = jnp.result_type(chol, 1.0j)
+    rt2 = jnp.sqrt(jnp.asarray(2.0, dtype=jnp.real(chol).dtype))
+    ones = jnp.ones((nchol,), dtype=dtype)
+    return jnp.concatenate([1.0j * rt2 * ones, 1.0j * rt2 * ones, -ones])
+
+
 def _build_exp_h1_half_from_h1(h1: jax.Array, dt: jax.Array) -> jax.Array:
     return jax.scipy.linalg.expm(-0.5 * dt * h1)
 
@@ -105,13 +146,25 @@ def _build_prop_ctx(
     rdm1: jax.Array,
     dt: float,
     chol_flat_precision: jnp.dtype = jnp.float64,
+    hs_decomposition: str = "charge",
 ) -> CholAfqmcCtx:
     dt_a = jnp.array(dt)
     sqrt_dt = jnp.sqrt(dt_a)
 
-    mf = _mf_shifts(ham_data, rdm1)
-    h0_prop = -ham_data.h0 - 0.5 * jnp.sum(mf**2)
-    h1_eff = _get_h1_eff(ham_data, mf)
+    hs_decomposition = hs_decomposition.lower()
+    mf_charge = _mf_shifts(ham_data, rdm1)
+    h0_prop = -ham_data.h0 - 0.5 * jnp.sum(mf_charge**2)
+    h1_eff = _get_h1_eff(ham_data, mf_charge)
+
+    match hs_decomposition:
+        case "charge":
+            mf = mf_charge
+            force_bias_scales = _force_bias_scales_charge(mf)
+        case "spin":
+            mf = _mf_shifts_spin(ham_data, rdm1)
+            force_bias_scales = _force_bias_scales_spin(ham_data.chol)
+        case _:
+            raise ValueError(f"Unknown HS decomposition: {hs_decomposition}")
 
     exp_h1_half = _build_exp_h1_half_from_h1(h1_eff, dt_a)
     chol_flat = ham_data.chol.reshape(ham_data.chol.shape[0], -1).astype(chol_flat_precision)
@@ -121,6 +174,7 @@ def _build_prop_ctx(
         sqrt_dt=sqrt_dt,
         exp_h1_half=exp_h1_half,
         mf_shifts=mf,
+        force_bias_scales=force_bias_scales,
         h0_prop=h0_prop,
         chol_flat=chol_flat,
         norb=norb,
@@ -179,6 +233,39 @@ def _apply_two_body_unrestricted(
     )
 
 
+def _apply_two_body_unrestricted_spin(
+    w_ud: Tuple[jax.Array, jax.Array],
+    field: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    n_terms: int,
+    *,
+    vhs_complex_dtype: jnp.dtype,
+) -> Tuple[jax.Array, jax.Array]:
+    wu, wd = w_ud
+    nchol = prop_ctx.chol_flat.shape[0]
+    x_a = field[:nchol]
+    x_b = field[nchol : 2 * nchol]
+    x_s = field[2 * nchol :]
+
+    rt2 = jnp.sqrt(jnp.asarray(2.0, dtype=jnp.real(field).dtype))
+    vhs_a = _make_vhs_split_flat(
+        chol_flat=prop_ctx.chol_flat,
+        x=(rt2 * x_a + 1.0j * x_s).astype(vhs_complex_dtype),
+        n=prop_ctx.norb,
+    ).astype(wu.dtype)
+    vhs_b = _make_vhs_split_flat(
+        chol_flat=prop_ctx.chol_flat,
+        x=(rt2 * x_b - 1.0j * x_s).astype(vhs_complex_dtype),
+        n=prop_ctx.norb,
+    ).astype(wd.dtype)
+
+    a = (1.0j * prop_ctx.sqrt_dt).astype(wu.dtype)
+    return (
+        taylor_expm_action(a, vhs_a, wu, n_terms),
+        taylor_expm_action(a, vhs_b, wd, n_terms),
+    )
+
+
 def _apply_two_body_generalized_from_restricted(
     w: jax.Array,
     field: jax.Array,
@@ -222,6 +309,21 @@ def _apply_trotter_u(
     return a
 
 
+def _apply_trotter_u_spin(
+    w_ud: Tuple[jax.Array, jax.Array],
+    field: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    n_terms: int,
+    *,
+    vhs_complex_dtype: jnp.dtype,
+) -> Tuple[jax.Array, jax.Array]:
+    w1 = _apply_one_body_half_unrestricted(w_ud, prop_ctx)
+    w2 = _apply_two_body_unrestricted_spin(
+        w1, field, prop_ctx, n_terms, vhs_complex_dtype=vhs_complex_dtype
+    )
+    return _apply_one_body_half_unrestricted(w2, prop_ctx)
+
+
 def _apply_trotter_g_from_restricted(
     w: jax.Array,
     field: jax.Array,
@@ -237,12 +339,18 @@ def _apply_trotter_g_from_restricted(
     return _apply_one_body_half_generalized_from_restricted(w2, prop_ctx)
 
 
-def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = False) -> TrotterOps:
+def make_trotter_ops(
+    ham_basis: str,
+    walker_kind: str,
+    mixed_precision: bool = False,
+    hs_decomposition: str = "charge",
+) -> TrotterOps:
     assert isinstance(ham_basis, str)
     assert isinstance(walker_kind, str)
     assert isinstance(mixed_precision, bool)
 
     walker_kind = walker_kind.lower()
+    hs_decomposition = hs_decomposition.lower()
 
     if mixed_precision:
         vhs_complex_dtype = jnp.complex64
@@ -262,6 +370,21 @@ def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = F
     if ham_basis not in ("restricted", "generalized"):
         raise ValueError(f"unknown ham_basis: {ham_basis}")
 
+    if hs_decomposition == "spin":
+        if (ham_basis, walker_kind) != ("restricted", "unrestricted"):
+            raise NotImplementedError(
+                "Spin HS decomposition is only implemented for restricted Hamiltonians "
+                "with unrestricted walkers."
+            )
+        return TrotterOps(
+            lambda w, f, ctx, n_terms, dtype=vhs_complex_dtype: _apply_trotter_u_spin(
+                w, f, ctx, n_terms, vhs_complex_dtype=dtype
+            )
+        )
+
+    if hs_decomposition != "charge":
+        raise ValueError(f"Unknown HS decomposition: {hs_decomposition}")
+
     match ham_basis, walker_kind:
         case "restricted", "restricted":
             apply_trotter = lambda w, f, ctx, n_terms, mv=make_vhs: _apply_trotter_r(
@@ -272,10 +395,8 @@ def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = F
                 w, f, ctx, n_terms, make_vhs=mv
             )
         case "restricted", "generalized":
-            apply_trotter = (
-                lambda w, f, ctx, n_terms, mv=make_vhs: _apply_trotter_g_from_restricted(
-                    w, f, ctx, n_terms, make_vhs=mv
-                )
+            apply_trotter = lambda w, f, ctx, n_terms, mv=make_vhs: (
+                _apply_trotter_g_from_restricted(w, f, ctx, n_terms, make_vhs=mv)
             )
         case "generalized", "generalized":
             apply_trotter = lambda w, f, ctx, n_terms, mv=make_vhs: _apply_trotter_r(

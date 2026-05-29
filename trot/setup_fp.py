@@ -56,7 +56,10 @@ def _make_prop_fp(
     sys: System,
     *,
     mixed_precision: bool,
+    hs_decomposition: str = "charge",
 ) -> Any:
+    if hs_decomposition != "charge":
+        raise NotImplementedError("Spin HS decomposition is not implemented for free projection.")
     return make_prop_ops_fp(
         ham_data.basis,
         walker_kind,

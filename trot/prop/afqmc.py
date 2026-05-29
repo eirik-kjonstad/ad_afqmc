@@ -90,13 +90,15 @@ def afqmc_step(
 
     key, subkey = jax.random.split(state.rng_key)
     nw = wk.n_walkers(state.walkers)
-    fields = jax.random.normal(subkey, (nw, prop_ctx.chol_flat.shape[0]))
+    fields = jax.random.normal(subkey, (nw, prop_ctx.mf_shifts.shape[0]))
 
     fb_kernel = meas_ops.require_kernel(k_force_bias)
     force_bias = wk.vmap_chunked(
         fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
     )(state.walkers, ham_data, meas_ctx, trial_data)
-    field_shifts = -prop_ctx.sqrt_dt * (1.0j * force_bias - prop_ctx.mf_shifts)
+    field_shifts = -prop_ctx.sqrt_dt * (
+        prop_ctx.force_bias_scales * force_bias - prop_ctx.mf_shifts
+    )
     shifted_fields = fields - field_shifts
 
     shift_term = jnp.sum(shifted_fields * prop_ctx.mf_shifts, axis=1)
@@ -144,8 +146,18 @@ def afqmc_step(
     )
 
 
-def make_prop_ops(ham_basis: HamBasis, walker_kind: str, mixed_precision=False) -> PropOps:
-    trotter_ops = make_trotter_ops(ham_basis, walker_kind, mixed_precision=mixed_precision)
+def make_prop_ops(
+    ham_basis: HamBasis,
+    walker_kind: str,
+    mixed_precision=False,
+    hs_decomposition: str = "charge",
+) -> PropOps:
+    trotter_ops = make_trotter_ops(
+        ham_basis,
+        walker_kind,
+        mixed_precision=mixed_precision,
+        hs_decomposition=hs_decomposition,
+    )
 
     def step(
         state: PropState,
@@ -175,6 +187,7 @@ def make_prop_ops(ham_basis: HamBasis, walker_kind: str, mixed_precision=False) 
             rdm1,
             params.dt,
             chol_flat_precision=jnp.float32 if mixed_precision else jnp.float64,
+            hs_decomposition=hs_decomposition,
         )
 
     return PropOps(init_prop_state=init_prop_state, build_prop_ctx=build_prop_ctx, step=step)

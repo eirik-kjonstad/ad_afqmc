@@ -21,9 +21,12 @@ from trot.meas.uhf import (
     force_bias_kernel_gw_rh,
     force_bias_kernel_rw_rh,
     force_bias_kernel_uw_rh,
+    force_bias_kernel_uw_rh_spin,
     make_uhf_meas_ops,
 )
 from trot.prop.types import QmcParams
+from trot.setup import setup
+from trot.staging import HamInput, StagedInputs, TrialInput
 from trot.trial.uhf import UhfTrial, make_uhf_trial_ops
 
 
@@ -208,6 +211,118 @@ def test_force_bias_equal_when_wg_eq_wu():
         fbg = force_bias_kernel_gw_rh(wi, ham, ctx, trial)
 
         assert jnp.allclose(fbu, fbg, atol=1e-12), (fbu, fbg)
+
+
+def test_spin_decomposition_force_bias_components_uhf():
+    norb = 6
+    nup, ndn = 2, 1
+    n_chol = 8
+    walker_kind = "unrestricted"
+
+    key = jax.random.PRNGKey(12)
+    key, k_w = jax.random.split(key)
+
+    (
+        sys,
+        ham,
+        trial,
+        ctx,
+    ) = testing.make_common_manual_only(
+        key,
+        walker_kind,
+        norb,
+        (nup, ndn),
+        n_chol,
+        make_trial_fn=_make_uhf_trial,
+        make_trial_fn_kwargs=dict(
+            norb=norb,
+            nup=nup,
+            ndn=ndn,
+        ),
+        make_trial_ops_fn=make_uhf_trial_ops,
+        build_meas_ctx_fn=build_meas_ctx,
+    )
+
+    meas_spin = make_uhf_meas_ops(sys, hs_decomposition="spin")
+    fb_spin_selected = meas_spin.require_kernel(k_force_bias)
+
+    for i in range(4):
+        wi = testing.make_walkers(jax.random.fold_in(k_w, i), sys)
+        wi = cast(tuple, wi)
+        fb_charge = force_bias_kernel_uw_rh(wi, ham, ctx, trial)
+        fb_spin = force_bias_kernel_uw_rh_spin(wi, ham, ctx, trial)
+        fb_spin_from_ops = fb_spin_selected(wi, ham, ctx, trial)
+
+        fb_a = fb_spin[:n_chol]
+        fb_b = fb_spin[n_chol : 2 * n_chol]
+        fb_s = fb_spin[2 * n_chol :]
+
+        assert fb_spin.shape == (3 * n_chol,)
+        assert jnp.allclose(fb_spin, fb_spin_from_ops, atol=1e-12)
+        assert jnp.allclose(fb_charge, fb_a + fb_b, atol=1e-12)
+        assert jnp.allclose(fb_s, fb_a - fb_b, atol=1e-12)
+
+
+def test_spin_decomposition_force_bias_rejects_non_unrestricted_uhf():
+    key = jax.random.PRNGKey(13)
+    sys, *_ = testing.make_common_manual_only(
+        key,
+        "restricted",
+        6,
+        (2, 2),
+        8,
+        make_trial_fn=_make_uhf_trial,
+        make_trial_fn_kwargs=dict(norb=6, nup=2, ndn=2),
+        make_trial_ops_fn=make_uhf_trial_ops,
+        build_meas_ctx_fn=build_meas_ctx,
+    )
+
+    with pytest.raises(NotImplementedError):
+        make_uhf_meas_ops(sys, hs_decomposition="spin")
+
+
+def test_setup_wires_spin_decomposition_for_uhf():
+    ham = HamInput(
+        h0=0.0,
+        h1=jnp.zeros((2, 2)),
+        chol=jnp.array([[[0.1, 0.0], [0.0, -0.2]]]),
+        nelec=(1, 1),
+        norb=2,
+        chol_cut=1.0e-5,
+        frozen=0,
+        source_kind="mf",
+        basis="restricted",
+    )
+    trial = TrialInput(
+        kind="uhf",
+        data={"mo_a": jnp.eye(2), "mo_b": jnp.eye(2)},
+        frozen=0,
+        source_kind="mf",
+    )
+    staged = StagedInputs(
+        ham=ham,
+        trial=trial,
+        meta={"source_kind": "mf", "chol_cut": 1.0e-5},
+    )
+
+    job = setup(
+        staged,
+        walker_kind="unrestricted",
+        hs_decomposition="spin",
+        mixed_precision=False,
+        params=QmcParams(dt=0.01, n_walkers=1, n_blocks=1, n_prop_steps=0, n_eql_blocks=0),
+    )
+    rdm1 = job.trial_ops.get_rdm1(job.trial_data)
+    prop_ctx = job.prop_ops.build_prop_ctx(job.ham_data, rdm1, job.params)
+    meas_ctx = job.meas_ops.build_meas_ctx(job.ham_data, job.trial_data)
+    walker = testing.make_walkers(jax.random.PRNGKey(14), job.sys)
+    force_bias = job.meas_ops.require_kernel(k_force_bias)(
+        walker, job.ham_data, meas_ctx, job.trial_data
+    )
+
+    assert prop_ctx.mf_shifts.shape == (3,)
+    assert prop_ctx.force_bias_scales.shape == (3,)
+    assert force_bias.shape == (3,)
 
 
 def test_energy_equal_when_wu_eq_wr():

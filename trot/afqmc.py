@@ -115,6 +115,7 @@ class Afqmc:
         dt: float | None = None,
         n_walkers: int | None = None,
         n_chunks: int | None = None,
+        hs_decomposition: str = "charge",
     ):
         self._obj = mf_or_cc
         self._cc: Any = None
@@ -139,6 +140,7 @@ class Afqmc:
 
         self.walker_kind: WalkerKind | None = None  # resolved in kernel
         self.mixed_precision = True
+        self.hs_decomposition = hs_decomposition
 
         self.params: QmcParamsBase | None = None  # resolved in kernel
         defaults = self.params_cls()
@@ -222,6 +224,7 @@ class Afqmc:
         print(f" chol_cut        = {chol_cut:g}")
         print(f" cache           = {str(self.cache) if self.cache else None}")
         print(f" walker_kind     = {sys.walker_kind}")
+        print(f" hs_decomp       = {self.hs_decomposition}")
         print(f" mixed_precision = {self.mixed_precision}\n")
         meas_cfg = self._resolve_meas_cfg(job)
         if meas_cfg is not None:
@@ -354,6 +357,7 @@ class Afqmc:
             prop_ops=prop_ops,
             block_fn=block_fn,
             prop_kwargs=prop_kwargs,
+            hs_decomposition=self.hs_decomposition,
         )
         self._job = job
         return job

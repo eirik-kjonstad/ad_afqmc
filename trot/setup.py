@@ -104,12 +104,56 @@ def _make_prop(
     sys: System | None = None,
     *,
     mixed_precision: bool,
+    hs_decomposition: str = "charge",
 ) -> Any:
     return make_prop_ops(
         ham_data.basis,
         walker_kind,
         mixed_precision=mixed_precision,
+        hs_decomposition=hs_decomposition,
     )
+
+
+def _normalize_hs_decomposition(hs_decomposition: str) -> str:
+    hs_decomposition = hs_decomposition.lower()
+    if hs_decomposition not in ("charge", "spin"):
+        raise ValueError(f"Unknown HS decomposition: {hs_decomposition}")
+    return hs_decomposition
+
+
+def _resolve_hs_decomposition(
+    hs_decomposition: str,
+    prop_kwargs: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    prop_kwargs = dict(prop_kwargs or {})
+    prop_hs = prop_kwargs.pop("hs_decomposition", None)
+    hs_decomposition = _normalize_hs_decomposition(hs_decomposition)
+    if prop_hs is not None:
+        prop_hs = _normalize_hs_decomposition(str(prop_hs))
+        if hs_decomposition != "charge" and prop_hs != hs_decomposition:
+            raise ValueError(
+                "Conflicting hs_decomposition values were provided through setup and prop_kwargs."
+            )
+        hs_decomposition = prop_hs
+    return hs_decomposition, prop_kwargs
+
+
+def _validate_builtin_hs_decomposition(
+    *,
+    hs_decomposition: str,
+    ham: Any,
+    sys: System,
+    staged: StagedInputs,
+    meas_ops_override: Any,
+) -> None:
+    if hs_decomposition == "charge":
+        return
+    if ham.basis != "restricted":
+        raise ValueError("Spin HS decomposition requires a restricted-basis Cholesky Hamiltonian.")
+    if sys.walker_kind.lower() != "unrestricted":
+        raise ValueError("Spin HS decomposition is currently implemented for unrestricted walkers.")
+    if meas_ops_override is None and staged.trial.kind.lower() not in {"uhf", "rohf"}:
+        raise ValueError("Spin HS decomposition currently has built-in measurement support only for UHF.")
 
 
 def _resolve_staged(
@@ -147,7 +191,10 @@ def _resolve_staged(
 
 
 def _make_trial_bundle(
-    sys: System, staged: StagedInputs, mixed_precision: bool
+    sys: System,
+    staged: StagedInputs,
+    mixed_precision: bool,
+    hs_decomposition: str = "charge",
 ) -> tuple[Any, Any, Any]:
     """
     Return (trial_data, trial_ops, meas_ops)
@@ -174,7 +221,7 @@ def _make_trial_bundle(
 
         trial_data = make_uhf_trial_data(data, sys)
         trial_ops = make_uhf_trial_ops(sys=sys)
-        meas_ops = make_uhf_meas_ops(sys=sys)
+        meas_ops = make_uhf_meas_ops(sys=sys, hs_decomposition=hs_decomposition)
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 
@@ -352,6 +399,7 @@ def _assemble_job(
     block_fn: Callable[..., Any] | None = None,
     params_kwargs: dict[str, Any] | None = None,
     prop_kwargs: dict[str, Any] | None = None,
+    hs_decomposition: str = "charge",
     params_builder: Callable[..., QmcParamsBase],
     prop_builder: Callable[..., Any],
     default_block_fn: Callable[..., Any],
@@ -362,6 +410,9 @@ def _assemble_job(
     trial_ops_override = trial_ops
     meas_ops_override = meas_ops
     prop_ops_override = prop_ops
+    hs_decomposition, prop_kwargs_resolved = _resolve_hs_decomposition(
+        hs_decomposition, prop_kwargs
+    )
 
     resolved_norb_frozen_core = cast(
         int | None,
@@ -380,11 +431,23 @@ def _assemble_job(
 
     resolved_walker_kind = walker_kind_resolver(ham, walker_kind)
     sys = System(norb=int(ham.norb), nelec=ham.nelec, walker_kind=resolved_walker_kind)
+    _validate_builtin_hs_decomposition(
+        hs_decomposition=hs_decomposition,
+        ham=ham,
+        sys=sys,
+        staged=staged,
+        meas_ops_override=meas_ops_override,
+    )
 
     qmc_params = params_builder(params=params, **(params_kwargs or {}))
 
     if trial_data is None or trial_ops is None or meas_ops is None:
-        td, to, mo = _make_trial_bundle(sys, staged, mixed_precision)
+        td, to, mo = _make_trial_bundle(
+            sys,
+            staged,
+            mixed_precision,
+            hs_decomposition=hs_decomposition,
+        )
         trial_data = td if trial_data is None else trial_data
         trial_ops = to if trial_ops is None else trial_ops
         meas_ops = mo if meas_ops is None else meas_ops
@@ -408,7 +471,8 @@ def _assemble_job(
             sys.walker_kind,
             sys=sys,
             mixed_precision=mixed_precision,
-            **(prop_kwargs or {}),
+            hs_decomposition=hs_decomposition,
+            **prop_kwargs_resolved,
         )
 
     if block_fn is None:
@@ -443,6 +507,7 @@ def setup(
     walker_kind: WalkerKind | None = None,
     mesh: Mesh | None = None,
     mixed_precision: bool = True,
+    hs_decomposition: str = "charge",
     # params options
     params: QmcParams | None = None,
     # overrides for customized runs
@@ -489,6 +554,7 @@ def setup(
         block_fn=block_fn,
         params_kwargs=params_kwargs,
         prop_kwargs=prop_kwargs,
+        hs_decomposition=hs_decomposition,
         params_builder=_make_params,
         prop_builder=_make_prop,
         default_block_fn=default_block,
