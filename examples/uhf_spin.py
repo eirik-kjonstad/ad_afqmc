@@ -61,10 +61,8 @@ def run_ccsdt_reference(mf):
     driver.options["amp_convergence"] = 1.0e-12
     driver.options["energy_convergence"] = 1.0e-12
     driver.options["RHF_symmetry"] = False
-    # driver.run_cc(method="ccsd(t)")
 
-    driver.run_cc(method="ccsd")
-    driver.run_ccp3(method="ccsd(t)")
+    driver.run_cc(method="ccsdt")
 
     return ccpy_total_energy(driver)
 
@@ -79,9 +77,9 @@ def run_afqmc(mf, *, hs_decomposition: str):
     af.n_eql_blocks = 100
     af.n_blocks = 1000
 
-    if hs_decomposition == "spin":
-        af.dt = 0.0005
-        af.n_prop_steps = 500
+#    if hs_decomposition == "spin":
+#        af.dt = 0.0005
+#        af.n_prop_steps = 500
 
     return af.kernel()
 

@@ -200,4 +200,7 @@ def shard_prop_state(state: PropState, mesh: Mesh | None) -> PropState:
         pop_control_ene_shift=replicate(state.pop_control_ene_shift, mesh),
         e_estimate=replicate(state.e_estimate, mesh),
         node_encounters=replicate(state.node_encounters, mesh),
+        ab_cos_nodes=replicate(state.ab_cos_nodes, mesh),
+        s_sign_nodes=replicate(state.s_sign_nodes, mesh),
+        floor_kills=replicate(state.floor_kills, mesh),
     )

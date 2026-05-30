@@ -72,6 +72,9 @@ def init_prop_state(
         pop_control_ene_shift=pop_shift,
         e_estimate=e_est,
         node_encounters=node_encounters,
+        ab_cos_nodes=jnp.asarray(0),
+        s_sign_nodes=jnp.asarray(0),
+        floor_kills=jnp.asarray(0),
     )
     return shard_prop_state(state, mesh)
 
@@ -93,39 +96,135 @@ def afqmc_step(
     fields = jax.random.normal(subkey, (nw, prop_ctx.mf_shifts.shape[0]))
 
     fb_kernel = meas_ops.require_kernel(k_force_bias)
-    force_bias = wk.vmap_chunked(
-        fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
-    )(state.walkers, ham_data, meas_ctx, trial_data)
-    field_shifts = -prop_ctx.sqrt_dt * (
-        prop_ctx.force_bias_scales * force_bias - prop_ctx.mf_shifts
-    )
-    shifted_fields = fields - field_shifts
+    is_spin_decomposition = prop_ctx.mf_shifts.shape[0] == 3 * prop_ctx.chol_flat.shape[0]
 
-    shift_term = jnp.sum(shifted_fields * prop_ctx.mf_shifts, axis=1)
-    fb_term = jnp.sum(fields * field_shifts - 0.5 * field_shifts * field_shifts, axis=1)
-    walkers_new = wk.vmap_chunked(
-        trotter_ops.apply_trotter, n_chunks=params.n_chunks, in_axes=(0, 0, None, None)
-    )(state.walkers, shifted_fields, prop_ctx, params.n_exp_terms)
+    if is_spin_decomposition:
+        if trotter_ops.apply_trotter_ab is None or trotter_ops.apply_trotter_s is None:
+            raise ValueError("Spin HS decomposition requires split Trotter propagation.")
 
-    overlaps_new = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
-        walkers_new, trial_data
-    )
-    ratio = overlaps_new / state.overlaps
-    exponent = (
-        -prop_ctx.sqrt_dt * shift_term
-        + fb_term
-        + prop_ctx.dt * (state.pop_control_ene_shift + prop_ctx.h0_prop)
-    )
-    imp_fun = jnp.exp(exponent) * ratio
+        n_chol = prop_ctx.chol_flat.shape[0]
+        ab_slice = slice(0, 2 * n_chol)
+        s_slice = slice(2 * n_chol, 3 * n_chol)
 
-    theta = jnp.angle(jnp.exp(-prop_ctx.sqrt_dt * shift_term) * ratio)
-    imp_ph = jnp.abs(imp_fun) * jnp.cos(theta)
+        force_bias = wk.vmap_chunked(
+            fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+        )(state.walkers, ham_data, meas_ctx, trial_data)
+        field_shifts_ab = -prop_ctx.sqrt_dt * (
+            prop_ctx.force_bias_scales[ab_slice] * force_bias[:, ab_slice]
+            - prop_ctx.mf_shifts[ab_slice]
+        )
+        shifted_fields_ab = fields[:, ab_slice] - field_shifts_ab
+
+        fields_ab = (
+            jnp.zeros(fields.shape, dtype=shifted_fields_ab.dtype)
+            .at[:, ab_slice]
+            .set(shifted_fields_ab)
+        )
+        walkers_mid = wk.vmap_chunked(
+            trotter_ops.apply_trotter_ab,
+            n_chunks=params.n_chunks,
+            in_axes=(0, 0, None, None),
+        )(state.walkers, fields_ab, prop_ctx, params.n_exp_terms)
+
+        force_bias_mid = wk.vmap_chunked(
+            fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+        )(walkers_mid, ham_data, meas_ctx, trial_data)
+        field_shifts_s = -prop_ctx.sqrt_dt * (
+            prop_ctx.force_bias_scales[s_slice] * force_bias_mid[:, s_slice]
+            - prop_ctx.mf_shifts[s_slice]
+        )
+        shifted_fields_s = fields[:, s_slice] - field_shifts_s
+
+        fields_s = (
+            jnp.zeros(fields.shape, dtype=shifted_fields_s.dtype)
+            .at[:, s_slice]
+            .set(shifted_fields_s)
+        )
+        walkers_new = wk.vmap_chunked(
+            trotter_ops.apply_trotter_s,
+            n_chunks=params.n_chunks,
+            in_axes=(0, 0, None, None),
+        )(walkers_mid, fields_s, prop_ctx, params.n_exp_terms)
+
+        overlaps_mid = wk.vmap_chunked(
+            meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
+        )(walkers_mid, trial_data)
+        overlaps_new = wk.vmap_chunked(
+            meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
+        )(walkers_new, trial_data)
+
+        ratio_ab = overlaps_mid / state.overlaps
+        ratio_s = overlaps_new / overlaps_mid
+
+        shift_term_ab = jnp.sum(shifted_fields_ab * prop_ctx.mf_shifts[ab_slice], axis=1)
+        shift_term_s = jnp.sum(shifted_fields_s * prop_ctx.mf_shifts[s_slice], axis=1)
+        fb_term_ab = jnp.sum(
+            fields[:, ab_slice] * field_shifts_ab - 0.5 * field_shifts_ab * field_shifts_ab,
+            axis=1,
+        )
+        fb_term_s = jnp.sum(
+            fields[:, s_slice] * field_shifts_s - 0.5 * field_shifts_s * field_shifts_s,
+            axis=1,
+        )
+
+        exp_ab = jnp.exp(-prop_ctx.sqrt_dt * shift_term_ab)
+        imp_ab = jnp.exp(-prop_ctx.sqrt_dt * shift_term_ab + fb_term_ab) * ratio_ab
+        cos_ab = jnp.cos(jnp.angle(exp_ab * ratio_ab))
+        imp_ph_ab = jnp.abs(imp_ab) * jnp.maximum(0.0, cos_ab)
+
+        imp_s = jnp.exp(-prop_ctx.sqrt_dt * shift_term_s + fb_term_s) * ratio_s
+        imp_ph_s = jnp.maximum(0.0, jnp.real(imp_s))
+        # imp_ph_s = jnp.real(imp_s)
+
+        pop_factor = jnp.abs(
+            jnp.exp(prop_ctx.dt * (state.pop_control_ene_shift + prop_ctx.h0_prop))
+        )
+        imp_ph = pop_factor * imp_ph_ab * imp_ph_s
+        ab_cos_step = jnp.sum((cos_ab <= 0.0) | ~jnp.isfinite(imp_ph_ab))
+        s_sign_step = jnp.sum((jnp.real(imp_s) <= 0.0) | ~jnp.isfinite(imp_ph_s))
+        node_step = ab_cos_step
+    else:
+        force_bias = wk.vmap_chunked(
+            fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+        )(state.walkers, ham_data, meas_ctx, trial_data)
+        field_shifts = -prop_ctx.sqrt_dt * (
+            prop_ctx.force_bias_scales * force_bias - prop_ctx.mf_shifts
+        )
+        shifted_fields = fields - field_shifts
+        shift_term = jnp.sum(shifted_fields * prop_ctx.mf_shifts, axis=1)
+        fb_term = jnp.sum(fields * field_shifts - 0.5 * field_shifts * field_shifts, axis=1)
+        walkers_new = wk.vmap_chunked(
+            trotter_ops.apply_trotter, n_chunks=params.n_chunks, in_axes=(0, 0, None, None)
+        )(state.walkers, shifted_fields, prop_ctx, params.n_exp_terms)
+
+        overlaps_new = wk.vmap_chunked(
+            meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
+        )(walkers_new, trial_data)
+        ratio = overlaps_new / state.overlaps
+        exponent = (
+            -prop_ctx.sqrt_dt * shift_term
+            + fb_term
+            + prop_ctx.dt * (state.pop_control_ene_shift + prop_ctx.h0_prop)
+        )
+        imp_fun = jnp.exp(exponent) * ratio
+        theta = jnp.angle(jnp.exp(-prop_ctx.sqrt_dt * shift_term) * ratio)
+        imp_ph = jnp.abs(imp_fun) * jnp.cos(theta)
+        node_step = None
+        ab_cos_step = jnp.asarray(0)
+        s_sign_step = jnp.asarray(0)
 
     w_floor = float(getattr(params, "weight_floor", 1.0e-3))
     w_cap = float(getattr(params, "weight_cap", 100.0))
 
-    imp_ph = jnp.where(~jnp.isfinite(imp_ph) | (imp_ph < w_floor), 0.0, imp_ph)
-    node_encounters_new = state.node_encounters + jnp.sum(imp_ph <= 0.0)
+    floor_mask = ~jnp.isfinite(imp_ph) | (imp_ph < w_floor)
+    floor_step = jnp.sum(floor_mask)
+    imp_ph = jnp.where(floor_mask, 0.0, imp_ph)
+    if node_step is None:
+        node_step = jnp.sum(imp_ph <= 0.0)
+    node_encounters_new = state.node_encounters + node_step
+    ab_cos_nodes_new = state.ab_cos_nodes + ab_cos_step
+    s_sign_nodes_new = state.s_sign_nodes + s_sign_step
+    floor_kills_new = state.floor_kills + floor_step
     imp_ph = jnp.where(imp_ph > w_cap, 0.0, imp_ph)
 
     weights_new = state.weights * imp_ph
@@ -143,6 +242,9 @@ def afqmc_step(
         pop_control_ene_shift=pop_shift_new,
         e_estimate=state.e_estimate,
         node_encounters=node_encounters_new,
+        ab_cos_nodes=ab_cos_nodes_new,
+        s_sign_nodes=s_sign_nodes_new,
+        floor_kills=floor_kills_new,
     )
 
 

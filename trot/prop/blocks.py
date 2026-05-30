@@ -82,6 +82,9 @@ def dump_prop_state_npz(
         "pop_control_ene_shift": np.asarray(jax.device_get(state.pop_control_ene_shift)),
         "e_estimate": np.asarray(jax.device_get(state.e_estimate)),
         "node_encounters": np.asarray(jax.device_get(state.node_encounters)),
+        "ab_cos_nodes": np.asarray(jax.device_get(state.ab_cos_nodes)),
+        "s_sign_nodes": np.asarray(jax.device_get(state.s_sign_nodes)),
+        "floor_kills": np.asarray(jax.device_get(state.floor_kills)),
     }
 
     walkers = jax.device_get(state.walkers)
@@ -118,6 +121,15 @@ def load_prop_state_npz(path: str | Path) -> PropState:
         pop_control_ene_shift=jnp.asarray(data["pop_control_ene_shift"]),
         e_estimate=jnp.asarray(data["e_estimate"]),
         node_encounters=jnp.asarray(data["node_encounters"]),
+        ab_cos_nodes=(
+            jnp.asarray(data["ab_cos_nodes"]) if "ab_cos_nodes" in data.files else jnp.asarray(0)
+        ),
+        s_sign_nodes=(
+            jnp.asarray(data["s_sign_nodes"]) if "s_sign_nodes" in data.files else jnp.asarray(0)
+        ),
+        floor_kills=(
+            jnp.asarray(data["floor_kills"]) if "floor_kills" in data.files else jnp.asarray(0)
+        ),
     )
 
 

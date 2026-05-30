@@ -30,6 +30,26 @@ def _make_dummy_meas_ops():
     )
 
 
+def _make_dummy_spin_meas_ops():
+    def build_meas_ctx(_ham, _trial):
+        return None
+
+    def overlap(walker, trial_data):
+        return jnp.asarray(1.0 + 0.0j)
+
+    def force_bias_kernel(walker, ham_data, meas_ctx, trial_data):
+        n_fields = 3 * ham_data.chol.shape[0]
+        wu, _ = walker
+        return jnp.zeros((n_fields,), dtype=wu.dtype)
+
+    return MeasOps(
+        overlap=overlap,
+        build_meas_ctx=build_meas_ctx,
+        kernels={"force_bias": force_bias_kernel},
+        observables={},
+    )
+
+
 def test_weight_update_matches_h0_prop_and_pop_control_update():
     norb, nocc, nw, n_fields = 4, 2, 8, 3
     ham = HamChol(
@@ -160,6 +180,60 @@ def test_step_matches_manual_walker_propagation_and_is_chunk_invariant():
     assert jnp.allclose(out2.weights, out1.weights)
     assert jnp.allclose(out2.overlaps, out1.overlaps)
     assert jnp.all(out2.rng_key == out1.rng_key)
+
+
+def test_spin_decomposition_step_runs_with_three_aux_fields():
+    norb, nocc, nw, n_fields = 4, 1, 5, 3
+    ham = HamChol(
+        basis="restricted",
+        h0=jnp.asarray(0.0),
+        h1=jnp.zeros((norb, norb)),
+        chol=jnp.zeros((n_fields, norb, norb)),
+    )
+    sys = System(norb=norb, nelec=(nocc, nocc), walker_kind="unrestricted")
+    params = QmcParams(dt=0.05, n_chunks=1, n_exp_terms=4)
+    meas_ops = _make_dummy_spin_meas_ops()
+    trial_data = {"rdm1": jnp.zeros((2, norb, norb))}
+
+    walkers = (
+        jnp.ones((nw, norb, nocc), dtype=jnp.complex64),
+        jnp.ones((nw, norb, nocc), dtype=jnp.complex64),
+    )
+    state = PropState(
+        walkers=walkers,
+        weights=jnp.ones((nw,)),
+        overlaps=jnp.ones((nw,), dtype=jnp.complex64),
+        rng_key=jax.random.PRNGKey(0),
+        pop_control_ene_shift=jnp.asarray(0.0),
+        e_estimate=jnp.asarray(0.0),
+        node_encounters=jnp.asarray(0),
+    )
+
+    trotter_ops = make_trotter_ops(
+        ham.basis, sys.walker_kind, hs_decomposition="spin"
+    )
+    prop_ctx = _build_prop_ctx(
+        ham, trial_data["rdm1"], params.dt, hs_decomposition="spin"
+    )
+    meas_ctx = meas_ops.build_meas_ctx(ham, trial_data)
+
+    out = afqmc_step(
+        state,
+        params=params,
+        ham_data=ham,
+        trial_data=trial_data,
+        meas_ops=meas_ops,
+        trotter_ops=trotter_ops,
+        prop_ctx=prop_ctx,
+        meas_ctx=meas_ctx,
+    )
+
+    assert prop_ctx.mf_shifts.shape == (3 * n_fields,)
+    assert jnp.allclose(out.weights, jnp.ones((nw,)))
+    assert jnp.asarray(out.node_encounters) == 0
+    assert jnp.asarray(out.ab_cos_nodes) == 0
+    assert jnp.asarray(out.s_sign_nodes) == 0
+    assert jnp.asarray(out.floor_kills) == 0
 
 
 if __name__ == "__main__":

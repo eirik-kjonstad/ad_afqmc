@@ -54,7 +54,13 @@ class CholAfqmcCtx:
 
 
 class TrotterOps(NamedTuple):
-    apply_trotter: Callable[[Any, jax.Array, CholAfqmcCtx, int], Any]  # (w, field, ctx, n_terms)->w
+    # (w, field, ctx, n_terms)->w
+    apply_trotter: Callable[[Any, jax.Array, CholAfqmcCtx, int], Any]
+    apply_trotter_split: (
+        Callable[[Any, jax.Array, CholAfqmcCtx, int], tuple[Any, Any]] | None
+    ) = None
+    apply_trotter_ab: Callable[[Any, jax.Array, CholAfqmcCtx, int], Any] | None = None
+    apply_trotter_s: Callable[[Any, jax.Array, CholAfqmcCtx, int], Any] | None = None
 
 
 def _as_total_rdm1_restricted(dm: jax.Array) -> jax.Array:
@@ -266,6 +272,72 @@ def _apply_two_body_unrestricted_spin(
     )
 
 
+def _split_spin_fields(
+    field: jax.Array, prop_ctx: CholAfqmcCtx
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    nchol = prop_ctx.chol_flat.shape[0]
+    return field[:nchol], field[nchol : 2 * nchol], field[2 * nchol :]
+
+
+def _apply_two_body_unrestricted_spin_ab(
+    w_ud: Tuple[jax.Array, jax.Array],
+    field: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    n_terms: int,
+    *,
+    vhs_complex_dtype: jnp.dtype,
+) -> Tuple[jax.Array, jax.Array]:
+    wu, wd = w_ud
+    x_a, x_b, _ = _split_spin_fields(field, prop_ctx)
+    rt2 = jnp.sqrt(jnp.asarray(2.0, dtype=jnp.real(field).dtype))
+
+    vhs_a = _make_vhs_split_flat(
+        chol_flat=prop_ctx.chol_flat,
+        x=(rt2 * x_a).astype(vhs_complex_dtype),
+        n=prop_ctx.norb,
+    ).astype(wu.dtype)
+    vhs_b = _make_vhs_split_flat(
+        chol_flat=prop_ctx.chol_flat,
+        x=(rt2 * x_b).astype(vhs_complex_dtype),
+        n=prop_ctx.norb,
+    ).astype(wd.dtype)
+
+    a = (1.0j * prop_ctx.sqrt_dt).astype(wu.dtype)
+    return (
+        taylor_expm_action(a, vhs_a, wu, n_terms),
+        taylor_expm_action(a, vhs_b, wd, n_terms),
+    )
+
+
+def _apply_two_body_unrestricted_spin_s(
+    w_ud: Tuple[jax.Array, jax.Array],
+    field: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    n_terms: int,
+    *,
+    vhs_complex_dtype: jnp.dtype,
+) -> Tuple[jax.Array, jax.Array]:
+    wu, wd = w_ud
+    _, _, x_s = _split_spin_fields(field, prop_ctx)
+
+    vhs_a = _make_vhs_split_flat(
+        chol_flat=prop_ctx.chol_flat,
+        x=(1.0j * x_s).astype(vhs_complex_dtype),
+        n=prop_ctx.norb,
+    ).astype(wu.dtype)
+    vhs_b = _make_vhs_split_flat(
+        chol_flat=prop_ctx.chol_flat,
+        x=(-1.0j * x_s).astype(vhs_complex_dtype),
+        n=prop_ctx.norb,
+    ).astype(wd.dtype)
+
+    a = (1.0j * prop_ctx.sqrt_dt).astype(wu.dtype)
+    return (
+        taylor_expm_action(a, vhs_a, wu, n_terms),
+        taylor_expm_action(a, vhs_b, wd, n_terms),
+    )
+
+
 def _apply_two_body_generalized_from_restricted(
     w: jax.Array,
     field: jax.Array,
@@ -320,6 +392,53 @@ def _apply_trotter_u_spin(
     w1 = _apply_one_body_half_unrestricted(w_ud, prop_ctx)
     w2 = _apply_two_body_unrestricted_spin(
         w1, field, prop_ctx, n_terms, vhs_complex_dtype=vhs_complex_dtype
+    )
+    return _apply_one_body_half_unrestricted(w2, prop_ctx)
+
+
+def _apply_trotter_u_spin_split(
+    w_ud: Tuple[jax.Array, jax.Array],
+    field: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    n_terms: int,
+    *,
+    vhs_complex_dtype: jnp.dtype,
+) -> tuple[Tuple[jax.Array, jax.Array], Tuple[jax.Array, jax.Array]]:
+    w1 = _apply_one_body_half_unrestricted(w_ud, prop_ctx)
+    w_mid = _apply_two_body_unrestricted_spin_ab(
+        w1, field, prop_ctx, n_terms, vhs_complex_dtype=vhs_complex_dtype
+    )
+    w2 = _apply_two_body_unrestricted_spin_s(
+        w_mid, field, prop_ctx, n_terms, vhs_complex_dtype=vhs_complex_dtype
+    )
+    w_new = _apply_one_body_half_unrestricted(w2, prop_ctx)
+    return w_mid, w_new
+
+
+def _apply_trotter_u_spin_ab(
+    w_ud: Tuple[jax.Array, jax.Array],
+    field: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    n_terms: int,
+    *,
+    vhs_complex_dtype: jnp.dtype,
+) -> Tuple[jax.Array, jax.Array]:
+    w1 = _apply_one_body_half_unrestricted(w_ud, prop_ctx)
+    return _apply_two_body_unrestricted_spin_ab(
+        w1, field, prop_ctx, n_terms, vhs_complex_dtype=vhs_complex_dtype
+    )
+
+
+def _apply_trotter_u_spin_s(
+    w_mid: Tuple[jax.Array, jax.Array],
+    field: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    n_terms: int,
+    *,
+    vhs_complex_dtype: jnp.dtype,
+) -> Tuple[jax.Array, jax.Array]:
+    w2 = _apply_two_body_unrestricted_spin_s(
+        w_mid, field, prop_ctx, n_terms, vhs_complex_dtype=vhs_complex_dtype
     )
     return _apply_one_body_half_unrestricted(w2, prop_ctx)
 
@@ -379,7 +498,16 @@ def make_trotter_ops(
         return TrotterOps(
             lambda w, f, ctx, n_terms, dtype=vhs_complex_dtype: _apply_trotter_u_spin(
                 w, f, ctx, n_terms, vhs_complex_dtype=dtype
-            )
+            ),
+            lambda w, f, ctx, n_terms, dtype=vhs_complex_dtype: _apply_trotter_u_spin_split(
+                w, f, ctx, n_terms, vhs_complex_dtype=dtype
+            ),
+            lambda w, f, ctx, n_terms, dtype=vhs_complex_dtype: _apply_trotter_u_spin_ab(
+                w, f, ctx, n_terms, vhs_complex_dtype=dtype
+            ),
+            lambda w, f, ctx, n_terms, dtype=vhs_complex_dtype: _apply_trotter_u_spin_s(
+                w, f, ctx, n_terms, vhs_complex_dtype=dtype
+            ),
         )
 
     if hs_decomposition != "charge":

@@ -67,7 +67,8 @@ def test_build_prop_ctx_spin_decomposition_shapes_and_charge_mf_invariants():
 
 
 def test_make_trotter_ops_spin_decomposition_is_unrestricted_only():
-    make_trotter_ops("restricted", "unrestricted", hs_decomposition="spin")
+    ops = make_trotter_ops("restricted", "unrestricted", hs_decomposition="spin")
+    assert ops.apply_trotter_split is not None
 
     with pytest.raises(NotImplementedError):
         make_trotter_ops("restricted", "restricted", hs_decomposition="spin")

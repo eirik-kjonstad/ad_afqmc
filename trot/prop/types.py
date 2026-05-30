@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
@@ -25,6 +26,9 @@ class PropState(NamedTuple):
     pop_control_ene_shift: jax.Array
     e_estimate: jax.Array
     node_encounters: jax.Array
+    ab_cos_nodes: jax.Array = jnp.asarray(0)
+    s_sign_nodes: jax.Array = jnp.asarray(0)
+    floor_kills: jax.Array = jnp.asarray(0)
 
 
 @dataclass(frozen=True)

@@ -29,6 +29,24 @@ from .meas.pt2ccsd import get_init_pt2trial_energy
 print = partial(print, flush=True)
 
 
+def _node_diag_header() -> str:
+    return (
+        f"{'nodes':>10s}  "
+        f"{'ab_cos':>10s}  "
+        f"{'s_sign':>10s}  "
+        f"{'floor':>10s}"
+    )
+
+
+def _node_diag_values(state: PropState) -> str:
+    return (
+        f"{int(state.node_encounters):10d}  "
+        f"{int(state.ab_cos_nodes):10d}  "
+        f"{int(state.s_sign_nodes):10d}  "
+        f"{int(state.floor_kills):10d}"
+    )
+
+
 class QmcResult(NamedTuple):
     mean_energy: jax.Array
     stderr_energy: jax.Array
@@ -240,14 +258,14 @@ def run_qmc(
             f"{'block':>9s}  "
             f"{'E_blk':>14s}  "
             f"{'W':>12s}   "
-            f"{'nodes':>10s}  "
+            f"{_node_diag_header()}  "
             f"{'t[s]':>8s}"
         )
     print(
         f"[eql {0:4d}/{params.n_eql_blocks}]  "
         f"{float(state.e_estimate):14.10f}  "
         f"{float(jnp.sum(state.weights)):12.6e}  "
-        f"{int(state.node_encounters):10d}  "
+        f"{_node_diag_values(state)}  "
         f"{0.0:8.1f}"
     )
     chunk = print_every if print_every > 0 else 1
@@ -274,7 +292,7 @@ def run_qmc(
             f"[eql {start + n:4d}/{params.n_eql_blocks}]  "
             f"{float(e_chunk_avg):14.10f}  "
             f"{float(w_chunk_avg):12.6e}  "
-            f"{int(state.node_encounters):10d}  "
+            f"{_node_diag_values(state)}  "
             f"{elapsed:8.1f}"
         )
     block_e_eq = jnp.asarray(block_e_eq)
@@ -295,7 +313,7 @@ def run_qmc(
     if print_every:
         print(
             f"{'':4s}{'block':>9s}  {'E_avg':>14s}  {'E_err':>10s}  {'E_block':>14s}  "
-            f"{'W':>12s}    {'nodes':>10s}  {'dt[s/bl]':>10s}  {'t[s]':>7s}"
+            f"{'W':>12s}    {_node_diag_header()}  {'dt[s/bl]':>10s}  {'t[s]':>7s}"
         )
 
     chunk = print_every if print_every > 0 else 1
@@ -325,14 +343,13 @@ def run_qmc(
         )
         mu = stats["mu"]
         se = stats["se_star"]
-        nodes = int(state.node_encounters)
         print(
             f"[blk {start + n:4d}/{params.n_blocks}]  "
             f"{mu:14.10f}  "
             f"{(f'{se:10.3e}' if se is not None else ' ' * 10)}  "
             f"{float(e_chunk_avg):16.10f}  "
             f"{float(w_chunk_avg):12.6e}  "
-            f"{nodes:10d}  "
+            f"{_node_diag_values(state)}  "
             f"{dt_per_block:9.3f}  "
             f"{elapsed:8.1f}"
         )
@@ -510,7 +527,7 @@ def run_mixed_qmc(
             f"{'Guide_W_blk':>12s}   "
             f"{'Trial_E_blk':>14s}  "
             f"{'Trial_W_blk':>12s}   "
-            f"{'nodes':>10s}  "
+            f"{_node_diag_header()}  "
             f"{'t[s]':>8s}"
         )
     print(
@@ -520,7 +537,7 @@ def run_mixed_qmc(
         f"{float(guide_block_w_eq[0].real):12.6e}  "
         f"{float(trial_energy0.real):14.10f}  "
         f"{float(trial_weights0.real):12.6e}  "
-        f"{int(state.node_encounters):10d}  "
+        f"{_node_diag_values(state)}  "
         f"{0.0:8.1f}"
     )
     chunk = print_every if print_every > 0 else 1
@@ -572,7 +589,7 @@ def run_mixed_qmc(
             f"{float(guide_w_chunk_avg):12.6e}  "
             f"{float(pt2trial_energy_avg.real):14.10f}  "
             f"{float(trial_w_chunk_avg.real):12.6e}  "
-            f"{int(state.node_encounters):10d}  "
+            f"{_node_diag_values(state)}  "
             f"{elapsed:8.1f}"
         )
 
@@ -606,7 +623,7 @@ def run_mixed_qmc(
     if print_every:
         print(
             f"{'':4s}{'block':>9s}  {'Guide_E_avg':>14s}  {'Guide_E_err':>10s}  {'Guide_W':>12s}  "
-            f"{'Trial_E_avg':>14s}  {'Trial_E_err':>10s}  {'nodes':>10s}  {'dt[s/bl]':>10s}  {'t[s]':>7s}"
+            f"{'Trial_E_avg':>14s}  {'Trial_E_err':>10s}  {_node_diag_header()}  {'dt[s/bl]':>10s}  {'t[s]':>7s}"
         )
 
     chunk = print_every if print_every > 0 else 1
@@ -639,7 +656,6 @@ def run_mixed_qmc(
         )
         guide_mu = stats["mu"]
         guide_se = stats["se_star"]
-        nodes = int(state.node_encounters)
         # trial
         trial_block_w_sp.extend(scalars_chunk["trial_weight"].tolist())
         trial_block_t2_sp.extend(scalars_chunk["trial_t2"].tolist())
@@ -667,7 +683,7 @@ def run_mixed_qmc(
             f"{float(guide_w_avg):12.6e}  "
             f"{float(trial_e_avg.real):14.10f}  "
             f"{float(trial_error.real):10.3e}  "
-            f"{nodes:10d}  "
+            f"{_node_diag_values(state)}  "
             f"{dt_per_block:9.3f}  "
             f"{elapsed:8.1f}"
         )
