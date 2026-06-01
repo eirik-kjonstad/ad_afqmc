@@ -152,8 +152,10 @@ def _validate_builtin_hs_decomposition(
         raise ValueError("Spin HS decomposition requires a restricted-basis Cholesky Hamiltonian.")
     if sys.walker_kind.lower() != "unrestricted":
         raise ValueError("Spin HS decomposition is currently implemented for unrestricted walkers.")
-    if meas_ops_override is None and staged.trial.kind.lower() not in {"uhf", "rohf"}:
-        raise ValueError("Spin HS decomposition currently has built-in measurement support only for UHF.")
+    if meas_ops_override is None and staged.trial.kind.lower() not in {"uhf", "rohf", "ucisd"}:
+        raise ValueError(
+            "Spin HS decomposition currently has built-in measurement support only for UHF/ROHF/UCISD."
+        )
 
 
 def _resolve_staged(
@@ -251,7 +253,11 @@ def _make_trial_bundle(
 
         trial_data = make_ucisd_trial_data(data, sys)
         trial_ops = make_ucisd_trial_ops(sys=sys)
-        meas_ops = make_ucisd_meas_ops(sys=sys, mixed_precision=mixed_precision)
+        meas_ops = make_ucisd_meas_ops(
+            sys=sys,
+            mixed_precision=mixed_precision,
+            hs_decomposition=hs_decomposition,
+        )
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 

@@ -256,6 +256,31 @@ def force_bias_kernel_uw_rh(
     return (fb_0 + fb_1 + fb_2) / overlap
 
 
+def force_bias_kernel_uw_rh_spin(
+    walker: tuple[jax.Array, jax.Array],
+    ham_data: HamChol,
+    meas_ctx: UcisdMeasCtx,
+    trial_data: UcisdTrial,
+) -> jax.Array:
+    """Spin-resolved UCISD force bias for A_alpha, A_beta, and A_spin fields."""
+    del meas_ctx
+    wa, wb = walker
+    chol = ham_data.chol
+    n_chol = chol.shape[0]
+
+    def overlap_with_independent_rotations(xa: jax.Array, xb: jax.Array) -> jax.Array:
+        la = jnp.einsum("gij,g->ij", chol, xa, optimize="optimal")
+        lb = jnp.einsum("gij,g->ij", chol, xb, optimize="optimal")
+        return overlap_u((wa + la @ wa, wb + lb @ wb), trial_data)
+
+    x0 = jnp.zeros((n_chol,), dtype=wa.dtype)
+    val, pullback = jax.vjp(overlap_with_independent_rotations, x0, x0)
+    fb_a, fb_b = pullback(jnp.asarray(1.0, dtype=val.dtype))
+    fb_a = fb_a / val
+    fb_b = fb_b / val
+    return jnp.concatenate([fb_a, fb_b, fb_a - fb_b])
+
+
 def force_bias_kernel_gw_rh(
     walker: jax.Array,
     ham_data: HamChol,
@@ -1296,8 +1321,14 @@ def make_ucisd_meas_ops(
     memory_mode: str = "high",
     mixed_precision: bool = True,
     testing: bool = False,
+    hs_decomposition: str = "charge",
 ) -> MeasOps:
     wk = sys.walker_kind.lower()
+    hs_decomposition = hs_decomposition.lower()
+    if hs_decomposition not in ("charge", "spin"):
+        raise ValueError(f"Unknown HS decomposition: {hs_decomposition}")
+    if hs_decomposition == "spin" and wk != "unrestricted":
+        raise NotImplementedError("UCISD spin HS decomposition requires unrestricted walkers.")
 
     cfg = UcisdMeasCfg(
         memory_mode=memory_mode,
@@ -1315,8 +1346,13 @@ def make_ucisd_meas_ops(
         }
     elif wk == "unrestricted":
         overlap_fn = overlap_u
+        force_bias_kernel = (
+            force_bias_kernel_uw_rh_spin
+            if hs_decomposition == "spin"
+            else force_bias_kernel_uw_rh
+        )
         kernels = {
-            k_force_bias: force_bias_kernel_uw_rh,
+            k_force_bias: force_bias_kernel,
             k_energy: energy_kernel_uw_rh,
         }
     elif wk == "generalized":

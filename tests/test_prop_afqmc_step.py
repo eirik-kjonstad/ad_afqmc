@@ -6,7 +6,7 @@ from trot.core.ops import MeasOps
 from trot.core.system import System
 from trot.ham.chol import HamChol
 from trot.prop.afqmc import afqmc_step
-from trot.prop.chol_afqmc_ops import _build_prop_ctx, make_trotter_ops
+from trot.prop.chol_afqmc_ops import CholAfqmcCtx, TrotterOps, _build_prop_ctx, make_trotter_ops
 from trot.prop.types import PropState, QmcParams
 from trot import testing
 
@@ -233,6 +233,221 @@ def test_spin_decomposition_step_runs_with_three_aux_fields():
     assert jnp.asarray(out.node_encounters) == 0
     assert jnp.asarray(out.ab_cos_nodes) == 0
     assert jnp.asarray(out.s_sign_nodes) == 0
+    assert jnp.asarray(out.floor_kills) == 0
+
+
+def test_spin_decomposition_uses_three_conditional_importance_factors():
+    nw = 1
+    ham = HamChol(
+        basis="restricted",
+        h0=jnp.asarray(0.0),
+        h1=jnp.zeros((1, 1)),
+        chol=jnp.zeros((1, 1, 1)),
+    )
+    params = QmcParams(
+        dt=1.0,
+        n_chunks=1,
+        n_exp_terms=1,
+        weight_floor=0.0,
+        weight_cap=1.0e12,
+        pop_control_damping=0.0,
+    )
+
+    def build_meas_ctx(_ham, _trial):
+        return None
+
+    def overlap(_walker, _trial_data):
+        return jnp.asarray(1.0 + 0.0j)
+
+    def force_bias_kernel(walker, _ham_data, _meas_ctx, _trial_data):
+        wu, wd = walker
+        alpha_marker = jnp.real(wu[0, 0])
+        beta_marker = jnp.real(wd[0, 0])
+        return jnp.asarray(
+            [1.0, 2.0 + alpha_marker, 3.0 + beta_marker],
+            dtype=wu.dtype,
+        )
+
+    def apply_a(walker, field, _ctx, _n_terms):
+        _wu, wd = walker
+        wu = jnp.asarray([[field[0]]], dtype=wd.dtype)
+        return (wu, wd)
+
+    def apply_b(walker, field, _ctx, _n_terms):
+        wu, _wd = walker
+        wd = jnp.asarray([[field[1]]], dtype=wu.dtype)
+        return (wu, wd)
+
+    def apply_s(walker, field, _ctx, _n_terms):
+        wu, wd = walker
+        return (wu + field[2], wd - field[2])
+
+    meas_ops = MeasOps(
+        overlap=overlap,
+        build_meas_ctx=build_meas_ctx,
+        kernels={"force_bias": force_bias_kernel},
+        observables={},
+    )
+    trotter_ops = TrotterOps(
+        apply_trotter=lambda walker, _field, _ctx, _n_terms: walker,
+        apply_trotter_a=apply_a,
+        apply_trotter_b=apply_b,
+        apply_trotter_s=apply_s,
+    )
+    prop_ctx = CholAfqmcCtx(
+        dt=jnp.asarray(1.0),
+        sqrt_dt=jnp.asarray(1.0),
+        exp_h1_half=jnp.eye(1),
+        mf_shifts=jnp.zeros((3,), dtype=jnp.complex64),
+        force_bias_scales=jnp.ones((3,), dtype=jnp.complex64),
+        h0_prop=jnp.asarray(0.0),
+        chol_flat=jnp.zeros((1, 1)),
+        norb=1,
+    )
+    walkers = (
+        jnp.zeros((nw, 1, 1), dtype=jnp.complex64),
+        jnp.zeros((nw, 1, 1), dtype=jnp.complex64),
+    )
+    state = PropState(
+        walkers=walkers,
+        weights=jnp.ones((nw,)),
+        overlaps=jnp.ones((nw,), dtype=jnp.complex64),
+        rng_key=jax.random.PRNGKey(19),
+        pop_control_ene_shift=jnp.asarray(0.0),
+        e_estimate=jnp.asarray(0.0),
+        node_encounters=jnp.asarray(0),
+    )
+
+    out = afqmc_step(
+        state,
+        params=params,
+        ham_data=ham,
+        trial_data=None,
+        meas_ops=meas_ops,
+        trotter_ops=trotter_ops,
+        prop_ctx=prop_ctx,
+        meas_ctx=None,
+    )
+
+    _, subkey = jax.random.split(state.rng_key)
+    fields = jax.random.normal(subkey, (nw, 3))[0]
+
+    field_shift_a = -jnp.asarray(1.0)
+    shifted_a = fields[0] - field_shift_a
+    field_shift_b = -(2.0 + shifted_a)
+    shifted_b = fields[1] - field_shift_b
+    field_shift_s = -(3.0 + shifted_b)
+
+    fb_term_a = fields[0] * field_shift_a - 0.5 * field_shift_a * field_shift_a
+    fb_term_b = fields[1] * field_shift_b - 0.5 * field_shift_b * field_shift_b
+    fb_term_s = fields[2] * field_shift_s - 0.5 * field_shift_s * field_shift_s
+    expected_weight = jnp.exp(fb_term_a) * jnp.exp(fb_term_b) * jnp.exp(fb_term_s)
+
+    assert jnp.allclose(out.weights[0], expected_weight)
+    assert jnp.allclose(out.walkers[0][0, 0, 0], shifted_a + fields[2] - field_shift_s)
+    assert jnp.allclose(out.walkers[1][0, 0, 0], shifted_b - (fields[2] - field_shift_s))
+    assert jnp.asarray(out.ab_cos_nodes) == 0
+    assert jnp.asarray(out.s_sign_nodes) == 0
+    assert jnp.asarray(out.floor_kills) == 0
+
+
+def test_spin_decomposition_combines_alpha_beta_phaseless_projection():
+    nw = 1
+    ham = HamChol(
+        basis="restricted",
+        h0=jnp.asarray(0.0),
+        h1=jnp.zeros((1, 1)),
+        chol=jnp.zeros((1, 1, 1)),
+    )
+    params = QmcParams(
+        dt=1.0,
+        n_chunks=1,
+        n_exp_terms=1,
+        weight_floor=0.0,
+        weight_cap=1.0e12,
+        pop_control_damping=0.0,
+    )
+    theta = 0.75 * jnp.pi
+
+    def build_meas_ctx(_ham, _trial):
+        return None
+
+    def overlap(walker, _trial_data):
+        marker = jnp.real(walker[0][0, 0])
+        phase = jnp.where(
+            marker == 1.0,
+            0.0,
+            jnp.where(marker == 2.0, theta, jnp.where(marker == 3.0, 0.0, 0.0)),
+        )
+        return jnp.exp(1.0j * phase)
+
+    def force_bias_kernel(walker, _ham_data, _meas_ctx, _trial_data):
+        wu, _ = walker
+        return jnp.zeros((3,), dtype=wu.dtype)
+
+    def apply_a(_walker, _field, _ctx, _n_terms):
+        return (
+            jnp.asarray([[2.0 + 0.0j]], dtype=jnp.complex64),
+            jnp.asarray([[0.0 + 0.0j]], dtype=jnp.complex64),
+        )
+
+    def apply_b(_walker, _field, _ctx, _n_terms):
+        return (
+            jnp.asarray([[3.0 + 0.0j]], dtype=jnp.complex64),
+            jnp.asarray([[0.0 + 0.0j]], dtype=jnp.complex64),
+        )
+
+    def apply_s(walker, _field, _ctx, _n_terms):
+        return walker
+
+    meas_ops = MeasOps(
+        overlap=overlap,
+        build_meas_ctx=build_meas_ctx,
+        kernels={"force_bias": force_bias_kernel},
+        observables={},
+    )
+    trotter_ops = TrotterOps(
+        apply_trotter=lambda walker, _field, _ctx, _n_terms: walker,
+        apply_trotter_a=apply_a,
+        apply_trotter_b=apply_b,
+        apply_trotter_s=apply_s,
+    )
+    prop_ctx = CholAfqmcCtx(
+        dt=jnp.asarray(1.0),
+        sqrt_dt=jnp.asarray(1.0),
+        exp_h1_half=jnp.eye(1),
+        mf_shifts=jnp.zeros((3,), dtype=jnp.complex64),
+        force_bias_scales=jnp.ones((3,), dtype=jnp.complex64),
+        h0_prop=jnp.asarray(0.0),
+        chol_flat=jnp.zeros((1, 1)),
+        norb=1,
+    )
+    state = PropState(
+        walkers=(
+            jnp.asarray([[[1.0 + 0.0j]]], dtype=jnp.complex64),
+            jnp.asarray([[[0.0 + 0.0j]]], dtype=jnp.complex64),
+        ),
+        weights=jnp.ones((nw,)),
+        overlaps=jnp.ones((nw,), dtype=jnp.complex64),
+        rng_key=jax.random.PRNGKey(0),
+        pop_control_ene_shift=jnp.asarray(0.0),
+        e_estimate=jnp.asarray(0.0),
+        node_encounters=jnp.asarray(0),
+    )
+
+    out = afqmc_step(
+        state,
+        params=params,
+        ham_data=ham,
+        trial_data=None,
+        meas_ops=meas_ops,
+        trotter_ops=trotter_ops,
+        prop_ctx=prop_ctx,
+        meas_ctx=None,
+    )
+
+    assert jnp.allclose(out.weights[0], 1.0)
+    assert jnp.asarray(out.ab_cos_nodes) == 0
     assert jnp.asarray(out.floor_kills) == 0
 
 

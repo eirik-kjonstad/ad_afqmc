@@ -13,6 +13,7 @@ from pyscf import cc, gto, scf
 from trot import testing
 from trot.afqmc import Afqmc
 from trot.core.ops import k_energy, k_force_bias
+from trot.core.system import System
 from trot.meas.ucisd import (
     build_meas_ctx,
     energy_kernel_gw_rh,
@@ -137,6 +138,28 @@ def test_auto_force_bias_matches_manual_ucisd(walker_kind, norb, nup, ndn, n_cho
         v_m = fb_manual(wi, ham, ctx_manual, trial)
         v_a = fb_auto(wi, ham, ctx_auto, trial)
         assert jnp.allclose(v_a, v_m, atol=1e-12), (v_a, v_m)
+
+
+def test_spin_force_bias_components_sum_to_charge_ucisd():
+    norb, nup, ndn, n_chol = 4, 2, 1, 5
+    key = jax.random.PRNGKey(101)
+    sys = System(norb=norb, nelec=(nup, ndn), walker_kind="unrestricted")
+    k_ham, k_trial, k_walker = jax.random.split(key, 3)
+    ham = testing.make_random_ham_chol(k_ham, norb=norb, n_chol=n_chol)
+    trial = _make_ucisd_trial(k_trial, norb=norb, nup=nup, ndn=ndn)
+    walker = testing.make_walkers(k_walker, sys)
+
+    meas_charge = make_ucisd_meas_ops(sys, mixed_precision=False)
+    meas_spin = make_ucisd_meas_ops(sys, mixed_precision=False, hs_decomposition="spin")
+    ctx_charge = meas_charge.build_meas_ctx(ham, trial)
+    ctx_spin = meas_spin.build_meas_ctx(ham, trial)
+
+    fb_charge = meas_charge.require_kernel(k_force_bias)(walker, ham, ctx_charge, trial)
+    fb_spin = meas_spin.require_kernel(k_force_bias)(walker, ham, ctx_spin, trial)
+
+    assert fb_spin.shape == (3 * n_chol,)
+    assert jnp.allclose(fb_spin[:n_chol] + fb_spin[n_chol : 2 * n_chol], fb_charge)
+    assert jnp.allclose(fb_spin[2 * n_chol :], fb_spin[:n_chol] - fb_spin[n_chol : 2 * n_chol])
 
 
 @pytest.mark.parametrize(

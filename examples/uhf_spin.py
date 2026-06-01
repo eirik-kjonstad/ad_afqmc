@@ -75,7 +75,7 @@ def run_afqmc(mf, *, hs_decomposition: str):
     af.seed = 7
     af.n_walkers = 100
     af.n_eql_blocks = 100
-    af.n_blocks = 1000
+    af.n_blocks = 4000
 
 #    if hs_decomposition == "spin":
 #        af.dt = 0.0005

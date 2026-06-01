@@ -99,38 +99,63 @@ def afqmc_step(
     is_spin_decomposition = prop_ctx.mf_shifts.shape[0] == 3 * prop_ctx.chol_flat.shape[0]
 
     if is_spin_decomposition:
-        if trotter_ops.apply_trotter_ab is None or trotter_ops.apply_trotter_s is None:
+        if (
+            trotter_ops.apply_trotter_a is None
+            or trotter_ops.apply_trotter_b is None
+            or trotter_ops.apply_trotter_s is None
+        ):
             raise ValueError("Spin HS decomposition requires split Trotter propagation.")
 
         n_chol = prop_ctx.chol_flat.shape[0]
-        ab_slice = slice(0, 2 * n_chol)
+        a_slice = slice(0, n_chol)
+        b_slice = slice(n_chol, 2 * n_chol)
         s_slice = slice(2 * n_chol, 3 * n_chol)
 
         force_bias = wk.vmap_chunked(
             fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
         )(state.walkers, ham_data, meas_ctx, trial_data)
-        field_shifts_ab = -prop_ctx.sqrt_dt * (
-            prop_ctx.force_bias_scales[ab_slice] * force_bias[:, ab_slice]
-            - prop_ctx.mf_shifts[ab_slice]
+        field_shifts_a = -prop_ctx.sqrt_dt * (
+            prop_ctx.force_bias_scales[a_slice] * force_bias[:, a_slice]
+            - prop_ctx.mf_shifts[a_slice]
         )
-        shifted_fields_ab = fields[:, ab_slice] - field_shifts_ab
+        shifted_fields_a = fields[:, a_slice] - field_shifts_a
 
-        fields_ab = (
-            jnp.zeros(fields.shape, dtype=shifted_fields_ab.dtype)
-            .at[:, ab_slice]
-            .set(shifted_fields_ab)
+        fields_a = (
+            jnp.zeros(fields.shape, dtype=shifted_fields_a.dtype)
+            .at[:, a_slice]
+            .set(shifted_fields_a)
         )
-        walkers_mid = wk.vmap_chunked(
-            trotter_ops.apply_trotter_ab,
+        walkers_a = wk.vmap_chunked(
+            trotter_ops.apply_trotter_a,
             n_chunks=params.n_chunks,
             in_axes=(0, 0, None, None),
-        )(state.walkers, fields_ab, prop_ctx, params.n_exp_terms)
+        )(state.walkers, fields_a, prop_ctx, params.n_exp_terms)
 
-        force_bias_mid = wk.vmap_chunked(
+        force_bias_a = wk.vmap_chunked(
             fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
-        )(walkers_mid, ham_data, meas_ctx, trial_data)
+        )(walkers_a, ham_data, meas_ctx, trial_data)
+        field_shifts_b = -prop_ctx.sqrt_dt * (
+            prop_ctx.force_bias_scales[b_slice] * force_bias_a[:, b_slice]
+            - prop_ctx.mf_shifts[b_slice]
+        )
+        shifted_fields_b = fields[:, b_slice] - field_shifts_b
+
+        fields_b = (
+            jnp.zeros(fields.shape, dtype=shifted_fields_b.dtype)
+            .at[:, b_slice]
+            .set(shifted_fields_b)
+        )
+        walkers_ab = wk.vmap_chunked(
+            trotter_ops.apply_trotter_b,
+            n_chunks=params.n_chunks,
+            in_axes=(0, 0, None, None),
+        )(walkers_a, fields_b, prop_ctx, params.n_exp_terms)
+
+        force_bias_ab = wk.vmap_chunked(
+            fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+        )(walkers_ab, ham_data, meas_ctx, trial_data)
         field_shifts_s = -prop_ctx.sqrt_dt * (
-            prop_ctx.force_bias_scales[s_slice] * force_bias_mid[:, s_slice]
+            prop_ctx.force_bias_scales[s_slice] * force_bias_ab[:, s_slice]
             - prop_ctx.mf_shifts[s_slice]
         )
         shifted_fields_s = fields[:, s_slice] - field_shifts_s
@@ -144,22 +169,32 @@ def afqmc_step(
             trotter_ops.apply_trotter_s,
             n_chunks=params.n_chunks,
             in_axes=(0, 0, None, None),
-        )(walkers_mid, fields_s, prop_ctx, params.n_exp_terms)
+        )(walkers_ab, fields_s, prop_ctx, params.n_exp_terms)
 
-        overlaps_mid = wk.vmap_chunked(
+        overlaps_a = wk.vmap_chunked(
             meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
-        )(walkers_mid, trial_data)
+        )(walkers_a, trial_data)
+        overlaps_ab = wk.vmap_chunked(
+            meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
+        )(walkers_ab, trial_data)
         overlaps_new = wk.vmap_chunked(
             meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
         )(walkers_new, trial_data)
 
-        ratio_ab = overlaps_mid / state.overlaps
-        ratio_s = overlaps_new / overlaps_mid
+        # Three-step spin importance: I = I_a I_b I_s with conditional ratios.
+        ratio_a = overlaps_a / state.overlaps
+        ratio_b = overlaps_ab / overlaps_a
+        ratio_s = overlaps_new / overlaps_ab
 
-        shift_term_ab = jnp.sum(shifted_fields_ab * prop_ctx.mf_shifts[ab_slice], axis=1)
+        shift_term_a = jnp.sum(shifted_fields_a * prop_ctx.mf_shifts[a_slice], axis=1)
+        shift_term_b = jnp.sum(shifted_fields_b * prop_ctx.mf_shifts[b_slice], axis=1)
         shift_term_s = jnp.sum(shifted_fields_s * prop_ctx.mf_shifts[s_slice], axis=1)
-        fb_term_ab = jnp.sum(
-            fields[:, ab_slice] * field_shifts_ab - 0.5 * field_shifts_ab * field_shifts_ab,
+        fb_term_a = jnp.sum(
+            fields[:, a_slice] * field_shifts_a - 0.5 * field_shifts_a * field_shifts_a,
+            axis=1,
+        )
+        fb_term_b = jnp.sum(
+            fields[:, b_slice] * field_shifts_b - 0.5 * field_shifts_b * field_shifts_b,
             axis=1,
         )
         fb_term_s = jnp.sum(
@@ -167,10 +202,15 @@ def afqmc_step(
             axis=1,
         )
 
-        exp_ab = jnp.exp(-prop_ctx.sqrt_dt * shift_term_ab)
-        imp_ab = jnp.exp(-prop_ctx.sqrt_dt * shift_term_ab + fb_term_ab) * ratio_ab
-        cos_ab = jnp.cos(jnp.angle(exp_ab * ratio_ab))
-        imp_ph_ab = jnp.abs(imp_ab) * jnp.maximum(0.0, cos_ab)
+        imp_a = jnp.exp(-prop_ctx.sqrt_dt * shift_term_a + fb_term_a) * ratio_a
+        imp_b = jnp.exp(-prop_ctx.sqrt_dt * shift_term_b + fb_term_b) * ratio_b
+        phase_ab = (
+            jnp.exp(-prop_ctx.sqrt_dt * (shift_term_a + shift_term_b))
+            * ratio_a
+            * ratio_b
+        )
+        cos_ab = jnp.cos(jnp.angle(phase_ab))
+        imp_ph_ab = jnp.abs(imp_a * imp_b) * jnp.maximum(0.0, cos_ab)
 
         imp_s = jnp.exp(-prop_ctx.sqrt_dt * shift_term_s + fb_term_s) * ratio_s
         imp_ph_s = jnp.maximum(0.0, jnp.real(imp_s))
