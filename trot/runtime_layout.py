@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-from .core.ops import MeasOps, TrialOps, k_energy
+from .core.ops import MeasOps, TrialOps, get_propagation_rdm1, k_energy
 from .core.system import System
 from .ham.chol import HamChol
 from .meas.cisd import CisdMeasCfg, CisdMeasCtx, get_cisd_meas_cfg
@@ -378,7 +378,7 @@ class DefaultRuntimeLayout:
             t_prop = _setup_begin("building propagation context")
             prop_ctx = job.prop_ops.build_prop_ctx(
                 ham_data_runtime,
-                job.trial_ops.get_rdm1(job.trial_data),
+                get_propagation_rdm1(job.trial_ops, job.trial_data),
                 job.params,
             )
             _setup_end(t_prop, "propagation context ready")
@@ -433,12 +433,13 @@ class RhfHostRuntimeLayout:
         trial_data = job.trial_data
         assert isinstance(trial_data, RhfTrial)
         trial_rdm1 = job.trial_ops.get_rdm1(trial_data)
+        prop_rdm1 = get_propagation_rdm1(job.trial_ops, trial_data)
 
         if prop_ctx is None:
             t_prop = _setup_begin("building propagation context")
             prop_ctx = _build_restricted_prop_ctx_from_host(
                 job.staged,
-                trial_rdm1=trial_rdm1,
+                trial_rdm1=prop_rdm1,
                 dt=job.params.dt,
                 mixed_precision=self.mixed_precision,
                 mesh=job.mesh,
@@ -492,12 +493,13 @@ class CisdHostRuntimeLayout:
         trial_data = job.trial_data
         assert isinstance(trial_data, CisdTrial)
         trial_rdm1 = job.trial_ops.get_rdm1(trial_data)
+        prop_rdm1 = get_propagation_rdm1(job.trial_ops, trial_data)
 
         if prop_ctx is None:
             t_prop = _setup_begin("building propagation context")
             prop_ctx = _build_restricted_prop_ctx_from_host(
                 job.staged,
-                trial_rdm1=trial_rdm1,
+                trial_rdm1=prop_rdm1,
                 dt=job.params.dt,
                 mixed_precision=self.mixed_precision,
                 mesh=job.mesh,

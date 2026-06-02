@@ -11,20 +11,20 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from .core.ops import MeasOps, TrialOps
+from .core.ops import MeasOps, TrialOps, get_propagation_rdm1
 from .core.system import System
+from .meas.pt2ccsd import get_init_pt2trial_energy
 from .prop.blocks import BlockFn, MixedBlockFn
-from .prop.types import PropOps, PropState, QmcParamsBase, QmcParams, QmcParamsFp
+from .prop.types import PropOps, PropState, QmcParams, QmcParamsBase, QmcParamsFp
 from .stat_utils import (
     blocking_analysis_ratio,
+    clean_pt2ccsd,
     jackknife_ratios,
+    pt2ccsd_blocking,
     rebin_observable,
     reject_outliers,
-    pt2ccsd_blocking,
-    clean_pt2ccsd,
 )
 from .walkers import stochastic_reconfiguration
-from .meas.pt2ccsd import get_init_pt2trial_energy
 
 print = partial(print, flush=True)
 
@@ -193,7 +193,9 @@ def run_qmc(
 
     # build ctx
     if prop_ctx is None:
-        prop_ctx = prop_ops.build_prop_ctx(ham_data, trial_ops.get_rdm1(trial_data), params)
+        prop_ctx = prop_ops.build_prop_ctx(
+            ham_data, get_propagation_rdm1(trial_ops, trial_data), params
+        )
     if meas_ctx is None:
         meas_ctx = meas_ops.build_meas_ctx(ham_data, trial_data)
     if state is None:
@@ -235,14 +237,7 @@ def run_qmc(
     block_w_eq.append(jnp.sum(state.weights))
     print("\nEquilibration:\n")
     if print_every:
-        print(
-            f"{'':4s}"
-            f"{'block':>9s}  "
-            f"{'E_blk':>14s}  "
-            f"{'W':>12s}   "
-            f"{'nodes':>10s}  "
-            f"{'t[s]':>8s}"
-        )
+        print(f"{'':4s}{'block':>9s}  {'E_blk':>14s}  {'W':>12s}   {'nodes':>10s}  {'t[s]':>8s}")
     print(
         f"[eql {0:4d}/{params.n_eql_blocks}]  "
         f"{float(state.e_estimate):14.10f}  "
@@ -438,7 +433,9 @@ def run_mixed_qmc(
         guide_meas_ops.require_observable(name)
 
     # build ctx
-    guide_prop_ctx = guide_prop_ops.build_prop_ctx(ham_data, guide_ops.get_rdm1(guide_data), params)
+    guide_prop_ctx = guide_prop_ops.build_prop_ctx(
+        ham_data, get_propagation_rdm1(guide_ops, guide_data), params
+    )
     if guide_meas_ctx is None:
         guide_meas_ctx = guide_meas_ops.build_meas_ctx(ham_data, guide_data)
 
@@ -825,7 +822,9 @@ def run_qmc_fp(
     """
     # build ctx
     if prop_ctx is None:
-        prop_ctx = prop_ops.build_prop_ctx(ham_data, trial_ops.get_rdm1(trial_data), params)
+        prop_ctx = prop_ops.build_prop_ctx(
+            ham_data, get_propagation_rdm1(trial_ops, trial_data), params
+        )
     if meas_ctx is None:
         meas_ctx = meas_ops.build_meas_ctx(ham_data, trial_data)
     if state is None:
@@ -862,7 +861,7 @@ def run_qmc_fp(
     chunk = print_every
     for i in range(params.n_traj):
         print("Trajectory count", i + 1)
-        print(f"{'tau':^12s}    " f"{'E_avg':^14s}  " f"{'E_err':^13s}  " f"{'sign':>6s}")
+        print(f"{'tau':^12s}    {'E_avg':^14s}  {'E_err':^13s}  {'sign':>6s}")
         if i > 0:
             params = dataclasses.replace(params, seed=params.seed + i)
             state = prop_ops.init_prop_state(

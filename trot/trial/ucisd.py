@@ -117,6 +117,10 @@ def _reference_rdm1(trial_data: UcisdTrial) -> jax.Array:
 
 
 def get_rdm1(trial_data: UcisdTrial) -> jax.Array:
+    return _reference_rdm1(trial_data)
+
+
+def get_mf_rdm1(trial_data: UcisdTrial) -> jax.Array:
     if trial_data.rdm1 is not None:
         return trial_data.rdm1
     return _reference_rdm1(trial_data)
@@ -239,6 +243,7 @@ def make_ucisd_trial_ops(sys: System) -> TrialOps:
     return TrialOps(
         overlap=overlap_fn,
         get_rdm1=get_rdm1_fn,
+        get_mf_rdm1=get_mf_rdm1,
     )
 
 

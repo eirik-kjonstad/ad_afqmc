@@ -12,7 +12,7 @@ from pyscf import cc, gto, scf
 
 from trot import testing
 from trot.afqmc import Afqmc
-from trot.core.ops import k_energy, k_force_bias
+from trot.core.ops import get_propagation_rdm1, k_energy, k_force_bias
 from trot.core.system import System
 from trot.ham.chol import HamChol
 from trot.meas.ucisd import (
@@ -120,7 +120,7 @@ def test_make_ucisd_trial_data_falls_back_to_reference_rdm1():
     assert jnp.allclose(rdm1, jnp.stack([expected_a, expected_b], axis=0))
 
 
-def test_make_ucisd_trial_data_uses_staged_rdm1():
+def test_make_ucisd_trial_data_uses_staged_rdm1_only_for_propagation():
     norb, nup, ndn = 5, 2, 1
     sys = System(norb=norb, nelec=(nup, ndn), walker_kind="unrestricted")
     rdm1 = jnp.zeros((2, norb, norb), dtype=jnp.float64)
@@ -128,8 +128,12 @@ def test_make_ucisd_trial_data_uses_staged_rdm1():
     rdm1 = rdm1.at[1].set(jnp.diag(jnp.array([0.76, 0.17, 0.04, 0.02, 0.01])))
 
     trial = make_ucisd_trial_data(_make_ucisd_trial_data_dict(norb, nup, ndn, rdm1=rdm1), sys)
+    trial_ops = make_ucisd_trial_ops(sys)
 
-    assert jnp.allclose(make_ucisd_trial_ops(sys).get_rdm1(trial), rdm1)
+    expected_a = jnp.diag(jnp.arange(norb) < nup).astype(jnp.float64)
+    expected_b = jnp.diag(jnp.arange(norb) < ndn).astype(jnp.float64)
+    assert jnp.allclose(trial_ops.get_rdm1(trial), jnp.stack([expected_a, expected_b], axis=0))
+    assert jnp.allclose(get_propagation_rdm1(trial_ops, trial), rdm1)
 
 
 def test_make_ucisd_trial_data_rejects_bad_rdm1_shape():
@@ -157,8 +161,8 @@ def test_ucisd_supplied_rdm1_sets_propagation_mean_field_shift():
     rdm1 = rdm1.at[1].set(jnp.diag(jnp.array([0.65, 0.2, 0.1, 0.03, 0.02])))
     trial = make_ucisd_trial_data(_make_ucisd_trial_data_dict(norb, nup, ndn, rdm1=rdm1), sys)
 
-    trial_rdm1 = make_ucisd_trial_ops(sys).get_rdm1(trial)
-    ctx = _build_prop_ctx(ham, trial_rdm1, dt=0.01)
+    trial_ops = make_ucisd_trial_ops(sys)
+    ctx = _build_prop_ctx(ham, get_propagation_rdm1(trial_ops, trial), dt=0.01)
 
     expected_mf = 1.0j * jnp.einsum("gij,ji->g", chol, rdm1[0] + rdm1[1], optimize="optimal")
     assert jnp.allclose(ctx.mf_shifts, expected_mf)

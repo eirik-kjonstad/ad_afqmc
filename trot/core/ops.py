@@ -50,15 +50,18 @@ class TrialOps(NamedTuple):
     """
     Trial operations.
       - overlap: overlap for a single walker
-      - get_rdm1: trial rdm1
+      - get_rdm1: trial rdm1 used for walker initialization
       Optional fast update functions (mainly for CPMC):
       - calc_green: compute the greens function
       - calc_overlap_ratio: compute overlap ratio for updates
       - update_green: update greens function after walker update
+      Optional propagation helper:
+      - get_mf_rdm1: rdm1 used for propagation mean-field subtraction.
+        If unset, get_rdm1 is used.
     """
 
     overlap: OverlapFn  # (walker, trial_data) -> overlap
-    get_rdm1: Rdm1Fn  # (trial_data) -> rdm1
+    get_rdm1: Rdm1Fn  # (trial_data) -> rdm1 for initial walkers
     calc_green: GreensFn | None = None  # (walker, trial_data) -> greens
     calc_overlap_ratio: OverlapRatioFn | None = (
         None  # (greens, update_indices, update_constants) -> ratio
@@ -66,6 +69,13 @@ class TrialOps(NamedTuple):
     update_green: UpdateGreenFn | None = (
         None  # (greens, update_indices, update_constants) -> new_greens
     )
+    get_mf_rdm1: Rdm1Fn | None = None  # (trial_data) -> rdm1 for MF subtraction
+
+
+def get_propagation_rdm1(trial_ops: TrialOps, trial_data: Any) -> jax.Array:
+    if trial_ops.get_mf_rdm1 is not None:
+        return trial_ops.get_mf_rdm1(trial_data)
+    return trial_ops.get_rdm1(trial_data)
 
 
 @dataclass(frozen=True)
