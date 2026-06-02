@@ -8,7 +8,6 @@ from jax import tree_util
 
 from ..core.ops import TrialOps
 from ..core.system import System
-from .ucisd import UcisdTrial, get_rdm1 as get_ucisd_rdm1
 
 
 @tree_util.register_pytree_node_class
@@ -102,19 +101,135 @@ class UcisdtTrial:
 
 
 def get_rdm1(trial_data: UcisdtTrial) -> jax.Array:
-    # Approximate the propagation mean-field shifts with the UCISD density
-    # from the singles/doubles subset of the UCISDT trial.
-    return get_ucisd_rdm1(
-        UcisdTrial(
-            mo_coeff_a=trial_data.mo_coeff_a,
-            mo_coeff_b=trial_data.mo_coeff_b,
-            c1a=trial_data.c1a,
-            c1b=trial_data.c1b,
-            c2aa=trial_data.c2aa,
-            c2ab=trial_data.c2ab,
-            c2bb=trial_data.c2bb,
-        )
+    c0 = jnp.array(
+        1.0,
+        dtype=jnp.result_type(
+            trial_data.c1a,
+            trial_data.c1b,
+            trial_data.c2aa,
+            trial_data.c2ab,
+            trial_data.c2bb,
+            trial_data.c3aaa,
+            trial_data.c3aab,
+            trial_data.c3abb,
+            trial_data.c3bbb,
+        ),
     )
+    dm_a, dm_b = _cisdt_1rdm_uhf(
+        c0,
+        trial_data.c1a,
+        trial_data.c1b,
+        trial_data.c2aa,
+        trial_data.c2ab,
+        trial_data.c2bb,
+        trial_data.c3aaa,
+        trial_data.c3aab,
+        trial_data.c3abb,
+        trial_data.c3bbb,
+    )
+    c_a = trial_data.mo_coeff_a
+    c_b = trial_data.mo_coeff_b
+    dm_a = c_a @ dm_a @ c_a.conj().T
+    dm_b = c_b @ dm_b @ c_b.conj().T
+    return jnp.stack([dm_a, dm_b], axis=0)
+
+
+def _cisdt_1rdm_uhf(
+    c0: jax.Array,
+    c1a: jax.Array,
+    c1b: jax.Array,
+    c2aa: jax.Array,
+    c2ab: jax.Array,
+    c2bb: jax.Array,
+    c3aaa: jax.Array,
+    c3aab: jax.Array,
+    c3abb: jax.Array,
+    c3bbb: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Return spin-separated UCISDT 1-RDMs in alpha and beta MO coordinates."""
+    nocc_a = c1a.shape[0]
+    nocc_b = c1b.shape[0]
+
+    norm = (
+        jnp.conj(c0) * c0
+        + jnp.sum(jnp.conj(c1a) * c1a)
+        + jnp.sum(jnp.conj(c1b) * c1b)
+        + 0.25 * jnp.sum(jnp.conj(c2aa) * c2aa)
+        + jnp.sum(jnp.conj(c2ab) * c2ab)
+        + 0.25 * jnp.sum(jnp.conj(c2bb) * c2bb)
+        + (1.0 / 36.0) * jnp.sum(jnp.conj(c3aaa) * c3aaa)
+        + 0.25 * jnp.sum(jnp.conj(c3aab) * c3aab)
+        + 0.25 * jnp.sum(jnp.conj(c3abb) * c3abb)
+        + (1.0 / 36.0) * jnp.sum(jnp.conj(c3bbb) * c3bbb)
+    )
+
+    oo_a = (
+        norm * jnp.eye(nocc_a, dtype=norm.dtype)
+        - jnp.einsum("ia,ja->ij", jnp.conj(c1a), c1a, optimize="optimal")
+        - 0.5 * jnp.einsum("iakb,jakb->ij", jnp.conj(c2aa), c2aa, optimize="optimal")
+        - jnp.einsum("iakb,jakb->ij", jnp.conj(c2ab), c2ab, optimize="optimal")
+        - (1.0 / 12.0)
+        * jnp.einsum("iakblc,jakblc->ij", jnp.conj(c3aaa), c3aaa, optimize="optimal")
+        - 0.5 * jnp.einsum("iakblc,jakblc->ij", jnp.conj(c3aab), c3aab, optimize="optimal")
+        - 0.25 * jnp.einsum("iakblc,jakblc->ij", jnp.conj(c3abb), c3abb, optimize="optimal")
+    )
+    vv_a = (
+        jnp.einsum("ia,ib->ab", jnp.conj(c1a), c1a, optimize="optimal")
+        + 0.5 * jnp.einsum("iajc,ibjc->ab", jnp.conj(c2aa), c2aa, optimize="optimal")
+        + jnp.einsum("iajc,ibjc->ab", jnp.conj(c2ab), c2ab, optimize="optimal")
+        + (1.0 / 12.0)
+        * jnp.einsum("iajckd,ibjckd->ab", jnp.conj(c3aaa), c3aaa, optimize="optimal")
+        + 0.5 * jnp.einsum("iajckd,ibjckd->ab", jnp.conj(c3aab), c3aab, optimize="optimal")
+        + 0.25 * jnp.einsum("iakcld,ibkcld->ab", jnp.conj(c3abb), c3abb, optimize="optimal")
+    )
+    ov_a = (
+        jnp.conj(c0) * c1a
+        + jnp.einsum("jb,iajb->ia", jnp.conj(c1a), c2aa, optimize="optimal")
+        + jnp.einsum("jb,iajb->ia", jnp.conj(c1b), c2ab, optimize="optimal")
+        + 0.25 * jnp.einsum("jbkc,iajbkc->ia", jnp.conj(c2aa), c3aaa, optimize="optimal")
+        + jnp.einsum("jbkc,iajbkc->ia", jnp.conj(c2ab), c3aab, optimize="optimal")
+        + 0.25 * jnp.einsum("jbkc,iajbkc->ia", jnp.conj(c2bb), c3abb, optimize="optimal")
+    )
+
+    oo_b = (
+        norm * jnp.eye(nocc_b, dtype=norm.dtype)
+        - jnp.einsum("ia,ja->ij", jnp.conj(c1b), c1b, optimize="optimal")
+        - 0.5 * jnp.einsum("iakb,jakb->ij", jnp.conj(c2bb), c2bb, optimize="optimal")
+        - jnp.einsum("kaib,kajb->ij", jnp.conj(c2ab), c2ab, optimize="optimal")
+        - (1.0 / 12.0)
+        * jnp.einsum("iakblc,jakblc->ij", jnp.conj(c3bbb), c3bbb, optimize="optimal")
+        - 0.5 * jnp.einsum("kaiblc,kajblc->ij", jnp.conj(c3abb), c3abb, optimize="optimal")
+        - 0.25 * jnp.einsum("kalbic,kalbjc->ij", jnp.conj(c3aab), c3aab, optimize="optimal")
+    )
+    vv_b = (
+        jnp.einsum("ia,ib->ab", jnp.conj(c1b), c1b, optimize="optimal")
+        + 0.5 * jnp.einsum("iajc,ibjc->ab", jnp.conj(c2bb), c2bb, optimize="optimal")
+        + jnp.einsum("icja,icjb->ab", jnp.conj(c2ab), c2ab, optimize="optimal")
+        + (1.0 / 12.0)
+        * jnp.einsum("iajckd,ibjckd->ab", jnp.conj(c3bbb), c3bbb, optimize="optimal")
+        + 0.5 * jnp.einsum("kciajd,kcibjd->ab", jnp.conj(c3abb), c3abb, optimize="optimal")
+        + 0.25 * jnp.einsum("kcldia,kcldib->ab", jnp.conj(c3aab), c3aab, optimize="optimal")
+    )
+    ov_b = (
+        jnp.conj(c0) * c1b
+        + jnp.einsum("jb,iajb->ia", jnp.conj(c1b), c2bb, optimize="optimal")
+        + jnp.einsum("jb,jbia->ia", jnp.conj(c1a), c2ab, optimize="optimal")
+        + 0.25 * jnp.einsum("jbkc,iajbkc->ia", jnp.conj(c2bb), c3bbb, optimize="optimal")
+        + jnp.einsum("jbkc,jbkcia->ia", jnp.conj(c2ab), c3abb, optimize="optimal")
+        + 0.25 * jnp.einsum("jbkc,jbkcia->ia", jnp.conj(c2aa), c3aab, optimize="optimal")
+    )
+
+    def assemble(oo: jax.Array, ov: jax.Array, vv: jax.Array) -> jax.Array:
+        nocc, nvir = ov.shape
+        nmo = nocc + nvir
+        dm = jnp.zeros((nmo, nmo), dtype=jnp.result_type(oo, ov, vv))
+        dm = dm.at[:nocc, :nocc].set(oo)
+        dm = dm.at[:nocc, nocc:].set(ov)
+        dm = dm.at[nocc:, :nocc].set(jnp.conj(ov.T))
+        dm = dm.at[nocc:, nocc:].set(vv)
+        return dm / norm
+
+    return assemble(oo_a, ov_a, vv_a), assemble(oo_b, ov_b, vv_b)
 
 
 def overlap_r(walker: jax.Array, trial_data: UcisdtTrial) -> jax.Array:

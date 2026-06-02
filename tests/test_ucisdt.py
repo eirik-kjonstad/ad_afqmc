@@ -135,13 +135,13 @@ def _make_ucisdt_trial(
 _ucisdt_meas_ops_fp64 = functools.partial(make_ucisdt_meas_ops, mixed_precision=False, testing=True)
 
 
-def test_ucisdt_get_rdm1_falls_back_to_ucisd_density():
+def test_ucisdt_get_rdm1_reduces_to_ucisd_density_when_triples_zero():
     trial_t = _make_ucisdt_trial(
         jax.random.PRNGKey(201),
         norb=5,
         nup=2,
         ndn=3,
-        scale_ci3=0.07,
+        scale_ci3=0.0,
     )
     trial_d = UcisdTrial(
         mo_coeff_a=trial_t.mo_coeff_a,
@@ -154,6 +154,23 @@ def test_ucisdt_get_rdm1_falls_back_to_ucisd_density():
     )
 
     assert jnp.allclose(get_ucisdt_rdm1(trial_t), get_ucisd_rdm1(trial_d), atol=1e-12)
+
+
+def test_ucisdt_get_rdm1_with_triples_is_hermitian_and_normalized():
+    nup, ndn = 3, 3
+    trial = _make_ucisdt_trial(
+        jax.random.PRNGKey(202),
+        norb=6,
+        nup=nup,
+        ndn=ndn,
+        scale_ci3=0.03,
+    )
+
+    dm = get_ucisdt_rdm1(trial)
+    assert jnp.allclose(dm[0], dm[0].conj().T, atol=1e-12)
+    assert jnp.allclose(dm[1], dm[1].conj().T, atol=1e-12)
+    assert jnp.allclose(jnp.trace(dm[0]), nup, atol=1e-12)
+    assert jnp.allclose(jnp.trace(dm[1]), ndn, atol=1e-12)
 
 
 def test_balanced_large_trial_exposes_same_spin_triples():
