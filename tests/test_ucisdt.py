@@ -18,6 +18,8 @@ from trot.meas.ucisdt import (
     force_bias_kernel_uw_rh,
     make_ucisdt_meas_ops,
 )
+from trot.trial.ucisd import UcisdTrial, get_rdm1 as get_ucisd_rdm1
+from trot.trial.ucisdt import get_rdm1 as get_ucisdt_rdm1
 from trot.trial.ucisdt import UcisdtTrial, make_ucisdt_trial_ops
 
 
@@ -131,6 +133,27 @@ def _make_ucisdt_trial(
 
 # Full float64 precision for auto vs manual comparisons
 _ucisdt_meas_ops_fp64 = functools.partial(make_ucisdt_meas_ops, mixed_precision=False, testing=True)
+
+
+def test_ucisdt_get_rdm1_falls_back_to_ucisd_density():
+    trial_t = _make_ucisdt_trial(
+        jax.random.PRNGKey(201),
+        norb=5,
+        nup=2,
+        ndn=3,
+        scale_ci3=0.07,
+    )
+    trial_d = UcisdTrial(
+        mo_coeff_a=trial_t.mo_coeff_a,
+        mo_coeff_b=trial_t.mo_coeff_b,
+        c1a=trial_t.c1a,
+        c1b=trial_t.c1b,
+        c2aa=trial_t.c2aa,
+        c2ab=trial_t.c2ab,
+        c2bb=trial_t.c2bb,
+    )
+
+    assert jnp.allclose(get_ucisdt_rdm1(trial_t), get_ucisd_rdm1(trial_d), atol=1e-12)
 
 
 def test_balanced_large_trial_exposes_same_spin_triples():

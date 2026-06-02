@@ -8,6 +8,7 @@ from jax import tree_util
 
 from ..core.ops import TrialOps
 from ..core.system import System
+from .ucisd import UcisdTrial, get_rdm1 as get_ucisd_rdm1
 
 
 @tree_util.register_pytree_node_class
@@ -101,12 +102,19 @@ class UcisdtTrial:
 
 
 def get_rdm1(trial_data: UcisdtTrial) -> jax.Array:
-    norb, (n_oa, n_ob) = trial_data.norb, trial_data.nocc
-    occ_a = jnp.arange(norb) < n_oa
-    c_b = trial_data.mo_coeff_b
-    dm_a = jnp.diag(occ_a)
-    dm_b = c_b[:, :n_ob] @ c_b[:, :n_ob].conj().T
-    return jnp.stack([dm_a, dm_b], axis=0)
+    # Approximate the propagation mean-field shifts with the UCISD density
+    # from the singles/doubles subset of the UCISDT trial.
+    return get_ucisd_rdm1(
+        UcisdTrial(
+            mo_coeff_a=trial_data.mo_coeff_a,
+            mo_coeff_b=trial_data.mo_coeff_b,
+            c1a=trial_data.c1a,
+            c1b=trial_data.c1b,
+            c2aa=trial_data.c2aa,
+            c2ab=trial_data.c2ab,
+            c2bb=trial_data.c2bb,
+        )
+    )
 
 
 def overlap_r(walker: jax.Array, trial_data: UcisdtTrial) -> jax.Array:
