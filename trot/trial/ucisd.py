@@ -83,13 +83,103 @@ def _det(m: jax.Array) -> jax.Array:
     return jnp.linalg.det(m)
 
 
+def _cisd_1rdm_uhf(
+    c0: jax.Array,
+    c1a: jax.Array,
+    c1b: jax.Array,
+    c2aa: jax.Array,
+    c2ab: jax.Array,
+    c2bb: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Return spin-separated UCISD 1-RDMs in the alpha and beta MO bases.
+
+    The CI doubles in ``UcisdTrial`` are stored as ``c2[i, a, j, b]``.
+    """
+    nocc_a = c1a.shape[0]
+    nocc_b = c1b.shape[0]
+
+    c0_abs2 = jnp.conj(c0) * c0
+    norm = (
+        c0_abs2
+        + jnp.sum(jnp.conj(c1a) * c1a)
+        + jnp.sum(jnp.conj(c1b) * c1b)
+        + 0.25 * jnp.sum(jnp.conj(c2aa) * c2aa)
+        + jnp.sum(jnp.conj(c2ab) * c2ab)
+        + 0.25 * jnp.sum(jnp.conj(c2bb) * c2bb)
+    )
+
+    oo_a = (
+        norm * jnp.eye(nocc_a, dtype=norm.dtype)
+        - jnp.einsum("ia,ja->ij", jnp.conj(c1a), c1a, optimize="optimal")
+        - 0.5 * jnp.einsum("iakb,jakb->ij", jnp.conj(c2aa), c2aa, optimize="optimal")
+        - jnp.einsum("iakb,jakb->ij", jnp.conj(c2ab), c2ab, optimize="optimal")
+    )
+    vv_a = (
+        jnp.einsum("ia,ib->ab", jnp.conj(c1a), c1a, optimize="optimal")
+        + 0.5 * jnp.einsum("iajc,ibjc->ab", jnp.conj(c2aa), c2aa, optimize="optimal")
+        + jnp.einsum("iajc,ibjc->ab", jnp.conj(c2ab), c2ab, optimize="optimal")
+    )
+    ov_a = (
+        jnp.conj(c0) * c1a
+        + jnp.einsum("jb,iajb->ia", jnp.conj(c1a), c2aa, optimize="optimal")
+        + jnp.einsum("jb,iajb->ia", jnp.conj(c1b), c2ab, optimize="optimal")
+    )
+
+    oo_b = (
+        norm * jnp.eye(nocc_b, dtype=norm.dtype)
+        - jnp.einsum("ia,ja->ij", jnp.conj(c1b), c1b, optimize="optimal")
+        - 0.5 * jnp.einsum("iakb,jakb->ij", jnp.conj(c2bb), c2bb, optimize="optimal")
+        - jnp.einsum("kaib,kajb->ij", jnp.conj(c2ab), c2ab, optimize="optimal")
+    )
+    vv_b = (
+        jnp.einsum("ia,ib->ab", jnp.conj(c1b), c1b, optimize="optimal")
+        + 0.5 * jnp.einsum("iajc,ibjc->ab", jnp.conj(c2bb), c2bb, optimize="optimal")
+        + jnp.einsum("icja,icjb->ab", jnp.conj(c2ab), c2ab, optimize="optimal")
+    )
+    ov_b = (
+        jnp.conj(c0) * c1b
+        + jnp.einsum("jb,iajb->ia", jnp.conj(c1b), c2bb, optimize="optimal")
+        + jnp.einsum("jb,jbia->ia", jnp.conj(c1a), c2ab, optimize="optimal")
+    )
+
+    def assemble(oo: jax.Array, ov: jax.Array, vv: jax.Array) -> jax.Array:
+        nocc, nvir = ov.shape
+        nmo = nocc + nvir
+        dm = jnp.zeros((nmo, nmo), dtype=jnp.result_type(oo, ov, vv))
+        dm = dm.at[:nocc, :nocc].set(oo)
+        dm = dm.at[:nocc, nocc:].set(ov)
+        dm = dm.at[nocc:, :nocc].set(jnp.conj(ov.T))
+        dm = dm.at[nocc:, nocc:].set(vv)
+        return dm / norm
+
+    return assemble(oo_a, ov_a, vv_a), assemble(oo_b, ov_b, vv_b)
+
+
 def get_rdm1(trial_data: UcisdTrial) -> jax.Array:
-    # UHF
-    norb, (n_oa, n_ob) = trial_data.norb, trial_data.nocc
-    occ_a = jnp.arange(norb) < n_oa
+    dm_a, dm_b = _cisd_1rdm_uhf(
+        jnp.array(
+            1.0,
+            dtype=jnp.result_type(
+                trial_data.c1a,
+                trial_data.c1b,
+                trial_data.c2aa,
+                trial_data.c2ab,
+                trial_data.c2bb,
+            ),
+        ),
+        trial_data.c1a,
+        trial_data.c1b,
+        trial_data.c2aa,
+        trial_data.c2ab,
+        trial_data.c2bb,
+    )
+    c_a = trial_data.mo_coeff_a
     c_b = trial_data.mo_coeff_b
-    dm_a = jnp.diag(occ_a)  # (norb, norb)
-    dm_b = c_b[:, :n_ob] @ c_b[:, :n_ob].conj().T  # (norb, norb)
+    # CI amplitudes define the beta density in beta-MO coordinates.  Propagation
+    # Cholesky vectors are in the alpha-MO Hamiltonian basis, so rotate the
+    # density in the dual direction to the measurement kernels' Cb^H L Cb.
+    dm_a = c_a @ dm_a @ c_a.conj().T
+    dm_b = c_b @ dm_b @ c_b.conj().T
     return jnp.stack([dm_a, dm_b], axis=0)  # (2, norb, norb)
 
 

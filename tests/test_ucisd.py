@@ -24,7 +24,7 @@ from trot.meas.ucisd import (
     make_ucisd_meas_ops,
 )
 from trot.prop.types import QmcParams
-from trot.trial.ucisd import UcisdTrial, make_ucisd_trial_ops
+from trot.trial.ucisd import UcisdTrial, get_rdm1, make_ucisd_trial_ops
 
 
 def _make_ucisd_trial(
@@ -89,6 +89,74 @@ def _make_ucisd_trial(
         c2ab=c2ab,
         c2bb=c2bb,
     )
+
+
+def test_ucisd_get_rdm1_singles_and_opposite_spin_double():
+    theta = 0.37
+    c = jnp.cos(theta)
+    s = jnp.sin(theta)
+    c_b = jnp.array([[c, -s], [s, c]], dtype=jnp.float64)
+
+    x = jnp.array(0.2, dtype=jnp.float64)
+    y = jnp.array(-0.3, dtype=jnp.float64)
+    z = jnp.array(0.4, dtype=jnp.float64)
+    trial = UcisdTrial(
+        mo_coeff_a=jnp.eye(2, dtype=jnp.float64),
+        mo_coeff_b=c_b,
+        c1a=jnp.array([[x]], dtype=jnp.float64),
+        c1b=jnp.array([[y]], dtype=jnp.float64),
+        c2aa=jnp.zeros((1, 1, 1, 1), dtype=jnp.float64),
+        c2ab=jnp.array([[[[z]]]], dtype=jnp.float64),
+        c2bb=jnp.zeros((1, 1, 1, 1), dtype=jnp.float64),
+    )
+
+    norm = 1.0 + x**2 + y**2 + z**2
+    dm_a_ref = jnp.array(
+        [[1.0 + y**2, x + y * z], [x + y * z, x**2 + z**2]], dtype=jnp.float64
+    ) / norm
+    dm_b_mo = jnp.array(
+        [[1.0 + x**2, y + x * z], [y + x * z, y**2 + z**2]], dtype=jnp.float64
+    ) / norm
+    dm_b_ref = c_b @ dm_b_mo @ c_b.T
+
+    dm = get_rdm1(trial)
+    assert jnp.allclose(dm[0], dm_a_ref, atol=1e-12)
+    assert jnp.allclose(dm[1], dm_b_ref, atol=1e-12)
+
+    op_alpha_basis = jnp.array([[0.7, -0.2], [0.5, 1.3]], dtype=jnp.float64)
+    op_beta_basis = c_b.T @ op_alpha_basis @ c_b
+    assert jnp.allclose(
+        jnp.einsum("ij,ji->", op_alpha_basis, dm[1]),
+        jnp.einsum("ij,ji->", op_beta_basis, dm_b_mo),
+        atol=1e-12,
+    )
+
+
+def test_ucisd_get_rdm1_same_spin_double_normalization():
+    d = jnp.array(0.5, dtype=jnp.float64)
+    c2aa = jnp.zeros((2, 2, 2, 2), dtype=jnp.float64)
+    c2aa = c2aa.at[0, 0, 1, 1].set(d)
+    c2aa = c2aa.at[1, 1, 0, 0].set(d)
+    c2aa = c2aa.at[1, 0, 0, 1].set(-d)
+    c2aa = c2aa.at[0, 1, 1, 0].set(-d)
+
+    trial = UcisdTrial(
+        mo_coeff_a=jnp.eye(4, dtype=jnp.float64),
+        mo_coeff_b=jnp.eye(4, dtype=jnp.float64),
+        c1a=jnp.zeros((2, 2), dtype=jnp.float64),
+        c1b=jnp.zeros((1, 3), dtype=jnp.float64),
+        c2aa=c2aa,
+        c2ab=jnp.zeros((2, 2, 1, 3), dtype=jnp.float64),
+        c2bb=jnp.zeros((1, 3, 1, 3), dtype=jnp.float64),
+    )
+
+    norm = 1.0 + d**2
+    dm_a_ref = jnp.diag(jnp.array([1.0, 1.0, d**2, d**2], dtype=jnp.float64)) / norm
+    dm_b_ref = jnp.diag(jnp.array([1.0, 0.0, 0.0, 0.0], dtype=jnp.float64))
+
+    dm = get_rdm1(trial)
+    assert jnp.allclose(dm[0], dm_a_ref, atol=1e-12)
+    assert jnp.allclose(dm[1], dm_b_ref, atol=1e-12)
 
 
 @pytest.mark.parametrize(
