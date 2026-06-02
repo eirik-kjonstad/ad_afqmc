@@ -24,6 +24,9 @@ class UcisdTrial:
       c2aa: (nocc[0], nvir[0], nocc[0], nvir[0])    doubles coefficients c_{i,alpha a,alpha j,alpha b,alpha}
       c2ab: (nocc[0], nvir[0], nocc[1], nvir[1])    doubles coefficients c_{i,alpha a,alpha j,beta  b,beta }
       c2bb: (nocc[1], nvir[1], nocc[1], nvir[1])    doubles coefficients c_{i,beta  a,beta  j,beta  b,beta }
+      rdm1 : optional (2, norb, norb) spin-block 1RDM in the Hamiltonian/propagation basis.
+             When provided in staged data, it is used for propagation mean-field subtraction
+             and walker initialization instead of the reference determinant density.
     """
 
     mo_coeff_a: jax.Array
@@ -33,6 +36,7 @@ class UcisdTrial:
     c2aa: jax.Array
     c2ab: jax.Array
     c2bb: jax.Array
+    rdm1: jax.Array | None = None
 
     @property
     def norb(self) -> int:
@@ -47,7 +51,7 @@ class UcisdTrial:
         return (int(self.c1a.shape[1]), int(self.c1b.shape[1]))
 
     def tree_flatten(self):
-        return (
+        children = (
             self.mo_coeff_a,
             self.mo_coeff_b,
             self.c1a,
@@ -55,19 +59,37 @@ class UcisdTrial:
             self.c2aa,
             self.c2ab,
             self.c2bb,
-        ), None
+        )
+        has_rdm1 = self.rdm1 is not None
+        if has_rdm1:
+            children = (*children, self.rdm1)
+        return children, has_rdm1
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        (
-            mo_coeff_a,
-            mo_coeff_b,
-            c1a,
-            c1b,
-            c2aa,
-            c2ab,
-            c2bb,
-        ) = children
+        has_rdm1 = bool(aux)
+        if has_rdm1:
+            (
+                mo_coeff_a,
+                mo_coeff_b,
+                c1a,
+                c1b,
+                c2aa,
+                c2ab,
+                c2bb,
+                rdm1,
+            ) = children
+        else:
+            (
+                mo_coeff_a,
+                mo_coeff_b,
+                c1a,
+                c1b,
+                c2aa,
+                c2ab,
+                c2bb,
+            ) = children
+            rdm1 = None
         return cls(
             mo_coeff_a=mo_coeff_a,
             mo_coeff_b=mo_coeff_b,
@@ -76,6 +98,7 @@ class UcisdTrial:
             c2aa=c2aa,
             c2ab=c2ab,
             c2bb=c2bb,
+            rdm1=rdm1,
         )
 
 
@@ -83,14 +106,20 @@ def _det(m: jax.Array) -> jax.Array:
     return jnp.linalg.det(m)
 
 
-def get_rdm1(trial_data: UcisdTrial) -> jax.Array:
-    # UHF
+def _reference_rdm1(trial_data: UcisdTrial) -> jax.Array:
+    # UHF/reference determinant density in the propagation basis.
     norb, (n_oa, n_ob) = trial_data.norb, trial_data.nocc
     occ_a = jnp.arange(norb) < n_oa
     c_b = trial_data.mo_coeff_b
     dm_a = jnp.diag(occ_a)  # (norb, norb)
     dm_b = c_b[:, :n_ob] @ c_b[:, :n_ob].conj().T  # (norb, norb)
     return jnp.stack([dm_a, dm_b], axis=0)  # (2, norb, norb)
+
+
+def get_rdm1(trial_data: UcisdTrial) -> jax.Array:
+    if trial_data.rdm1 is not None:
+        return trial_data.rdm1
+    return _reference_rdm1(trial_data)
 
 
 def overlap_r(walker: jax.Array, trial_data: UcisdTrial) -> jax.Array:
@@ -213,13 +242,30 @@ def make_ucisd_trial_ops(sys: System) -> TrialOps:
     )
 
 
-def make_ucisd_trial_data(data: dict, sys: System) -> UcisdTrial:
+def _validate_rdm1_shape(rdm1: jax.Array, *, norb: int) -> None:
+    expected = (2, norb, norb)
+    if rdm1.ndim != 3 or rdm1.shape != expected:
+        msg = (
+            f"UCISD rdm1 must have shape (2, norb, norb) in the Hamiltonian basis; "
+            f"got {rdm1.shape}, expected {expected}."
+        )
+        raise ValueError(msg)
+
+
+def make_ucisd_trial_data(data: dict[str, object], sys: System) -> UcisdTrial:
+    mo_coeff_a = jnp.asarray(data["mo_coeff_a"])
+    mo_coeff_b = jnp.asarray(data["mo_coeff_b"])
+    rdm1 = jnp.asarray(data["rdm1"]) if "rdm1" in data else None
+    if rdm1 is not None:
+        _validate_rdm1_shape(rdm1, norb=int(mo_coeff_b.shape[0]))
+
     return UcisdTrial(
-        mo_coeff_a=jnp.asarray(data["mo_coeff_a"]),
-        mo_coeff_b=jnp.asarray(data["mo_coeff_b"]),
+        mo_coeff_a=mo_coeff_a,
+        mo_coeff_b=mo_coeff_b,
         c1a=jnp.asarray(data["ci1a"]),
         c1b=jnp.asarray(data["ci1b"]),
         c2aa=jnp.asarray(data["ci2aa"]),
         c2ab=jnp.asarray(data["ci2ab"]),
         c2bb=jnp.asarray(data["ci2bb"]),
+        rdm1=rdm1,
     )
