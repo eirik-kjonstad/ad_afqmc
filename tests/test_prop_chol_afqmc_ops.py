@@ -33,5 +33,51 @@ def test_build_prop_ctx_shapes_and_nfields():
     assert ctx.h0_prop.shape == ()
 
 
+def test_build_spin_prop_ctx_shapes_and_matches_charge_scalars():
+    norb, n_fields = 5, 7
+    ham = _make_small_ham(norb=norb, n_fields=n_fields, h0=1.5)
+
+    dm_a = jnp.diag(jnp.array([1.0, 1.0, 0.0, 0.0, 0.0]))
+    dm_b = jnp.diag(jnp.array([1.0, 0.0, 0.0, 0.0, 0.0]))
+    dm = jnp.stack([dm_a, dm_b], axis=0)
+    dt = 0.2
+
+    ctx_charge = _build_prop_ctx(ham, dm, dt)
+    ctx_spin = _build_prop_ctx(ham, dm, dt, decomposition="spin")
+
+    assert ctx_spin.mf_shifts.shape == (3 * n_fields,)
+    assert ctx_spin.chol_flat.shape == (3 * n_fields, norb * norb)
+    assert ctx_spin.exp_h1_half.shape == (norb, norb)
+    assert jnp.allclose(ctx_spin.h0_prop, ctx_charge.h0_prop)
+    assert jnp.allclose(ctx_spin.exp_h1_half, ctx_charge.exp_h1_half)
+
+
+def test_build_interpolated_spin_prop_ctx_shapes_and_matches_charge_scalars():
+    norb, n_fields = 5, 7
+    ham = _make_small_ham(norb=norb, n_fields=n_fields, h0=1.5)
+
+    dm_a = jnp.diag(jnp.array([1.0, 1.0, 0.0, 0.0, 0.0]))
+    dm_b = jnp.diag(jnp.array([1.0, 0.0, 0.0, 0.0, 0.0]))
+    dm = jnp.stack([dm_a, dm_b], axis=0)
+    dt = 0.2
+    lam = 0.25
+
+    ctx_charge = _build_prop_ctx(ham, dm, dt)
+    ctx_spin = _build_prop_ctx(
+        ham,
+        dm,
+        dt,
+        decomposition="spin",
+        spin_decomposition_lambda=lam,
+    )
+
+    assert ctx_spin.spin_decomposition_lambda == lam
+    assert ctx_spin.mf_shifts.shape == (4 * n_fields,)
+    assert ctx_spin.chol_flat.shape == (4 * n_fields, norb * norb)
+    assert ctx_spin.exp_h1_half.shape == (norb, norb)
+    assert jnp.allclose(ctx_spin.h0_prop, ctx_charge.h0_prop)
+    assert jnp.allclose(ctx_spin.exp_h1_half, ctx_charge.exp_h1_half)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

@@ -142,6 +142,25 @@ def test_auto_meas_runs_ucisdtq(walker_kind, norb, nup, ndn, n_chol):
     assert jnp.isfinite(e_val)
 
 
+def test_spin_auto_force_bias_runs_ucisdtq():
+    key = jax.random.PRNGKey(31)
+    norb, nup, ndn, n_chol = 4, 2, 1, 5
+    k_ham, k_trial, k_w = jax.random.split(key, 3)
+
+    sys = System(norb=norb, nelec=(nup, ndn), walker_kind="unrestricted")
+    ham = testing.make_random_ham_chol(k_ham, norb=norb, n_chol=n_chol)
+    trial = _make_ucisdtq_trial(k_trial, norb, nup, ndn)
+    t_ops = make_ucisdtq_trial_ops(sys)
+    meas = make_auto_meas_ops(sys, t_ops, decomposition="spin")
+    ctx = meas.build_meas_ctx(ham, trial)
+
+    wi = testing.make_walkers(k_w, sys)
+    fb_val = meas.require_kernel(k_force_bias)(wi, ham, ctx, trial)
+
+    assert fb_val.shape == (3 * n_chol,)
+    assert jnp.isfinite(fb_val).all()
+
+
 def test_generalized_walkers_raise():
     sys = System(norb=4, nelec=(2, 2), walker_kind="generalized")
     with pytest.raises(NotImplementedError):

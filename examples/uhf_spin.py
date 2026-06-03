@@ -38,11 +38,19 @@ mf = scf.UHF(mol)
 mf.max_cycle = 300
 mf = run_stable_uhf(mf)
 
-af = Afqmc(mf)
+spin_lambda = 1.0
+af = Afqmc(
+    mf,
+    decomposition="spin",
+    spin_decomposition_lambda=spin_lambda,
+)
 af.n_walkers = 80
-af.n_eql_blocks = 20
-af.n_blocks = 800
+af.n_eql_blocks = 200
+af.n_blocks = 3000
 af.seed = 7
 af.walker_kind = "unrestricted"
 mean, err = af.kernel()
-print(f"AFQMC/UHF energy: {mean:.10f} +/- {err:.10f} Ha")
+print(
+    f"spin-decomposed AFQMC/UHF energy "
+    f"(lambda={spin_lambda:g}): {mean:.10f} +/- {err:.10f} Ha"
+)

@@ -78,6 +78,22 @@ class StepKernel(Protocol):
     ) -> PropState: ...
 
 
+class StepDiagnosticsKernel(Protocol):
+
+    def __call__(
+        self,
+        state: PropState,
+        *,
+        params: Any,
+        ham_data: Any,
+        trial_data: Any,
+        trial_ops: TrialOps,
+        meas_ops: MeasOps,
+        meas_ctx: Any,
+        prop_ctx: Any,
+    ) -> tuple[PropState, dict[str, jax.Array]]: ...
+
+
 class InitPropState(Protocol):
 
     def __call__(
@@ -101,3 +117,4 @@ class PropOps:
     init_prop_state: InitPropState
     build_prop_ctx: Callable[[Any, jax.Array, Any], Any]  # (ham_data, rdm1, params) -> prop_ctx
     step: StepKernel
+    step_diagnostics: StepDiagnosticsKernel | None = None

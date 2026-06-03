@@ -10,6 +10,8 @@ import pytest
 
 from trot import testing
 from trot.core.ops import k_energy, k_force_bias
+from trot.core.system import System
+from trot.meas.auto import make_auto_meas_ops
 from trot.meas.ucisdt import (
     build_meas_ctx,
     energy_kernel_rw_rh,
@@ -140,6 +142,25 @@ def test_balanced_large_trial_exposes_same_spin_triples():
     assert jnp.linalg.norm(trial.c3aab) > 1e-12
     assert jnp.linalg.norm(trial.c3abb) > 1e-12
     assert jnp.linalg.norm(trial.c3bbb) > 1e-12
+
+
+def test_spin_auto_force_bias_runs_ucisdt():
+    key = jax.random.PRNGKey(17)
+    norb, nup, ndn, n_chol = 4, 2, 1, 5
+    k_ham, k_trial, k_w = jax.random.split(key, 3)
+
+    sys = System(norb=norb, nelec=(nup, ndn), walker_kind="unrestricted")
+    ham = testing.make_random_ham_chol(k_ham, norb=norb, n_chol=n_chol)
+    trial = _make_ucisdt_trial(k_trial, norb=norb, nup=nup, ndn=ndn)
+    t_ops = make_ucisdt_trial_ops(sys)
+    meas = make_auto_meas_ops(sys, t_ops, decomposition="spin")
+    ctx = meas.build_meas_ctx(ham, trial)
+
+    wi = testing.make_walkers(k_w, sys)
+    fb_val = meas.require_kernel(k_force_bias)(wi, ham, ctx, trial)
+
+    assert fb_val.shape == (3 * n_chol,)
+    assert jnp.isfinite(fb_val).all()
 
 
 @pytest.mark.parametrize(

@@ -1,11 +1,13 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from trot.core.ops import MeasOps
 from trot.core.system import System
 from trot.ham.chol import HamChol
-from trot.prop.afqmc import afqmc_step
+from trot.prop.afqmc import afqmc_step, make_prop_ops
+from trot.prop.blocks import make_phaseless_diagnostic_logger
 from trot.prop.chol_afqmc_ops import _build_prop_ctx, make_trotter_ops
 from trot.prop.types import PropState, QmcParams
 from trot import testing
@@ -22,10 +24,13 @@ def _make_dummy_meas_ops():
         n_fields = ham_data.chol.shape[0]
         return jnp.zeros((n_fields,), dtype=walker.dtype)
 
+    def energy_kernel(walker, ham_data, meas_ctx, trial_data):
+        return jnp.asarray(0.0)
+
     return MeasOps(
         overlap=overlap,
         build_meas_ctx=build_meas_ctx,
-        kernels={"force_bias": force_bias_kernel},
+        kernels={"force_bias": force_bias_kernel, "energy": energy_kernel},
         observables={},
     )
 
@@ -51,11 +56,11 @@ def test_weight_update_matches_h0_prop_and_pop_control_update():
     meas_ops = _make_dummy_meas_ops()
     trial_data = {"rdm1": jnp.zeros((norb, norb))}
 
-    walkers = jnp.ones((nw, norb, nocc), dtype=jnp.complex64)
+    walkers = jnp.ones((nw, norb, nocc), dtype=jnp.complex128)
     state = PropState(
         walkers=walkers,
         weights=jnp.ones((nw,)),
-        overlaps=jnp.ones((nw,), dtype=jnp.complex64),
+        overlaps=jnp.ones((nw,), dtype=jnp.complex128),
         rng_key=jax.random.PRNGKey(0),
         pop_control_ene_shift=jnp.asarray(0.0),
         e_estimate=jnp.asarray(0.0),
@@ -160,6 +165,65 @@ def test_step_matches_manual_walker_propagation_and_is_chunk_invariant():
     assert jnp.allclose(out2.weights, out1.weights)
     assert jnp.allclose(out2.overlaps, out1.overlaps)
     assert jnp.all(out2.rng_key == out1.rng_key)
+
+
+def test_phaseless_diagnostic_logger_writes_step_summaries(tmp_path):
+    norb, nocc, nw, n_fields = 4, 2, 5, 3
+    ham = HamChol(
+        basis="restricted",
+        h0=jnp.asarray(0.0),
+        h1=jnp.zeros((norb, norb)),
+        chol=jnp.zeros((n_fields, norb, norb)),
+    )
+    sys = System(norb=norb, nelec=(nocc, nocc), walker_kind="restricted")
+    params = QmcParams(
+        dt=0.1,
+        n_chunks=1,
+        n_exp_terms=4,
+        n_prop_steps=3,
+        n_walkers=nw,
+    )
+    meas_ops = _make_dummy_meas_ops()
+    trial_ops = testing.make_dummy_trial_ops()
+    trial_data = {"rdm1": jnp.stack([jnp.eye(norb), jnp.eye(norb)])}
+    prop_ops = make_prop_ops(ham.basis, sys.walker_kind)
+    prop_ctx = prop_ops.build_prop_ctx(ham, trial_ops.get_rdm1(trial_data), params)
+    meas_ctx = meas_ops.build_meas_ctx(ham, trial_data)
+
+    walkers = jnp.ones((nw, norb, nocc), dtype=jnp.complex128)
+    state = PropState(
+        walkers=walkers,
+        weights=jnp.ones((nw,)),
+        overlaps=jnp.ones((nw,), dtype=jnp.complex128),
+        rng_key=jax.random.PRNGKey(0),
+        pop_control_ene_shift=jnp.asarray(0.0),
+        e_estimate=jnp.asarray(0.0),
+        node_encounters=jnp.asarray(0),
+    )
+
+    block_fn = make_phaseless_diagnostic_logger(tmp_path)
+    block_fn(
+        state,
+        sys=sys,
+        params=params,
+        ham_data=ham,
+        trial_data=trial_data,
+        trial_ops=trial_ops,
+        meas_ops=meas_ops,
+        meas_ctx=meas_ctx,
+        prop_ops=prop_ops,
+        prop_ctx=prop_ctx,
+    )
+
+    files = sorted(tmp_path.glob("phaseless_diag_*.npz"))
+    assert len(files) == 1
+    data = np.load(files[0])
+    assert data["theta_abs_mean"].shape == (params.n_prop_steps,)
+    assert data["n_floor"].shape == (params.n_prop_steps,)
+    assert data["force_bias_norm_max"].shape == (params.n_prop_steps,)
+    assert data["force_bias_norm_alpha_max"].shape == (params.n_prop_steps,)
+    assert np.isnan(data["force_bias_norm_alpha_max"]).all()
+    assert data["block_energy"].shape == ()
 
 
 if __name__ == "__main__":

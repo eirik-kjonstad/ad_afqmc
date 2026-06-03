@@ -194,6 +194,8 @@ def _build_restricted_prop_ctx_from_host(
         h0_prop=h0_prop_a,
         chol_flat=chol_flat_a,
         norb=norb,
+        decomposition="charge",
+        spin_decomposition_lambda=1.0,
     )
 
 

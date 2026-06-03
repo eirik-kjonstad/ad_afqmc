@@ -192,7 +192,7 @@ def make_block_state_logger(
     return logging_block_fn
 
 
-def block(
+def _finish_phaseless_block(
     state: PropState,
     *,
     sys: System,
@@ -207,26 +207,6 @@ def block(
     sr_fn: Callable = wk.stochastic_reconfiguration,
     observable_names: tuple[str, ...] = (),
 ) -> tuple[PropState, BlockObs]:
-    """
-    propagation + measurement
-    """
-    step = lambda st: prop_ops.step(
-        st,
-        params=params,
-        ham_data=ham_data,
-        trial_data=trial_data,
-        trial_ops=trial_ops,
-        meas_ops=meas_ops,
-        prop_ctx=prop_ctx,
-        meas_ctx=meas_ctx,
-    )
-
-    def _scan_step(carry: PropState, _x: Any):
-        carry = step(carry)
-        return carry, None
-
-    state, _ = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
-
     walkers_new = wk.orthonormalize(state.walkers, sys.walker_kind)
     overlaps_new = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
         walkers_new, trial_data
@@ -285,6 +265,157 @@ def block(
         observables=obs_samples,
     )
     return state, obs
+
+
+def make_phaseless_diagnostic_logger(
+    directory: str | Path,
+    *,
+    prefix: str = "phaseless_diag",
+    start_index: int = 0,
+    compressed: bool = True,
+) -> BlockFn:
+    """
+    Build a block function that writes per-step phaseless diagnostics to ``.npz`` files.
+
+    Each file contains arrays with shape ``(params.n_prop_steps,)`` for quantities such
+    as ``theta_abs_mean``, ``cos_min``, ``n_cos_nonpositive``, ``n_floor``,
+    ``force_bias_norm_max``, and ``field_shift_norm_max``. The files also contain
+    ``block_energy``, ``block_weight``, and ``node_encounters_end`` scalars.
+    """
+
+    out_dir = Path(directory).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    counter = int(start_index)
+    result_spec = jax.ShapeDtypeStruct((), jnp.int32)
+
+    def _write_diagnostics(
+        diagnostics: dict[str, jax.Array],
+        scalars: dict[str, jax.Array],
+        node_encounters_end: jax.Array,
+    ) -> np.int32:
+        nonlocal counter
+        path = out_dir / f"{prefix}_{counter:05d}.npz"
+        arrays: dict[str, np.ndarray] = {
+            name: np.asarray(jax.device_get(value)) for name, value in diagnostics.items()
+        }
+        arrays["block_energy"] = np.asarray(jax.device_get(scalars["energy"]))
+        arrays["block_weight"] = np.asarray(jax.device_get(scalars["weight"]))
+        arrays["node_encounters_end"] = np.asarray(jax.device_get(node_encounters_end))
+        arrays_kw = cast(dict[str, Any], arrays)
+        if compressed:
+            np.savez_compressed(path, **arrays_kw)
+        else:
+            np.savez(path, **arrays_kw)
+        counter += 1
+        return np.int32(0)
+
+    def diagnostic_block_fn(
+        state: PropState,
+        *,
+        sys: System,
+        params: Any,
+        ham_data: Any,
+        trial_data: Any,
+        trial_ops: TrialOps,
+        meas_ops: MeasOps,
+        meas_ctx: Any,
+        prop_ops: Any,
+        prop_ctx: Any,
+        sr_fn: SrFn = wk.stochastic_reconfiguration,
+        observable_names: tuple[str, ...] = (),
+    ) -> tuple[PropState, BlockObs]:
+        if prop_ops.step_diagnostics is None:
+            raise ValueError("The supplied PropOps does not provide step diagnostics.")
+
+        def _scan_step(carry: PropState, _x: Any):
+            carry, diag = prop_ops.step_diagnostics(
+                carry,
+                params=params,
+                ham_data=ham_data,
+                trial_data=trial_data,
+                trial_ops=trial_ops,
+                meas_ops=meas_ops,
+                prop_ctx=prop_ctx,
+                meas_ctx=meas_ctx,
+            )
+            return carry, diag
+
+        state, diagnostics = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
+        state, obs = _finish_phaseless_block(
+            state,
+            sys=sys,
+            params=params,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            trial_ops=trial_ops,
+            meas_ops=meas_ops,
+            meas_ctx=meas_ctx,
+            prop_ops=prop_ops,
+            prop_ctx=prop_ctx,
+            sr_fn=sr_fn,
+            observable_names=observable_names,
+        )
+        _ = io_callback(
+            _write_diagnostics,
+            result_spec,
+            diagnostics,
+            obs.scalars,
+            state.node_encounters,
+            ordered=True,
+        )
+        return state, obs
+
+    return diagnostic_block_fn
+
+
+def block(
+    state: PropState,
+    *,
+    sys: System,
+    params: QmcParams,
+    ham_data: Any,
+    trial_data: Any,
+    trial_ops: TrialOps,
+    meas_ops: MeasOps,
+    meas_ctx: Any,
+    prop_ops: PropOps,
+    prop_ctx: Any,
+    sr_fn: Callable = wk.stochastic_reconfiguration,
+    observable_names: tuple[str, ...] = (),
+) -> tuple[PropState, BlockObs]:
+    """
+    propagation + measurement
+    """
+    step = lambda st: prop_ops.step(
+        st,
+        params=params,
+        ham_data=ham_data,
+        trial_data=trial_data,
+        trial_ops=trial_ops,
+        meas_ops=meas_ops,
+        prop_ctx=prop_ctx,
+        meas_ctx=meas_ctx,
+    )
+
+    def _scan_step(carry: PropState, _x: Any):
+        carry = step(carry)
+        return carry, None
+
+    state, _ = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
+    return _finish_phaseless_block(
+        state,
+        sys=sys,
+        params=params,
+        ham_data=ham_data,
+        trial_data=trial_data,
+        trial_ops=trial_ops,
+        meas_ops=meas_ops,
+        meas_ctx=meas_ctx,
+        prop_ops=prop_ops,
+        prop_ctx=prop_ctx,
+        sr_fn=sr_fn,
+        observable_names=observable_names,
+    )
 
 
 def block_mixed(

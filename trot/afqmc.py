@@ -21,6 +21,7 @@ from . import staging
 from .core.system import WalkerKind
 from .driver import QmcResult
 from .prop.types import QmcParams, QmcParamsBase, QmcParamsFp, QmcParamsLno
+from .prop.chol_afqmc_ops import CholDecomposition
 from .runtime_provenance import print_runtime_provenance
 from .setup import Job
 from .setup import setup as setup_job
@@ -95,6 +96,17 @@ class Afqmc:
         Number of walkers if params is not provided, by default None
     n_chunk : int | None, optional
         Number of chunks if params is not provided, by default 1
+    weight_floor : float | None, optional
+        Minimum phaseless importance factor retained during propagation, by default
+        ``QmcParams.weight_floor``.
+    diagnostics_dir : str | Path | None, optional
+        If provided, write per-block phaseless diagnostic ``.npz`` files to this directory.
+    decomposition : {"charge", "spin"}, optional
+        Auxiliary-field decomposition to use for phaseless propagation, by default "charge".
+    spin_decomposition_lambda : float, optional
+        Interpolation parameter for ``decomposition="spin"``. ``1`` is the full spin
+        decomposition and values in ``[0, 1)`` mix in a charge channel with the
+        spin channels scaled by ``sqrt(lambda)``.
     """
 
     params_cls = QmcParams
@@ -115,7 +127,14 @@ class Afqmc:
         dt: float | None = None,
         n_walkers: int | None = None,
         n_chunks: int | None = None,
+        weight_floor: float | None = None,
+        diagnostics_dir: Union[str, Path] | None = None,
+        decomposition: CholDecomposition = "charge",
+        spin_decomposition_lambda: float = 1.0,
     ):
+        if not 0.0 <= spin_decomposition_lambda <= 1.0:
+            raise ValueError("spin_decomposition_lambda must be between 0 and 1.")
+
         self._obj = mf_or_cc
         self._cc: Any = None
         if _is_cc_like(mf_or_cc):
@@ -139,6 +158,9 @@ class Afqmc:
 
         self.walker_kind: WalkerKind | None = None  # resolved in kernel
         self.mixed_precision = True
+        self.decomposition = decomposition
+        self.spin_decomposition_lambda = float(spin_decomposition_lambda)
+        self.diagnostics_dir = diagnostics_dir
 
         self.params: QmcParamsBase | None = None  # resolved in kernel
         defaults = self.params_cls()
@@ -147,6 +169,8 @@ class Afqmc:
         self.n_blocks = defaults.n_blocks if n_blocks is None else n_blocks
         self.seed = defaults.seed if seed is None else seed
         self.n_chunks = defaults.n_chunks if n_chunks is None else n_chunks
+        if hasattr(defaults, "weight_floor"):
+            self.weight_floor = defaults.weight_floor if weight_floor is None else weight_floor
         if hasattr(defaults, "n_eql_blocks"):
             self.n_eql_blocks = defaults.n_eql_blocks if n_eql_blocks is None else n_eql_blocks
 
@@ -222,6 +246,9 @@ class Afqmc:
         print(f" chol_cut        = {chol_cut:g}")
         print(f" cache           = {str(self.cache) if self.cache else None}")
         print(f" walker_kind     = {sys.walker_kind}")
+        print(f" decomposition   = {job.decomposition}")
+        if job.decomposition == "spin":
+            print(f" spin_lambda     = {job.spin_decomposition_lambda:g}")
         print(f" mixed_precision = {self.mixed_precision}\n")
         meas_cfg = self._resolve_meas_cfg(job)
         if meas_cfg is not None:
@@ -336,11 +363,20 @@ class Afqmc:
         Assemble a runnable Job from current settings and staged inputs.
         """
         if self._job is not None and not force and (mesh is None or self._job.mesh is mesh):
-            return self._job
+            if (
+                self._job.decomposition == self.decomposition
+                and self._job.spin_decomposition_lambda == self.spin_decomposition_lambda
+            ):
+                return self._job
 
         staged = self.stage()
         qmc_params = self._make_params()
         self.params = qmc_params
+
+        if block_fn is None and self.diagnostics_dir is not None:
+            from .prop.blocks import make_phaseless_diagnostic_logger
+
+            block_fn = make_phaseless_diagnostic_logger(self.diagnostics_dir)
 
         job = self.setup_fn(
             staged,
@@ -354,6 +390,8 @@ class Afqmc:
             prop_ops=prop_ops,
             block_fn=block_fn,
             prop_kwargs=prop_kwargs,
+            decomposition=self.decomposition,
+            spin_decomposition_lambda=self.spin_decomposition_lambda,
         )
         self._job = job
         return job
@@ -409,6 +447,8 @@ class Afqmc:
         dt: float | None = None,
         n_walkers: int | None = None,
         n_chunks: int = 1,
+        decomposition: CholDecomposition = "charge",
+        spin_decomposition_lambda: float = 1.0,
     ) -> Afqmc:
         """
         Returns a new AFQMC object from a previously staged calculations
@@ -428,6 +468,8 @@ class Afqmc:
             dt=dt,
             n_walkers=n_walkers,
             n_chunks=n_chunks,
+            decomposition=decomposition,
+            spin_decomposition_lambda=spin_decomposition_lambda,
         )
 
 

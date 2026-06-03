@@ -17,6 +17,7 @@ from .driver import QmcResult
 from .core.ops import MeasOps, TrialOps
 from .core.system import System, WalkerKind
 from .ham.chol import HamChol
+from .prop.chol_afqmc_ops import CholDecomposition
 from .prop.afqmc import make_prop_ops
 from .prop.blocks import block as default_block
 from .prop.types import PropOps, PropState, QmcParams, QmcParamsBase
@@ -104,11 +105,15 @@ def _make_prop(
     sys: System | None = None,
     *,
     mixed_precision: bool,
+    decomposition: CholDecomposition = "charge",
+    spin_decomposition_lambda: float = 1.0,
 ) -> Any:
     return make_prop_ops(
         ham_data.basis,
         walker_kind,
         mixed_precision=mixed_precision,
+        decomposition=decomposition,
+        spin_decomposition_lambda=spin_decomposition_lambda,
     )
 
 
@@ -147,7 +152,11 @@ def _resolve_staged(
 
 
 def _make_trial_bundle(
-    sys: System, staged: StagedInputs, mixed_precision: bool
+    sys: System,
+    staged: StagedInputs,
+    mixed_precision: bool,
+    decomposition: CholDecomposition = "charge",
+    spin_decomposition_lambda: float = 1.0,
 ) -> tuple[Any, Any, Any]:
     """
     Return (trial_data, trial_ops, meas_ops)
@@ -157,6 +166,26 @@ def _make_trial_bundle(
 
     kind = tr.kind.lower()
     t_bundle = _setup_begin(f"building trial bundle ({kind})")
+
+    def meas_ops_for_decomposition(trial_ops: TrialOps, manual_meas_ops: MeasOps) -> MeasOps:
+        if decomposition == "charge":
+            return manual_meas_ops
+        if decomposition != "spin":
+            raise ValueError(f"unknown decomposition: {decomposition}")
+        if kind not in {"uhf", "rohf", "ucisd", "ucisdt", "ucisdtq"}:
+            raise NotImplementedError(f"Spin decomposition is not wired for trial kind {kind!r}.")
+        if sys.walker_kind.lower() not in {"unrestricted", "generalized"}:
+            raise NotImplementedError(
+                "Spin decomposition currently supports unrestricted or generalized walkers."
+            )
+        from .meas.auto import make_auto_meas_ops
+
+        return make_auto_meas_ops(
+            sys=sys,
+            trial_ops_=trial_ops,
+            decomposition="spin",
+            spin_decomposition_lambda=spin_decomposition_lambda,
+        )
 
     if kind == "rhf":
         from .meas.rhf import make_rhf_meas_ops
@@ -174,7 +203,7 @@ def _make_trial_bundle(
 
         trial_data = make_uhf_trial_data(data, sys)
         trial_ops = make_uhf_trial_ops(sys=sys)
-        meas_ops = make_uhf_meas_ops(sys=sys)
+        meas_ops = meas_ops_for_decomposition(trial_ops, make_uhf_meas_ops(sys=sys))
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 
@@ -204,7 +233,10 @@ def _make_trial_bundle(
 
         trial_data = make_ucisd_trial_data(data, sys)
         trial_ops = make_ucisd_trial_ops(sys=sys)
-        meas_ops = make_ucisd_meas_ops(sys=sys, mixed_precision=mixed_precision)
+        meas_ops = meas_ops_for_decomposition(
+            trial_ops,
+            make_ucisd_meas_ops(sys=sys, mixed_precision=mixed_precision),
+        )
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 
@@ -214,8 +246,13 @@ def _make_trial_bundle(
 
         trial_data = make_ucisdt_trial_data(data, sys)
         trial_ops = make_ucisdt_trial_ops(sys=sys)
-        meas_ops = make_ucisdt_meas_ops(
-            sys=sys, memory_mode="high", mixed_precision=mixed_precision
+        meas_ops = meas_ops_for_decomposition(
+            trial_ops,
+            make_ucisdt_meas_ops(
+                sys=sys,
+                memory_mode="high",
+                mixed_precision=mixed_precision,
+            ),
         )
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
@@ -226,7 +263,10 @@ def _make_trial_bundle(
 
         trial_data = make_ucisdtq_trial_data(data, sys)
         trial_ops = make_ucisdtq_trial_ops(sys=sys)
-        meas_ops = make_ucisdtq_meas_ops(sys=sys, trial_ops=trial_ops)
+        meas_ops = meas_ops_for_decomposition(
+            trial_ops,
+            make_ucisdtq_meas_ops(sys=sys, trial_ops=trial_ops),
+        )
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 
@@ -266,6 +306,8 @@ class Job:
     block_fn: Callable[..., Any]
     runtime_layout: RuntimeLayout
     mesh: Mesh | None = None
+    decomposition: CholDecomposition = "charge"
+    spin_decomposition_lambda: float = 1.0
     _runtime_prop_ctx: object | None = field(default=None, init=False, repr=False)
     _runtime_meas_ctx: object | None = field(default=None, init=False, repr=False)
     _runtime_state: PropState | None = field(default=None, init=False, repr=False)
@@ -352,12 +394,36 @@ def _assemble_job(
     block_fn: Callable[..., Any] | None = None,
     params_kwargs: dict[str, Any] | None = None,
     prop_kwargs: dict[str, Any] | None = None,
+    decomposition: CholDecomposition = "charge",
+    spin_decomposition_lambda: float = 1.0,
     params_builder: Callable[..., QmcParamsBase],
     prop_builder: Callable[..., Any],
     default_block_fn: Callable[..., Any],
     job_cls: type[Job],
     walker_kind_resolver: Callable[[Any, WalkerKind | None], WalkerKind],
 ) -> Job:
+    if not 0.0 <= spin_decomposition_lambda <= 1.0:
+        raise ValueError("spin_decomposition_lambda must be between 0 and 1.")
+
+    if prop_kwargs is not None and "decomposition" in prop_kwargs:
+        prop_decomposition = cast(CholDecomposition, prop_kwargs["decomposition"])
+        if decomposition != "charge" and prop_decomposition != decomposition:
+            raise ValueError(
+                "Conflicting decomposition values were provided in setup(..., decomposition=...) "
+                "and prop_kwargs['decomposition']."
+            )
+        decomposition = prop_decomposition
+    if prop_kwargs is not None and "spin_decomposition_lambda" in prop_kwargs:
+        prop_lambda = float(prop_kwargs["spin_decomposition_lambda"])
+        if spin_decomposition_lambda != 1.0 and prop_lambda != spin_decomposition_lambda:
+            raise ValueError(
+                "Conflicting spin_decomposition_lambda values were provided in setup(...) "
+                "and prop_kwargs['spin_decomposition_lambda']."
+            )
+        spin_decomposition_lambda = prop_lambda
+    if not 0.0 <= spin_decomposition_lambda <= 1.0:
+        raise ValueError("spin_decomposition_lambda must be between 0 and 1.")
+
     trial_data_override = trial_data
     trial_ops_override = trial_ops
     meas_ops_override = meas_ops
@@ -384,7 +450,13 @@ def _assemble_job(
     qmc_params = params_builder(params=params, **(params_kwargs or {}))
 
     if trial_data is None or trial_ops is None or meas_ops is None:
-        td, to, mo = _make_trial_bundle(sys, staged, mixed_precision)
+        td, to, mo = _make_trial_bundle(
+            sys,
+            staged,
+            mixed_precision,
+            decomposition,
+            spin_decomposition_lambda,
+        )
         trial_data = td if trial_data is None else trial_data
         trial_ops = to if trial_ops is None else trial_ops
         meas_ops = mo if meas_ops is None else meas_ops
@@ -403,12 +475,15 @@ def _assemble_job(
     _setup_end(t_ham_runtime, "runtime Hamiltonian ready")
 
     if prop_ops is None:
+        prop_kwargs_ = dict(prop_kwargs or {})
+        prop_kwargs_.setdefault("decomposition", decomposition)
+        prop_kwargs_.setdefault("spin_decomposition_lambda", spin_decomposition_lambda)
         prop_ops = prop_builder(
             ham_data,
             sys.walker_kind,
             sys=sys,
             mixed_precision=mixed_precision,
-            **(prop_kwargs or {}),
+            **prop_kwargs_,
         )
 
     if block_fn is None:
@@ -426,6 +501,8 @@ def _assemble_job(
         block_fn=block_fn,
         runtime_layout=runtime_layout,
         mesh=mesh,
+        decomposition=decomposition,
+        spin_decomposition_lambda=spin_decomposition_lambda,
     )
 
 
@@ -454,6 +531,8 @@ def setup(
     # extra kwargs
     params_kwargs: dict[str, Any] | None = None,
     prop_kwargs: dict[str, Any] | None = None,
+    decomposition: CholDecomposition = "charge",
+    spin_decomposition_lambda: float = 1.0,
 ) -> Job:
     """
     Assemble a runnable AFQMC Job from either:
@@ -489,6 +568,8 @@ def setup(
         block_fn=block_fn,
         params_kwargs=params_kwargs,
         prop_kwargs=prop_kwargs,
+        decomposition=decomposition,
+        spin_decomposition_lambda=spin_decomposition_lambda,
         params_builder=_make_params,
         prop_builder=_make_prop,
         default_block_fn=default_block,

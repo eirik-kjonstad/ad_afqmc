@@ -1,6 +1,13 @@
 from pyscf import gto, scf
 
 from trot.afqmc import Afqmc
+from trot.staging import stage_from_ccpy
+
+try:
+    from ccpy.drivers.driver import Driver
+except Exception as exc:
+    raise RuntimeError(
+        "This example requires ccpy. Please install ccpy to run it.") from exc
 
 mol = gto.M(
     atom="H 0 0 0; F 1.7 0.0 0.0",
@@ -38,11 +45,31 @@ mf = scf.UHF(mol)
 mf.max_cycle = 300
 mf = run_stable_uhf(mf)
 
-af = Afqmc(mf)
-af.n_walkers = 80
-af.n_eql_blocks = 20
-af.n_blocks = 800
-af.seed = 7
+cc_driver = Driver.from_pyscf(mf, nfrozen=0, uhf=True)
+cc_driver.options["amp_convergence"] = 1.0e-12
+cc_driver.options["energy_convergence"] = 1.0e-12
+cc_driver.options["RHF_symmetry"] = False
+cc_driver.run_cc(method="ccsdt")
+
+staged = stage_from_ccpy(cc_driver, mf, order=3,
+                         chol_cut=1.0e-14, verbose=False)
+
+spin_lambda = 0.1
+af = Afqmc(
+    staged,
+    decomposition="spin",
+    spin_decomposition_lambda=spin_lambda,
+    diagnostics_dir="diag_spin",
+)
 af.walker_kind = "unrestricted"
+af.n_walkers = 80
+af.n_eql_blocks = 50
+af.n_blocks = 200
+af.dt = 0.005
+af.mixed_precision = False
+af.seed = 7
 mean, err = af.kernel()
-print(f"AFQMC/UHF energy: {mean:.10f} +/- {err:.10f} Ha")
+print(
+    f"spin-decomposed AFQMC/UCISDT energy "
+    f"(lambda={spin_lambda:g}): {mean:.10f} +/- {err:.10f} Ha"
+)

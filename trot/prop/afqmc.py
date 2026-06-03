@@ -12,7 +12,13 @@ from ..core.system import System
 from ..ham.chol import HamBasis, HamChol
 from ..sharding import shard_prop_state
 from ..walkers import init_walkers
-from .chol_afqmc_ops import CholAfqmcCtx, TrotterOps, _build_prop_ctx, make_trotter_ops
+from .chol_afqmc_ops import (
+    CholAfqmcCtx,
+    CholDecomposition,
+    TrotterOps,
+    _build_prop_ctx,
+    make_trotter_ops,
+)
 from .types import PropOps, PropState, QmcParamsBase
 
 
@@ -144,8 +150,180 @@ def afqmc_step(
     )
 
 
-def make_prop_ops(ham_basis: HamBasis, walker_kind: str, mixed_precision=False) -> PropOps:
-    trotter_ops = make_trotter_ops(ham_basis, walker_kind, mixed_precision=mixed_precision)
+def _spin_channel_norm_diagnostics(
+    name: str,
+    values: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+) -> dict[str, jax.Array]:
+    dtype = jnp.real(values).dtype
+    if prop_ctx.decomposition != "spin":
+        nan = jnp.asarray(jnp.nan, dtype=dtype)
+        return {
+            f"{name}_charge_mean": nan,
+            f"{name}_charge_max": nan,
+            f"{name}_alpha_mean": nan,
+            f"{name}_alpha_max": nan,
+            f"{name}_beta_mean": nan,
+            f"{name}_beta_max": nan,
+            f"{name}_s_mean": nan,
+            f"{name}_s_max": nan,
+        }
+
+    if prop_ctx.spin_decomposition_lambda >= 1.0:
+        nan = jnp.asarray(jnp.nan, dtype=dtype)
+        n_chol = values.shape[1] // 3
+        charge = jnp.full((values.shape[0],), nan, dtype=dtype)
+        alpha = jnp.linalg.norm(values[:, :n_chol], axis=1)
+        beta = jnp.linalg.norm(values[:, n_chol : 2 * n_chol], axis=1)
+        spin = jnp.linalg.norm(values[:, 2 * n_chol :], axis=1)
+    else:
+        n_chol = values.shape[1] // 4
+        charge = jnp.linalg.norm(values[:, :n_chol], axis=1)
+        alpha = jnp.linalg.norm(values[:, n_chol : 2 * n_chol], axis=1)
+        beta = jnp.linalg.norm(values[:, 2 * n_chol : 3 * n_chol], axis=1)
+        spin = jnp.linalg.norm(values[:, 3 * n_chol :], axis=1)
+
+    return {
+        f"{name}_charge_mean": jnp.mean(charge),
+        f"{name}_charge_max": jnp.max(charge),
+        f"{name}_alpha_mean": jnp.mean(alpha),
+        f"{name}_alpha_max": jnp.max(alpha),
+        f"{name}_beta_mean": jnp.mean(beta),
+        f"{name}_beta_max": jnp.max(beta),
+        f"{name}_s_mean": jnp.mean(spin),
+        f"{name}_s_max": jnp.max(spin),
+    }
+
+
+def afqmc_step_with_diagnostics(
+    state: PropState,
+    *,
+    params: QmcParamsBase,
+    ham_data: HamChol,
+    trial_data: Any,
+    meas_ops: MeasOps,
+    trotter_ops: TrotterOps,
+    prop_ctx: CholAfqmcCtx,
+    meas_ctx: Any,
+) -> tuple[PropState, dict[str, jax.Array]]:
+
+    key, subkey = jax.random.split(state.rng_key)
+    nw = wk.n_walkers(state.walkers)
+    fields = jax.random.normal(subkey, (nw, prop_ctx.chol_flat.shape[0]))
+
+    fb_kernel = meas_ops.require_kernel(k_force_bias)
+    force_bias = wk.vmap_chunked(
+        fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+    )(state.walkers, ham_data, meas_ctx, trial_data)
+    field_shifts = -prop_ctx.sqrt_dt * (1.0j * force_bias - prop_ctx.mf_shifts)
+    shifted_fields = fields - field_shifts
+
+    shift_term = jnp.sum(shifted_fields * prop_ctx.mf_shifts, axis=1)
+    fb_term = jnp.sum(fields * field_shifts - 0.5 * field_shifts * field_shifts, axis=1)
+    walkers_new = wk.vmap_chunked(
+        trotter_ops.apply_trotter, n_chunks=params.n_chunks, in_axes=(0, 0, None, None)
+    )(state.walkers, shifted_fields, prop_ctx, params.n_exp_terms)
+
+    overlaps_new = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
+        walkers_new, trial_data
+    )
+    ratio = overlaps_new / state.overlaps
+    exponent = (
+        -prop_ctx.sqrt_dt * shift_term
+        + fb_term
+        + prop_ctx.dt * (state.pop_control_ene_shift + prop_ctx.h0_prop)
+    )
+    imp_fun = jnp.exp(exponent) * ratio
+
+    phase_factor = jnp.exp(-prop_ctx.sqrt_dt * shift_term) * ratio
+    theta = jnp.angle(phase_factor)
+    cos_theta = jnp.cos(theta)
+    imp_raw = jnp.abs(imp_fun) * cos_theta
+
+    w_floor = float(getattr(params, "weight_floor", 1.0e-3))
+    w_cap = float(getattr(params, "weight_cap", 100.0))
+
+    nonfinite = ~jnp.isfinite(imp_raw)
+    floor_kill = (~nonfinite) & (imp_raw < w_floor)
+    imp_ph = jnp.where(nonfinite | floor_kill, 0.0, imp_raw)
+    cap_kill = imp_ph > w_cap
+    node_encounters_new = state.node_encounters + jnp.sum(imp_ph <= 0.0)
+    imp_ph = jnp.where(cap_kill, 0.0, imp_ph)
+
+    weights_unbounded = state.weights * imp_ph
+    weight_cap_kill = weights_unbounded > w_cap
+    weights_new = jnp.where(weight_cap_kill, 0.0, weights_unbounded)
+
+    damping = float(getattr(params, "pop_control_damping", 0.1))
+    avg_w = jnp.clip(jnp.mean(weights_new), min=1.0e-300)
+    pop_shift_new = state.e_estimate - damping * (jnp.log(avg_w) / prop_ctx.dt)
+
+    new_state = PropState(
+        walkers=walkers_new,
+        weights=weights_new,
+        overlaps=overlaps_new,
+        rng_key=key,
+        pop_control_ene_shift=pop_shift_new,
+        e_estimate=state.e_estimate,
+        node_encounters=node_encounters_new,
+    )
+
+    force_bias_norm = jnp.linalg.norm(force_bias, axis=1)
+    field_shift_norm = jnp.linalg.norm(field_shifts, axis=1)
+    shifted_field_norm = jnp.linalg.norm(shifted_fields, axis=1)
+    abs_ratio = jnp.abs(ratio)
+    abs_phase_factor = jnp.abs(phase_factor)
+
+    diagnostics = {
+        "n_cos_nonpositive": jnp.sum(cos_theta <= 0.0),
+        "n_floor": jnp.sum(floor_kill),
+        "n_nonfinite": jnp.sum(nonfinite),
+        "n_imp_cap": jnp.sum(cap_kill),
+        "n_weight_cap": jnp.sum(weight_cap_kill),
+        "theta_abs_mean": jnp.mean(jnp.abs(theta)),
+        "theta_abs_max": jnp.max(jnp.abs(theta)),
+        "cos_mean": jnp.mean(cos_theta),
+        "cos_min": jnp.min(cos_theta),
+        "imp_raw_mean": jnp.mean(imp_raw),
+        "imp_raw_min": jnp.min(imp_raw),
+        "imp_raw_max": jnp.max(imp_raw),
+        "abs_ratio_mean": jnp.mean(abs_ratio),
+        "abs_ratio_max": jnp.max(abs_ratio),
+        "abs_phase_factor_mean": jnp.mean(abs_phase_factor),
+        "abs_phase_factor_max": jnp.max(abs_phase_factor),
+        "force_bias_norm_mean": jnp.mean(force_bias_norm),
+        "force_bias_norm_max": jnp.max(force_bias_norm),
+        "field_shift_norm_mean": jnp.mean(field_shift_norm),
+        "field_shift_norm_max": jnp.max(field_shift_norm),
+        "shifted_field_norm_mean": jnp.mean(shifted_field_norm),
+        "shifted_field_norm_max": jnp.max(shifted_field_norm),
+        "weight_sum_before": jnp.sum(state.weights),
+        "weight_sum_after": jnp.sum(weights_new),
+        "overlap_abs_mean_before": jnp.mean(jnp.abs(state.overlaps)),
+        "overlap_abs_mean_after": jnp.mean(jnp.abs(overlaps_new)),
+    }
+    diagnostics.update(_spin_channel_norm_diagnostics("force_bias_norm", force_bias, prop_ctx))
+    diagnostics.update(_spin_channel_norm_diagnostics("field_shift_norm", field_shifts, prop_ctx))
+    diagnostics.update(
+        _spin_channel_norm_diagnostics("shifted_field_norm", shifted_fields, prop_ctx)
+    )
+    return new_state, diagnostics
+
+
+def make_prop_ops(
+    ham_basis: HamBasis,
+    walker_kind: str,
+    mixed_precision=False,
+    decomposition: CholDecomposition = "charge",
+    spin_decomposition_lambda: float = 1.0,
+) -> PropOps:
+    trotter_ops = make_trotter_ops(
+        ham_basis,
+        walker_kind,
+        mixed_precision=mixed_precision,
+        decomposition=decomposition,
+        spin_decomposition_lambda=spin_decomposition_lambda,
+    )
 
     def step(
         state: PropState,
@@ -169,12 +347,41 @@ def make_prop_ops(ham_basis: HamBasis, walker_kind: str, mixed_precision=False) 
             trotter_ops=trotter_ops,
         )
 
+    def step_diagnostics(
+        state: PropState,
+        *,
+        params: QmcParamsBase,
+        ham_data: Any,
+        trial_data: Any,
+        trial_ops: TrialOps,
+        meas_ops: MeasOps,
+        meas_ctx: Any,
+        prop_ctx: Any,
+    ) -> tuple[PropState, dict[str, jax.Array]]:
+        return afqmc_step_with_diagnostics(
+            state,
+            params=params,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            meas_ops=meas_ops,
+            meas_ctx=meas_ctx,
+            prop_ctx=prop_ctx,
+            trotter_ops=trotter_ops,
+        )
+
     def build_prop_ctx(ham_data: Any, rdm1: jax.Array, params: QmcParamsBase) -> CholAfqmcCtx:
         return _build_prop_ctx(
             ham_data,
             rdm1,
             params.dt,
             chol_flat_precision=jnp.float32 if mixed_precision else jnp.float64,
+            decomposition=decomposition,
+            spin_decomposition_lambda=spin_decomposition_lambda,
         )
 
-    return PropOps(init_prop_state=init_prop_state, build_prop_ctx=build_prop_ctx, step=step)
+    return PropOps(
+        init_prop_state=init_prop_state,
+        build_prop_ctx=build_prop_ctx,
+        step=step,
+        step_diagnostics=step_diagnostics,
+    )

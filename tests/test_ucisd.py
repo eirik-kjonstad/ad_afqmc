@@ -13,6 +13,8 @@ from pyscf import cc, gto, scf
 from trot import testing
 from trot.afqmc import Afqmc
 from trot.core.ops import k_energy, k_force_bias
+from trot.core.system import System
+from trot.meas.auto import make_auto_meas_ops
 from trot.meas.ucisd import (
     build_meas_ctx,
     energy_kernel_gw_rh,
@@ -137,6 +139,25 @@ def test_auto_force_bias_matches_manual_ucisd(walker_kind, norb, nup, ndn, n_cho
         v_m = fb_manual(wi, ham, ctx_manual, trial)
         v_a = fb_auto(wi, ham, ctx_auto, trial)
         assert jnp.allclose(v_a, v_m, atol=1e-12), (v_a, v_m)
+
+
+def test_spin_auto_force_bias_runs_ucisd():
+    key = jax.random.PRNGKey(13)
+    norb, nup, ndn, n_chol = 4, 2, 1, 5
+    k_ham, k_trial, k_w = jax.random.split(key, 3)
+
+    sys = System(norb=norb, nelec=(nup, ndn), walker_kind="unrestricted")
+    ham = testing.make_random_ham_chol(k_ham, norb=norb, n_chol=n_chol)
+    trial = _make_ucisd_trial(k_trial, norb=norb, nup=nup, ndn=ndn)
+    t_ops = make_ucisd_trial_ops(sys)
+    meas = make_auto_meas_ops(sys, t_ops, decomposition="spin")
+    ctx = meas.build_meas_ctx(ham, trial)
+
+    wi = testing.make_walkers(k_w, sys)
+    fb_val = meas.require_kernel(k_force_bias)(wi, ham, ctx, trial)
+
+    assert fb_val.shape == (3 * n_chol,)
+    assert jnp.isfinite(fb_val).all()
 
 
 @pytest.mark.parametrize(

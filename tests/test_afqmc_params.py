@@ -18,17 +18,30 @@ def test_afqmc_defaults_match_qmc_params():
     assert af.n_walkers == defaults.n_walkers
     assert af.n_blocks == defaults.n_blocks
     assert af.n_eql_blocks == defaults.n_eql_blocks
+    assert af.weight_floor == defaults.weight_floor
+    assert af.diagnostics_dir is None
     assert isinstance(af.seed, int)
     assert af.n_chunks == defaults.n_chunks
 
 
 def test_afqmc_custom_values_override_defaults():
-    af = Afqmc(DUMMY_MF, dt=0.01, n_walkers=50, n_blocks=100, seed=786, n_chunks=4)
+    af = Afqmc(
+        DUMMY_MF,
+        dt=0.01,
+        n_walkers=50,
+        n_blocks=100,
+        seed=786,
+        n_chunks=4,
+        weight_floor=0.0,
+        diagnostics_dir="diag-out",
+    )
     assert af.dt == 0.01
     assert af.n_walkers == 50
     assert af.n_blocks == 100
     assert af.seed == 786
     assert af.n_chunks == 4
+    assert af.weight_floor == 0.0
+    assert af.diagnostics_dir == "diag-out"
 
 
 def test_afqmc_partial_overrides():
@@ -50,12 +63,13 @@ def test_afqmc_source_kind_mf():
 
 
 def test_afqmc_make_params_from_self_attributes():
-    af = Afqmc(DUMMY_MF, dt=0.01, n_walkers=50, seed=7)
+    af = Afqmc(DUMMY_MF, dt=0.01, n_walkers=50, seed=7, weight_floor=0.0)
     params = af._make_params()
     assert isinstance(params, QmcParams)
     assert params.dt == 0.01
     assert params.n_walkers == 50
     assert params.seed == 7
+    assert params.weight_floor == 0.0
 
 
 def test_afqmc_make_params_uses_defaults():

@@ -6,6 +6,7 @@ from typing import cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from jax import lax
 from pyscf import gto, scf
@@ -13,6 +14,8 @@ from pyscf import gto, scf
 from trot import testing
 from trot.afqmc import Afqmc
 from trot.core.ops import k_energy, k_force_bias
+from trot.core.system import System
+from trot.meas.auto import make_auto_meas_ops
 from trot.meas.uhf import (
     build_meas_ctx,
     energy_kernel_gw_rh,
@@ -24,6 +27,8 @@ from trot.meas.uhf import (
     make_uhf_meas_ops,
 )
 from trot.prop.types import QmcParams
+from trot.setup import setup
+from trot.staging import HamInput, StagedInputs, TrialInput
 from trot.trial.uhf import UhfTrial, make_uhf_trial_ops
 
 
@@ -79,6 +84,186 @@ def test_auto_force_bias_matches_manual_uhf(walker_kind, norb, nup, ndn, n_chol)
         v_a = fb_auto(wi, ham, ctx_auto, trial)
 
         assert jnp.allclose(v_a, v_m, rtol=5e-6, atol=5e-7), (v_a, v_m)
+
+
+def test_spin_auto_force_bias_matches_uhf_spin_channel_transform():
+    key = jax.random.PRNGKey(12)
+    norb, nup, ndn, n_chol = 6, 2, 1, 8
+    sys = System(norb=norb, nelec=(nup, ndn), walker_kind="unrestricted")
+    ham = testing.make_random_ham_chol(key, norb=norb, n_chol=n_chol)
+    trial = _make_uhf_trial(jax.random.fold_in(key, 1), norb, nup, ndn)
+    walker = testing.make_walkers(jax.random.fold_in(key, 2), sys)
+
+    trial_ops = make_uhf_trial_ops(sys)
+    meas_auto_spin = make_auto_meas_ops(sys, trial_ops, decomposition="spin")
+    ctx_auto_spin = meas_auto_spin.build_meas_ctx(ham, trial)
+    fb_spin = meas_auto_spin.require_kernel(k_force_bias)(walker, ham, ctx_auto_spin, trial)
+
+    meas_ctx = build_meas_ctx(ham, trial)
+    wu, wd = walker
+    mu = trial.mo_coeff_a.conj().T @ wu
+    md = trial.mo_coeff_b.conj().T @ wd
+    gu = jnp.linalg.solve(mu.T, wu.T)
+    gd = jnp.linalg.solve(md.T, wd.T)
+    fb_a = jnp.einsum("gij,ij->g", meas_ctx.rot_chol_a, gu, optimize="optimal")
+    fb_b = jnp.einsum("gij,ij->g", meas_ctx.rot_chol_b, gd, optimize="optimal")
+    sqrt2 = jnp.sqrt(jnp.asarray(2.0))
+    expected = jnp.concatenate([sqrt2 * fb_a, sqrt2 * fb_b, 1.0j * (fb_a - fb_b)])
+
+    assert fb_spin.shape == (3 * n_chol,)
+    assert jnp.allclose(fb_spin, expected, rtol=5e-6, atol=5e-7), (fb_spin, expected)
+
+
+def test_interpolated_spin_auto_force_bias_matches_scaled_channels():
+    key = jax.random.PRNGKey(13)
+    norb, nup, ndn, n_chol = 6, 2, 1, 8
+    lam = 0.25
+    sys = System(norb=norb, nelec=(nup, ndn), walker_kind="unrestricted")
+    ham = testing.make_random_ham_chol(key, norb=norb, n_chol=n_chol)
+    trial = _make_uhf_trial(jax.random.fold_in(key, 1), norb, nup, ndn)
+    walker = testing.make_walkers(jax.random.fold_in(key, 2), sys)
+
+    trial_ops = make_uhf_trial_ops(sys)
+    meas_auto_spin = make_auto_meas_ops(
+        sys,
+        trial_ops,
+        decomposition="spin",
+        spin_decomposition_lambda=lam,
+    )
+    ctx_auto_spin = meas_auto_spin.build_meas_ctx(ham, trial)
+    fb_spin = meas_auto_spin.require_kernel(k_force_bias)(walker, ham, ctx_auto_spin, trial)
+
+    meas_ctx = build_meas_ctx(ham, trial)
+    wu, wd = walker
+    mu = trial.mo_coeff_a.conj().T @ wu
+    md = trial.mo_coeff_b.conj().T @ wd
+    gu = jnp.linalg.solve(mu.T, wu.T)
+    gd = jnp.linalg.solve(md.T, wd.T)
+    fb_a = jnp.einsum("gij,ij->g", meas_ctx.rot_chol_a, gu, optimize="optimal")
+    fb_b = jnp.einsum("gij,ij->g", meas_ctx.rot_chol_b, gd, optimize="optimal")
+    sqrt2 = jnp.sqrt(jnp.asarray(2.0))
+    sqrt_lam = jnp.sqrt(jnp.asarray(lam))
+    sqrt_charge = jnp.sqrt(jnp.asarray(1.0 - lam))
+    expected = jnp.concatenate(
+        [
+            sqrt_charge * (fb_a + fb_b),
+            sqrt_lam * sqrt2 * fb_a,
+            sqrt_lam * sqrt2 * fb_b,
+            sqrt_lam * 1.0j * (fb_a - fb_b),
+        ]
+    )
+
+    assert fb_spin.shape == (4 * n_chol,)
+    assert jnp.allclose(fb_spin, expected, rtol=5e-6, atol=5e-7), (fb_spin, expected)
+
+
+def test_setup_spin_decomposition_builds_three_field_uhf_job():
+    norb, nup, ndn, n_chol = 4, 2, 1, 3
+    rng = np.random.default_rng(4)
+    h1 = rng.standard_normal((norb, norb))
+    h1 = 0.5 * (h1 + h1.T)
+    chol = rng.standard_normal((n_chol, norb, norb)) * 0.05
+    mo = np.eye(norb)
+
+    staged = StagedInputs(
+        ham=HamInput(
+            h0=0.0,
+            h1=h1,
+            chol=chol,
+            nelec=(nup, ndn),
+            norb=norb,
+            chol_cut=1.0e-5,
+            frozen=0,
+            source_kind="mf",
+            basis="restricted",
+        ),
+        trial=TrialInput(
+            kind="uhf",
+            data={"mo_a": mo, "mo_b": mo},
+            frozen=0,
+            source_kind="mf",
+        ),
+        meta={"source_kind": "mf", "chol_cut": 1.0e-5, "frozen": 0},
+    )
+
+    job = setup(
+        staged,
+        walker_kind="unrestricted",
+        mixed_precision=False,
+        decomposition="spin",
+        params=QmcParams(n_walkers=2, n_eql_blocks=0, n_blocks=0),
+    )
+    rdm1 = job.trial_ops.get_rdm1(job.trial_data)
+    prop_ctx = job.prop_ops.build_prop_ctx(job.ham_data, rdm1, job.params)
+    meas_ctx = job.meas_ops.build_meas_ctx(job.ham_data, job.trial_data)
+    walker = (jnp.eye(norb, nup), jnp.eye(norb, ndn))
+    fb = job.meas_ops.require_kernel(k_force_bias)(
+        walker,
+        job.ham_data,
+        meas_ctx,
+        job.trial_data,
+    )
+
+    assert job.decomposition == "spin"
+    assert prop_ctx.mf_shifts.shape == (3 * n_chol,)
+    assert prop_ctx.chol_flat.shape == (3 * n_chol, norb * norb)
+    assert fb.shape == (3 * n_chol,)
+
+
+def test_setup_interpolated_spin_decomposition_builds_four_field_uhf_job():
+    norb, nup, ndn, n_chol = 4, 2, 1, 3
+    lam = 0.5
+    rng = np.random.default_rng(5)
+    h1 = rng.standard_normal((norb, norb))
+    h1 = 0.5 * (h1 + h1.T)
+    chol = rng.standard_normal((n_chol, norb, norb)) * 0.05
+    mo = np.eye(norb)
+
+    staged = StagedInputs(
+        ham=HamInput(
+            h0=0.0,
+            h1=h1,
+            chol=chol,
+            nelec=(nup, ndn),
+            norb=norb,
+            chol_cut=1.0e-5,
+            frozen=0,
+            source_kind="mf",
+            basis="restricted",
+        ),
+        trial=TrialInput(
+            kind="uhf",
+            data={"mo_a": mo, "mo_b": mo},
+            frozen=0,
+            source_kind="mf",
+        ),
+        meta={"source_kind": "mf", "chol_cut": 1.0e-5, "frozen": 0},
+    )
+
+    job = setup(
+        staged,
+        walker_kind="unrestricted",
+        mixed_precision=False,
+        decomposition="spin",
+        spin_decomposition_lambda=lam,
+        params=QmcParams(n_walkers=2, n_eql_blocks=0, n_blocks=0),
+    )
+    rdm1 = job.trial_ops.get_rdm1(job.trial_data)
+    prop_ctx = job.prop_ops.build_prop_ctx(job.ham_data, rdm1, job.params)
+    meas_ctx = job.meas_ops.build_meas_ctx(job.ham_data, job.trial_data)
+    walker = (jnp.eye(norb, nup), jnp.eye(norb, ndn))
+    fb = job.meas_ops.require_kernel(k_force_bias)(
+        walker,
+        job.ham_data,
+        meas_ctx,
+        job.trial_data,
+    )
+
+    assert job.decomposition == "spin"
+    assert job.spin_decomposition_lambda == lam
+    assert prop_ctx.mf_shifts.shape == (4 * n_chol,)
+    assert prop_ctx.chol_flat.shape == (4 * n_chol, norb * norb)
+    assert fb.shape == (4 * n_chol,)
 
 
 @pytest.mark.parametrize(

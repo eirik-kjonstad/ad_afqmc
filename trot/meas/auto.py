@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 import jax
 import jax.numpy as jnp
@@ -96,6 +96,32 @@ def _force_bias_from_overlap_array(
     return grad_x / val
 
 
+def _as_spin_force_bias(
+    fb_a: jax.Array,
+    fb_b: jax.Array,
+    *,
+    spin_decomposition_lambda: float = 1.0,
+) -> jax.Array:
+    if not 0.0 <= spin_decomposition_lambda <= 1.0:
+        raise ValueError("spin_decomposition_lambda must be between 0 and 1.")
+
+    sqrt2 = jnp.sqrt(jnp.asarray(2.0, dtype=jnp.real(fb_a).dtype))
+    spin_fb = jnp.concatenate([sqrt2 * fb_a, sqrt2 * fb_b, 1.0j * (fb_a - fb_b)], axis=0)
+
+    if spin_decomposition_lambda >= 1.0:
+        return spin_fb
+
+    lam = jnp.asarray(spin_decomposition_lambda, dtype=jnp.real(fb_a).dtype)
+    charge_fb = fb_a + fb_b
+    return jnp.concatenate(
+        [
+            jnp.sqrt(1.0 - lam) * charge_fb,
+            jnp.sqrt(lam) * spin_fb,
+        ],
+        axis=0,
+    )
+
+
 def force_bias_kernel_rw_rh(
     w: jax.Array,
     ham_data: HamChol,
@@ -140,6 +166,70 @@ def force_bias_kernel_uw_rh(
     val, pullback = jax.vjp(f, x0)
     grad_x = pullback(jnp.asarray(1.0, dtype=val.dtype))[0]
     return grad_x / val
+
+
+def force_bias_spin_kernel_uw_rh(
+    w: tuple[jax.Array, jax.Array],
+    ham_data: HamChol,
+    _meas_ctx: AutoMeasCtx,
+    trial_data: trial_data,
+    *,
+    overlap,
+    spin_decomposition_lambda: float = 1.0,
+) -> jax.Array:
+    wu, wd = w
+    chol = ham_data.chol
+    n_fields = chol.shape[0]
+
+    def f(x_ab: jax.Array) -> jax.Array:
+        x_a = x_ab[0]
+        x_b = x_ab[1]
+        x_chol_a = jnp.einsum("gij,g->ij", chol, x_a, optimize="optimal")
+        x_chol_b = jnp.einsum("gij,g->ij", chol, x_b, optimize="optimal")
+        wu1 = wu + x_chol_a @ wu
+        wd1 = wd + x_chol_b @ wd
+        return overlap((wu1, wd1), trial_data)
+
+    x0 = jnp.zeros((2, n_fields), dtype=wu.dtype)
+    val, pullback = jax.vjp(f, x0)
+    grad_x = pullback(jnp.asarray(1.0, dtype=val.dtype))[0] / val
+    return _as_spin_force_bias(
+        grad_x[0],
+        grad_x[1],
+        spin_decomposition_lambda=spin_decomposition_lambda,
+    )
+
+
+def force_bias_spin_kernel_gw_rh(
+    w: jax.Array,
+    ham_data: HamChol,
+    _meas_ctx: AutoMeasCtx,
+    trial_data: trial_data,
+    *,
+    overlap,
+    spin_decomposition_lambda: float = 1.0,
+) -> jax.Array:
+    chol = ham_data.chol
+    n_fields = chol.shape[0]
+    norb = chol.shape[1]
+
+    def f(x_ab: jax.Array) -> jax.Array:
+        x_a = x_ab[0]
+        x_b = x_ab[1]
+        x_chol_a = jnp.einsum("gij,g->ij", chol, x_a, optimize="optimal")
+        x_chol_b = jnp.einsum("gij,g->ij", chol, x_b, optimize="optimal")
+        wa1 = w[:norb, :] + x_chol_a @ w[:norb, :]
+        wb1 = w[norb:, :] + x_chol_b @ w[norb:, :]
+        return overlap(jnp.vstack([wa1, wb1]), trial_data)
+
+    x0 = jnp.zeros((2, n_fields), dtype=w.dtype)
+    val, pullback = jax.vjp(f, x0)
+    grad_x = pullback(jnp.asarray(1.0, dtype=val.dtype))[0] / val
+    return _as_spin_force_bias(
+        grad_x[0],
+        grad_x[1],
+        spin_decomposition_lambda=spin_decomposition_lambda,
+    )
 
 
 def _energy_from_overlap_array(
@@ -256,6 +346,8 @@ def make_auto_meas_ops(
     trial_ops_: TrialOps,
     *,
     eps: float = 1.0e-4,
+    decomposition: Literal["charge", "spin"] = "charge",
+    spin_decomposition_lambda: float = 1.0,
 ) -> MeasOps:
     """
     Measurement ops that compute force bias and energy by differentiating overlaps.
@@ -268,10 +360,19 @@ def make_auto_meas_ops(
     wk = sys.walker_kind.lower()
     overlap = trial_ops_.overlap
 
+    if decomposition not in ("charge", "spin"):
+        raise ValueError(f"unknown decomposition: {decomposition}")
+    if not 0.0 <= spin_decomposition_lambda <= 1.0:
+        raise ValueError("spin_decomposition_lambda must be between 0 and 1.")
+
     def build_ctx(ham_data: HamChol, trial_data: Any) -> AutoMeasCtx:
         return build_meas_ctx(ham_data, trial_data, eps=eps)
 
     if wk == "restricted":
+        if decomposition == "spin":
+            raise NotImplementedError(
+                "Spin decomposition currently supports unrestricted or generalized walkers."
+            )
         fb = lambda walker, ham_data, meas_ctx, trial_data: force_bias_kernel_rw_rh(
             walker, ham_data, meas_ctx, trial_data, overlap=overlap
         )
@@ -285,9 +386,19 @@ def make_auto_meas_ops(
         )
 
     if wk == "unrestricted":
-        fb = lambda walker, ham_data, meas_ctx, trial_data: force_bias_kernel_uw_rh(
-            walker, ham_data, meas_ctx, trial_data, overlap=overlap
-        )
+        if decomposition == "spin":
+            fb = lambda walker, ham_data, meas_ctx, trial_data: force_bias_spin_kernel_uw_rh(
+                walker,
+                ham_data,
+                meas_ctx,
+                trial_data,
+                overlap=overlap,
+                spin_decomposition_lambda=spin_decomposition_lambda,
+            )
+        else:
+            fb = lambda walker, ham_data, meas_ctx, trial_data: force_bias_kernel_uw_rh(
+                walker, ham_data, meas_ctx, trial_data, overlap=overlap
+            )
         ene = lambda walker, ham_data, meas_ctx, trial_data: energy_kernel_uw_rh(
             walker, ham_data, meas_ctx, trial_data, overlap=overlap
         )
@@ -301,9 +412,19 @@ def make_auto_meas_ops(
         )
 
     if wk == "generalized":
-        fb = lambda walker, ham_data, meas_ctx, trial_data: force_bias_kernel_gw_rh(
-            walker, ham_data, meas_ctx, trial_data, overlap=overlap
-        )
+        if decomposition == "spin":
+            fb = lambda walker, ham_data, meas_ctx, trial_data: force_bias_spin_kernel_gw_rh(
+                walker,
+                ham_data,
+                meas_ctx,
+                trial_data,
+                overlap=overlap,
+                spin_decomposition_lambda=spin_decomposition_lambda,
+            )
+        else:
+            fb = lambda walker, ham_data, meas_ctx, trial_data: force_bias_kernel_gw_rh(
+                walker, ham_data, meas_ctx, trial_data, overlap=overlap
+            )
         ene = lambda walker, ham_data, meas_ctx, trial_data: energy_kernel_gw_rh(
             walker, ham_data, meas_ctx, trial_data, overlap=overlap
         )
