@@ -336,15 +336,56 @@ def _rotate_chol_to_ghf_mo(chol_vec: Array, basis_coeff: Array) -> Array:
     return chol
 
 
-def _factorize_charge_spin_cholesky_full(spin_chol: Array) -> Array:
+def _pivoted_cholesky_hermitian(mat: Array) -> tuple[Array, tuple[int, ...]]:
+    a = np.asarray(mat)
+    if a.ndim != 2 or a.shape[0] != a.shape[1]:
+        raise ValueError(f"mat must be a square matrix, got {a.shape}")
+
+    n = int(a.shape[0])
+    diag = np.real(np.diag(a)).copy()
+    max_diag = float(np.max(np.abs(diag))) if diag.size else 0.0
+    eps = np.finfo(np.asarray(diag).dtype).eps
+    tol = 10.0 * eps * n * max(max_diag, 1.0)
+
+    factors: list[Array] = []
+    pivots: list[int] = []
+    while diag.size and float(np.max(diag)) > tol:
+        pivot = int(np.argmax(diag))
+        delta = float(diag[pivot])
+        if delta < -tol:
+            raise ValueError(
+                "Full charge/spin interaction matrix has a negative residual pivot below "
+                f"numerical tolerance: pivot={delta:g}, tol={tol:g}."
+            )
+        if delta <= tol:
+            break
+
+        row = np.array(a[pivot], copy=True)
+        if factors:
+            prev = np.asarray(factors)
+            row -= prev[:, pivot].conj() @ prev
+        row /= delta**0.5
+
+        factors.append(row)
+        pivots.append(pivot)
+        diag -= np.real(row.conj() * row)
+        diag = np.where(diag > 0.0, diag, 0.0)
+
+    if not factors:
+        return np.zeros((0, n), dtype=a.dtype), ()
+    return np.asarray(factors), tuple(pivots)
+
+
+def _factorize_charge_spin_cholesky_full_with_pivots(spin_chol: Array) -> ChargeSpinFactorization:
     """
     Factorize the full charge/spin interaction matrix.
 
     Input is spin-resolved Cholesky factors with shape (nchol, 2, norb, norb),
     where spin 0/1 are alpha/beta.  We build charge/spin factors
     L0=(La+Lb)/2 and Lz=(La-Lb)/2, assemble the full compound-index matrix
-    Vcs[(a,pq),(b,rs)], diagonalize it, and return charge/spin factors for the
-    resulting HS fields.  The returned spin index 0/1 is charge/spin.
+    Vcs[(a,pq),(b,rs)], pivoted-Cholesky factorize it, and return charge/spin
+    factors for the resulting HS fields.  The returned spin index 0/1 is
+    charge/spin.
     """
     chol = np.asarray(spin_chol)
     if chol.ndim != 4 or chol.shape[1] != 2:
@@ -364,29 +405,20 @@ def _factorize_charge_spin_cholesky_full(spin_chol: Array) -> Array:
     v_charge_spin = low_rank_factors.T @ low_rank_factors
     v_charge_spin = 0.5 * (v_charge_spin + v_charge_spin.T.conj())
 
-    eigvals, eigvecs = np.linalg.eigh(v_charge_spin)
-    max_eval = float(np.max(np.abs(eigvals))) if eigvals.size else 0.0
-    dtype = np.real(eigvals).dtype
-    eps = np.finfo(dtype).eps if np.issubdtype(dtype, np.floating) else np.finfo(np.float64).eps
-    tol = max(10.0 * eps * max(v_charge_spin.shape) * max(max_eval, 1.0), 0.0)
-    min_eval = float(np.min(np.real(eigvals))) if eigvals.size else 0.0
-    if min_eval < -tol:
-        raise ValueError(
-            "Full charge/spin interaction matrix has a negative eigenvalue below numerical "
-            f"tolerance: min={min_eval:g}, tol={tol:g}."
-        )
-
-    keep = np.real(eigvals) > tol
-    eigvals_keep = np.real(eigvals[keep])
-    eigvecs_keep = eigvecs[:, keep]
-    cs_factors = (np.sqrt(eigvals_keep)[:, None] * eigvecs_keep.T).astype(
-        np.result_type(chol.dtype, eigvecs.dtype, eigvals_keep.dtype),
-        copy=False,
-    )
+    cs_factors, pivots = _pivoted_cholesky_hermitian(v_charge_spin)
+    cs_factors = cs_factors.astype(np.result_type(chol.dtype, cs_factors.dtype), copy=False)
+    pivot_channels = tuple("charge" if pivot < n2 else "spin" for pivot in pivots)
 
     l0_new = cs_factors[:, :n2].reshape(-1, norb, norb)
     lz_new = cs_factors[:, n2:].reshape(-1, norb, norb)
-    return np.stack([l0_new, lz_new], axis=1)
+    return ChargeSpinFactorization(
+        chol=np.stack([l0_new, lz_new], axis=1),
+        pivot_channels=pivot_channels,
+    )
+
+
+def _factorize_charge_spin_cholesky_full(spin_chol: Array) -> Array:
+    return _factorize_charge_spin_cholesky_full_with_pivots(spin_chol).chol
 
 
 def _spin_cholesky_to_charge_spin(spin_chol: Array) -> Array:
@@ -400,25 +432,25 @@ def _spin_cholesky_to_charge_spin(spin_chol: Array) -> Array:
 def charge_spin_field_summary(
     chol: Array,
     *,
-    dominance_threshold: float = 0.9,
+    pivot_channels: Tuple[str, ...] | None = None,
     zero_tol: float | None = None,
 ) -> Dict[str, Any]:
     """
-    Count charge-dominant, spin-dominant, mixed, and near-zero charge/spin fields.
+    Summarize charge-spin fields and, when available, their pivot channels.
 
     ``chol`` must use the charge-spin convention ``(n_fields, 2, norb, norb)``,
-    where axis 1 is ``(charge, spin)``.  A field is charge-dominant when
-    ``||L_c||^2 / (||L_c||^2 + ||L_s||^2) >= dominance_threshold`` and
-    spin-dominant by the analogous spin criterion.
+    where axis 1 is ``(charge, spin)``.  If ``pivot_channels`` is supplied, it
+    must contain one ``"charge"`` or ``"spin"`` entry per field.
     """
     arr = np.asarray(chol)
     if arr.ndim != 4 or arr.shape[1] != 2:
         raise ValueError(
             f"charge-spin chol must have shape (n_fields, 2, norb, norb), got {arr.shape}"
         )
-    if not 0.5 <= dominance_threshold <= 1.0:
+    if pivot_channels is not None and len(pivot_channels) != arr.shape[0]:
         raise ValueError(
-            f"dominance_threshold must be between 0.5 and 1.0, got {dominance_threshold!r}."
+            f"Expected one pivot channel per field, got {len(pivot_channels)} channels "
+            f"for {arr.shape[0]} fields."
         )
 
     charge_norm2 = np.sum(np.abs(arr[:, 0]) ** 2, axis=(1, 2))
@@ -429,43 +461,36 @@ def charge_spin_field_summary(
         zero_tol = 100.0 * np.finfo(np.asarray(total_norm2).dtype).eps * max(max_norm2, 1.0)
 
     nonzero = total_norm2 > float(zero_tol)
-    charge_fraction = np.divide(
-        charge_norm2,
-        total_norm2,
-        out=np.zeros_like(total_norm2, dtype=np.result_type(total_norm2, np.float64)),
-        where=nonzero,
-    )
-    spin_fraction = np.divide(
-        spin_norm2,
-        total_norm2,
-        out=np.zeros_like(total_norm2, dtype=np.result_type(total_norm2, np.float64)),
-        where=nonzero,
-    )
 
-    charge_mask = nonzero & (charge_fraction >= dominance_threshold)
-    spin_mask = nonzero & (spin_fraction >= dominance_threshold)
-    mixed_mask = nonzero & ~(charge_mask | spin_mask)
-    zero_mask = ~nonzero
-
-    return {
+    summary: Dict[str, Any] = {
         "n_fields": int(arr.shape[0]),
-        "n_charge": int(np.count_nonzero(charge_mask)),
-        "n_spin": int(np.count_nonzero(spin_mask)),
-        "n_mixed": int(np.count_nonzero(mixed_mask)),
-        "n_zero": int(np.count_nonzero(zero_mask)),
-        "dominance_threshold": float(dominance_threshold),
+        "n_zero": int(np.count_nonzero(~nonzero)),
         "zero_tol": float(zero_tol),
         "charge_norm2_sum": float(np.sum(charge_norm2)),
         "spin_norm2_sum": float(np.sum(spin_norm2)),
     }
+    if pivot_channels is not None:
+        channels = tuple(str(channel) for channel in pivot_channels)
+        unknown = sorted(set(channels) - {"charge", "spin"})
+        if unknown:
+            raise ValueError(f"Unknown charge-spin pivot channels: {unknown}")
+        summary.update(
+            {
+                "n_charge_pivots": int(sum(channel == "charge" for channel in channels)),
+                "n_spin_pivots": int(sum(channel == "spin" for channel in channels)),
+                "pivot_channels": channels,
+            }
+        )
+    return summary
 
 
 def _format_charge_spin_field_summary(summary: Dict[str, Any]) -> str:
-    return (
-        f"fields charge={summary['n_charge']} spin={summary['n_spin']} "
-        f"mixed={summary['n_mixed']} zero={summary['n_zero']} "
-        f"threshold={summary['dominance_threshold']:.2f}"
-    )
+    if "n_charge_pivots" in summary:
+        return (
+            f"fields charge_pivots={summary['n_charge_pivots']} "
+            f"spin_pivots={summary['n_spin_pivots']} zero={summary['n_zero']}"
+        )
+    return f"fields n={summary['n_fields']} zero={summary['n_zero']} pivots=unavailable"
 
 
 def _stage_frozen(frozen: int | ArrayLike | None) -> int | NDArray | None:
@@ -544,6 +569,12 @@ def _load_frozen(group: h5py.Group, *, attr_name: str = "frozen") -> int | NDArr
 
 
 @dataclass(frozen=True, slots=True)
+class ChargeSpinFactorization:
+    chol: Array
+    pivot_channels: Tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class HamInput:
     """ham inputs in the chosen orthonormal one particle basis"""
 
@@ -556,6 +587,7 @@ class HamInput:
     frozen: int | NDArray
     source_kind: str  # "mf" or "cc"
     basis: HamBasis  # "restricted", "generalized", or "charge_spin"
+    field_metadata: Dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -894,7 +926,7 @@ def stage(
             hamiltonian_decomposition=hamiltonian_decomposition,
         )
         if ham.basis == "charge_spin":
-            charge_spin_summary = charge_spin_field_summary(ham.chol)
+            charge_spin_summary = ham.field_metadata or charge_spin_field_summary(ham.chol)
             ham_details = (
                 f"norb={ham.norb} nchol={ham.chol.shape[0]} | "
                 f"{_format_charge_spin_field_summary(charge_spin_summary)}"
@@ -907,7 +939,7 @@ def stage(
             details=ham_details,
         )
     elif ham.basis == "charge_spin":
-        charge_spin_summary = charge_spin_field_summary(ham.chol)
+        charge_spin_summary = ham.field_metadata or charge_spin_field_summary(ham.chol)
 
     if trial is None:
         t_trial = _stage_begin("building trial input")
@@ -1061,6 +1093,7 @@ def _stage_ham_input(
     # full space electron count
     nelec: Tuple[int, int] = (int(mol.nelec[0]), int(mol.nelec[1]))
     norb_frozen = scf_obj.afqmc_frozen
+    field_metadata: Dict[str, Any] | None = None
 
     assert isinstance(norb_frozen, int)
 
@@ -1086,9 +1119,15 @@ def _stage_ham_input(
             axis=1,
         )
         if hamiltonian_decomposition == "charge_spin":
-            chol = _factorize_charge_spin_cholesky_full(spin_chol)
+            factorization = _factorize_charge_spin_cholesky_full_with_pivots(spin_chol)
+            chol = factorization.chol
+            field_metadata = charge_spin_field_summary(
+                chol,
+                pivot_channels=factorization.pivot_channels,
+            )
         else:
             chol = _spin_cholesky_to_charge_spin(spin_chol)
+            field_metadata = charge_spin_field_summary(chol)
     elif scf_obj.kind != "ghf":
         C = np.asarray(basis_coeff)
         norb = int(basis_coeff.shape[1])
@@ -1138,6 +1177,7 @@ def _stage_ham_input(
         frozen=norb_frozen,
         source_kind=obj.source,
         basis=ham_basis,
+        field_metadata=field_metadata,
     )
 
 
@@ -1245,6 +1285,7 @@ def _stage_ham_input_from_fcidump(
             "Use stage_from_ccpy(..., fcidump=...) which falls back to the existing MF frozen-core path."
         )
 
+    field_metadata: Dict[str, Any] | None = None
     t0 = time.time()
     if hamiltonian_decomposition.startswith("charge_spin"):
         eri_s4 = ao2mo.restore(4, np.asarray(eri_ao), norb)
@@ -1259,9 +1300,15 @@ def _stage_ham_input_from_fcidump(
             axis=1,
         )
         if hamiltonian_decomposition == "charge_spin":
-            chol = _factorize_charge_spin_cholesky_full(spin_chol)
+            factorization = _factorize_charge_spin_cholesky_full_with_pivots(spin_chol)
+            chol = factorization.chol
+            field_metadata = charge_spin_field_summary(
+                chol,
+                pivot_channels=factorization.pivot_channels,
+            )
         else:
             chol = _spin_cholesky_to_charge_spin(spin_chol)
+            field_metadata = charge_spin_field_summary(chol)
         ham_basis = "charge_spin"
     else:
         assert not isinstance(basis_coeff, tuple)
@@ -1290,6 +1337,7 @@ def _stage_ham_input_from_fcidump(
         frozen=norb_frozen,
         source_kind=obj.source,
         basis=ham_basis,
+        field_metadata=field_metadata,
     )
 
 
@@ -1653,9 +1701,19 @@ def _load_h5(path: Path) -> StagedInputs:
             frozen=_load_frozen(gham),
             source_kind=str(gham.attrs["source_kind"]),
             basis=cast(HamBasis, str(gham.attrs["basis"])),
+            field_metadata=meta.get("charge_spin_fields"),
         )
+        if ham.basis == "charge_spin" and ham.field_metadata is not None:
+            ham_details = (
+                f"norb={ham.norb} nchol={ham.chol.shape[0]} | "
+                f"{_format_charge_spin_field_summary(ham.field_metadata)}"
+            )
+        else:
+            ham_details = f"norb={ham.norb} nchol={ham.chol.shape[0]}"
         _stage_end(
-            t_ham, "Hamiltonian loaded", details=f"norb={ham.norb} nchol={ham.chol.shape[0]}"
+            t_ham,
+            "Hamiltonian loaded",
+            details=ham_details,
         )
 
         t_trial = _stage_begin("reading trial input from cache")

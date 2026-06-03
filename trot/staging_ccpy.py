@@ -477,7 +477,7 @@ def stage_from_ccpy(
         )
     charge_spin_summary: Dict[str, Any] | None = None
     if ham.basis == "charge_spin":
-        charge_spin_summary = charge_spin_field_summary(ham.chol)
+        charge_spin_summary = ham.field_metadata or charge_spin_field_summary(ham.chol)
         ham_details = (
             f"norb={ham.norb} nchol={ham.chol.shape[0]} | "
             f"{_format_charge_spin_field_summary(charge_spin_summary)}"
