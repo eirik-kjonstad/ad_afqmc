@@ -1452,6 +1452,7 @@ def stage_from_ccpy(
     cache: Union[str, Path] | None = None,
     overwrite: bool = False,
     verbose: bool = False,
+    hamiltonian_decomposition: str = "standard",
 ) -> StagedInputs:
     from .staging_ccpy import stage_from_ccpy as _impl
 
@@ -1466,6 +1467,7 @@ def stage_from_ccpy(
         cache=cache,
         overwrite=overwrite,
         verbose=verbose,
+        hamiltonian_decomposition=hamiltonian_decomposition,
     )
 
 

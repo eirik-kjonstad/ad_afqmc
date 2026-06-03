@@ -286,46 +286,70 @@ def _ccpy_t_to_c_amplitudes(driver: Any, order: int, order_cc: int) -> dict:
     return amps
 
 
-def _stage_ucisd_input_from_ccpy(driver: Any, staged_mf: Any, order_cc: int) -> TrialInput:
-    amps = _ccpy_t_to_c_amplitudes(driver, order=2, order_cc=order_cc)
-
+def _stage_spin_mo_coeffs_from_ccpy_mf(
+    staged_mf: Any,
+    *,
+    hamiltonian_decomposition: str,
+) -> tuple[NDArray, NDArray]:
     mol = staged_mf.mol
     S = staged_mf.get_ovlp(mol)
     frozen = staged_mf.afqmc_frozen
     Ca = np.asarray(staged_mf.mo_coeff[0])
     Cb = np.asarray(staged_mf.mo_coeff[1])
     moa = _mf_coeff_helper(Ca, Ca, S, frozen)
-    mob = _mf_coeff_helper(Ca, Cb, S, frozen)
+    if hamiltonian_decomposition.startswith("charge_spin"):
+        mob = _mf_coeff_helper(Cb, Cb, S, frozen)
+    else:
+        mob = _mf_coeff_helper(Ca, Cb, S, frozen)
+    return np.asarray(moa), np.asarray(mob)
+
+
+def _stage_ucisd_input_from_ccpy(
+    driver: Any,
+    staged_mf: Any,
+    order_cc: int,
+    *,
+    hamiltonian_decomposition: str = "standard",
+) -> TrialInput:
+    amps = _ccpy_t_to_c_amplitudes(driver, order=2, order_cc=order_cc)
+    moa, mob = _stage_spin_mo_coeffs_from_ccpy_mf(
+        staged_mf,
+        hamiltonian_decomposition=hamiltonian_decomposition,
+    )
 
     data = {"mo_coeff_a": np.asarray(moa), "mo_coeff_b": np.asarray(mob), **amps}
     return TrialInput(kind="ucisd", data=data, frozen=staged_mf.trial_frozen, source_kind="cc")
 
 
-def _stage_ucisdt_input_from_ccpy(driver: Any, staged_mf: Any, order_cc: int) -> TrialInput:
+def _stage_ucisdt_input_from_ccpy(
+    driver: Any,
+    staged_mf: Any,
+    order_cc: int,
+    *,
+    hamiltonian_decomposition: str = "standard",
+) -> TrialInput:
     amps = _ccpy_t_to_c_amplitudes(driver, order=3, order_cc=order_cc)
-
-    mol = staged_mf.mol
-    S = staged_mf.get_ovlp(mol)
-    frozen = staged_mf.afqmc_frozen
-    Ca = np.asarray(staged_mf.mo_coeff[0])
-    Cb = np.asarray(staged_mf.mo_coeff[1])
-    moa = _mf_coeff_helper(Ca, Ca, S, frozen)
-    mob = _mf_coeff_helper(Ca, Cb, S, frozen)
+    moa, mob = _stage_spin_mo_coeffs_from_ccpy_mf(
+        staged_mf,
+        hamiltonian_decomposition=hamiltonian_decomposition,
+    )
 
     data = {"mo_coeff_a": np.asarray(moa), "mo_coeff_b": np.asarray(mob), **amps}
     return TrialInput(kind="ucisdt", data=data, frozen=staged_mf.trial_frozen, source_kind="cc")
 
 
-def _stage_ucisdtq_input_from_ccpy(driver: Any, staged_mf: Any, order_cc: int) -> TrialInput:
+def _stage_ucisdtq_input_from_ccpy(
+    driver: Any,
+    staged_mf: Any,
+    order_cc: int,
+    *,
+    hamiltonian_decomposition: str = "standard",
+) -> TrialInput:
     amps = _ccpy_t_to_c_amplitudes(driver, order=4, order_cc=order_cc)
-
-    mol = staged_mf.mol
-    S = staged_mf.get_ovlp(mol)
-    frozen = staged_mf.afqmc_frozen
-    Ca = np.asarray(staged_mf.mo_coeff[0])
-    Cb = np.asarray(staged_mf.mo_coeff[1])
-    moa = _mf_coeff_helper(Ca, Ca, S, frozen)
-    mob = _mf_coeff_helper(Ca, Cb, S, frozen)
+    moa, mob = _stage_spin_mo_coeffs_from_ccpy_mf(
+        staged_mf,
+        hamiltonian_decomposition=hamiltonian_decomposition,
+    )
 
     data = {"mo_coeff_a": np.asarray(moa), "mo_coeff_b": np.asarray(mob), **amps}
     return TrialInput(kind="ucisdtq", data=data, frozen=staged_mf.trial_frozen, source_kind="cc")
@@ -343,6 +367,7 @@ def stage_from_ccpy(
     cache: Union[str, Path] | None = None,
     overwrite: bool = False,
     verbose: bool = False,
+    hamiltonian_decomposition: str = "standard",
 ) -> StagedInputs:
     """
     Stage AFQMC inputs from a ccpy driver and a PySCF UHF mf object.
@@ -371,14 +396,35 @@ def stage_from_ccpy(
             If True, recompute even when cache exists.
         verbose:
             Print timing/info.
+        hamiltonian_decomposition:
+            ``"standard"`` keeps the existing Hamiltonian basis convention. ``"charge_spin"``
+            stages the UHF charge/spin HS experiment by factorizing the full charge/spin
+            matrix. ``"charge_spin_cholesky"`` uses the AO-Cholesky-induced charge/spin
+            factors directly. Charge-spin modes use MF-based Hamiltonian staging even if
+            ``fcidump`` is provided, because FCIDUMP does not carry the separate UHF orbital
+            rotations needed here.
 
     Returns:
         StagedInputs with HamInput and TrialInput
         (kind='ucisd', 'ucisdt', or 'ucisdtq'), and metadata.
     """
     cache_path = Path(cache).expanduser().resolve() if cache is not None else None
+    if hamiltonian_decomposition not in ("standard", "charge_spin", "charge_spin_cholesky"):
+        raise ValueError(
+            "hamiltonian_decomposition must be 'standard', 'charge_spin', or "
+            f"'charge_spin_cholesky', got {hamiltonian_decomposition!r}."
+        )
+
     if cache_path is not None and cache_path.exists() and not overwrite:
-        return load(cache_path)
+        staged_cached = load(cache_path)
+        cached_decomposition = staged_cached.meta.get("hamiltonian_decomposition", "standard")
+        if cached_decomposition != hamiltonian_decomposition:
+            raise ValueError(
+                f"Cache {cache_path} was staged with hamiltonian_decomposition="
+                f"{cached_decomposition!r}, but {hamiltonian_decomposition!r} was requested. "
+                "Use overwrite=True or a different cache path."
+            )
+        return staged_cached
 
     t0 = time.time()
 
@@ -396,7 +442,11 @@ def stage_from_ccpy(
 
     t_ham = _stage_begin("building Hamiltonian")
     ham_source = "mf"
-    if fcidump is not None and int(obj.afqmc_frozen) == 0:
+    if (
+        fcidump is not None
+        and int(obj.afqmc_frozen) == 0
+        and not hamiltonian_decomposition.startswith("charge_spin")
+    ):
         ham = _stage_ham_input_from_fcidump(
             obj, fcidump=fcidump, chol_cut=chol_cut, verbose=verbose
         )
@@ -407,16 +457,41 @@ def stage_from_ccpy(
                 "[stage] FCIDUMP + norb_frozen>0 requested; "
                 "using existing MF frozen-core Hamiltonian staging."
             )
-        ham = _stage_ham_input(obj, chol_cut=chol_cut, verbose=verbose)
+        elif fcidump is not None and hamiltonian_decomposition.startswith("charge_spin") and verbose:
+            print(
+                "[stage] FCIDUMP + charge_spin requested; "
+                "using MF-based charge/spin Hamiltonian staging."
+            )
+        ham = _stage_ham_input(
+            obj,
+            chol_cut=chol_cut,
+            verbose=verbose,
+            hamiltonian_decomposition=hamiltonian_decomposition,
+        )
     _stage_end(t_ham, "Hamiltonian ready", details=f"norb={ham.norb} nchol={ham.chol.shape[0]}")
 
     t_trial = _stage_begin("building trial input")
     if order <= 2:
-        trial = _stage_ucisd_input_from_ccpy(driver, staged_mf, order_cc)
+        trial = _stage_ucisd_input_from_ccpy(
+            driver,
+            staged_mf,
+            order_cc,
+            hamiltonian_decomposition=hamiltonian_decomposition,
+        )
     elif order == 3:
-        trial = _stage_ucisdt_input_from_ccpy(driver, staged_mf, order_cc)
+        trial = _stage_ucisdt_input_from_ccpy(
+            driver,
+            staged_mf,
+            order_cc,
+            hamiltonian_decomposition=hamiltonian_decomposition,
+        )
     else:
-        trial = _stage_ucisdtq_input_from_ccpy(driver, staged_mf, order_cc)
+        trial = _stage_ucisdtq_input_from_ccpy(
+            driver,
+            staged_mf,
+            order_cc,
+            hamiltonian_decomposition=hamiltonian_decomposition,
+        )
     _stage_end(t_trial, "trial input ready", details=f"kind={trial.kind}")
 
     mol = obj.mol
@@ -427,6 +502,7 @@ def stage_from_ccpy(
         "ccpy_order": order_cc,
         "ci_order": order,
         "ham_source": ham_source,
+        "hamiltonian_decomposition": hamiltonian_decomposition,
         "frozen": _freeze_meta_value(obj.afqmc_frozen),
         "chol_cut": ham.chol_cut,
         "mol": {
