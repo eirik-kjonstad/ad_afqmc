@@ -88,7 +88,14 @@ def _padded_model_length(length: int, mesh: Mesh | None) -> int:
 
 def _make_ham_data(ham: HamInput | HamChol, mesh: Mesh | None, *, compact_chol: bool) -> HamChol:
     chol = ham.chol
+    pivot_channels = getattr(ham, "pivot_channels", None)
+    if pivot_channels is None and getattr(ham, "field_metadata", None) is not None:
+        pivot_channels = ham.field_metadata.get("pivot_channels")
     runtime_n_chol = _padded_model_length(int(chol.shape[0]), mesh)
+    if pivot_channels is not None and len(pivot_channels) < runtime_n_chol:
+        pivot_channels = tuple(pivot_channels) + ("padding",) * (
+            runtime_n_chol - len(pivot_channels)
+        )
     if compact_chol:
         n_chol = int(chol.shape[0])
         if runtime_n_chol != n_chol:
@@ -108,6 +115,7 @@ def _make_ham_data(ham: HamInput | HamChol, mesh: Mesh | None, *, compact_chol: 
             shard_model_axis(chol, mesh),
             basis=ham.basis,
             nchol=runtime_n_chol if compact_chol else None,
+            pivot_channels=pivot_channels,
         )
 
     return HamChol(
@@ -116,6 +124,7 @@ def _make_ham_data(ham: HamInput | HamChol, mesh: Mesh | None, *, compact_chol: 
         jnp.asarray(chol),
         basis=ham.basis,
         nchol=runtime_n_chol,
+        pivot_channels=pivot_channels,
     )
 
 
@@ -355,6 +364,7 @@ def _compact_ham_data_for_runtime(ham_data: Any, meas_ctx: Any) -> Any:
             chol=compact_chol,
             basis=ham_data.basis,
             nchol=ham_data.nchol,
+            pivot_channels=ham_data.pivot_channels,
         )
 
     return ham_data

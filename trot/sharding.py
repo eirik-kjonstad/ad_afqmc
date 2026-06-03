@@ -174,6 +174,7 @@ def shard_ham_data(ham_data: THam, mesh: Mesh | None) -> THam:
                 chol=shard_model_axis(ham_data.chol, mesh),
                 basis=ham_data.basis,
                 nchol=nchol,
+                pivot_channels=ham_data.pivot_channels,
             ),
         )
 
@@ -191,6 +192,11 @@ def shard_prop_state(state: PropState, mesh: Mesh | None) -> PropState:
         return state
 
     walkers_sh = tree_util.tree_map(lambda a: shard_first_axis(a, mesh), state.walkers)
+    diagnostics = (
+        None
+        if state.diagnostics is None
+        else tree_util.tree_map(lambda a: replicate(a, mesh), state.diagnostics)
+    )
 
     return state._replace(
         walkers=walkers_sh,
@@ -200,4 +206,5 @@ def shard_prop_state(state: PropState, mesh: Mesh | None) -> PropState:
         pop_control_ene_shift=replicate(state.pop_control_ene_shift, mesh),
         e_estimate=replicate(state.e_estimate, mesh),
         node_encounters=replicate(state.node_encounters, mesh),
+        diagnostics=diagnostics,
     )

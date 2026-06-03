@@ -83,6 +83,10 @@ def dump_prop_state_npz(
         "e_estimate": np.asarray(jax.device_get(state.e_estimate)),
         "node_encounters": np.asarray(jax.device_get(state.node_encounters)),
     }
+    if state.diagnostics:
+        diagnostics = jax.device_get(state.diagnostics)
+        for key, value in diagnostics.items():
+            arrays[key] = np.asarray(value)
 
     walkers = jax.device_get(state.walkers)
     if isinstance(walkers, tuple):
@@ -118,6 +122,21 @@ def load_prop_state_npz(path: str | Path) -> PropState:
         pop_control_ene_shift=jnp.asarray(data["pop_control_ene_shift"]),
         e_estimate=jnp.asarray(data["e_estimate"]),
         node_encounters=jnp.asarray(data["node_encounters"]),
+        diagnostics={
+            key: jnp.asarray(data[key])
+            for key in data.files
+            if key
+            not in {
+                "weights",
+                "overlaps",
+                "rng_key",
+                "pop_control_ene_shift",
+                "e_estimate",
+                "node_encounters",
+                "walkers",
+            }
+            and not key.startswith("walkers_")
+        },
     )
 
 
@@ -223,9 +242,10 @@ def block(
 
     def _scan_step(carry: PropState, _x: Any):
         carry = step(carry)
-        return carry, None
+        return carry, carry.diagnostics
 
-    state, _ = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
+    state, diagnostics = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
+    state = state._replace(diagnostics=diagnostics)
 
     walkers_new = wk.orthonormalize(state.walkers, sys.walker_kind)
     overlaps_new = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(

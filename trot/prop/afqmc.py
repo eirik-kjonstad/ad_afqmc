@@ -16,6 +16,111 @@ from .chol_afqmc_ops import CholAfqmcCtx, TrotterOps, _build_prop_ctx, make_trot
 from .types import PropOps, PropState, QmcParamsBase
 
 
+def _charge_spin_pivot_masks(ham_data: HamChol) -> tuple[jax.Array, jax.Array] | None:
+    if ham_data.basis != "charge_spin" or ham_data.pivot_channels is None:
+        return None
+    channels = tuple(ham_data.pivot_channels)
+    if "charge" not in channels and "spin" not in channels:
+        return None
+    charge_mask = jnp.asarray([channel == "charge" for channel in channels])
+    spin_mask = jnp.asarray([channel == "spin" for channel in channels])
+    return charge_mask, spin_mask
+
+
+def _empty_charge_spin_pivot_diagnostics(ham_data: HamChol) -> dict[str, jax.Array] | None:
+    masks = _charge_spin_pivot_masks(ham_data)
+    if masks is None:
+        return None
+    zero = jnp.asarray(0.0)
+    return {
+        "force_bias_norm_charge_pivot_mean": zero,
+        "force_bias_norm_charge_pivot_max": zero,
+        "force_bias_norm_spin_pivot_mean": zero,
+        "force_bias_norm_spin_pivot_max": zero,
+        "field_shift_norm_charge_pivot_mean": zero,
+        "field_shift_norm_charge_pivot_max": zero,
+        "field_shift_norm_spin_pivot_mean": zero,
+        "field_shift_norm_spin_pivot_max": zero,
+        "shifted_field_norm_charge_pivot_mean": zero,
+        "shifted_field_norm_charge_pivot_max": zero,
+        "shifted_field_norm_spin_pivot_mean": zero,
+        "shifted_field_norm_spin_pivot_max": zero,
+        "field_phase_abs_charge_pivot_mean": zero,
+        "field_phase_abs_charge_pivot_max": zero,
+        "field_phase_abs_spin_pivot_mean": zero,
+        "field_phase_abs_spin_pivot_max": zero,
+    }
+
+
+def _masked_vector_norm(values: jax.Array, mask: jax.Array) -> jax.Array:
+    masked = jnp.where(mask[None, :], values, 0.0)
+    return jnp.sqrt(jnp.sum(jnp.abs(masked) ** 2, axis=1))
+
+
+def _mean_max(values: jax.Array) -> tuple[jax.Array, jax.Array]:
+    return jnp.mean(values), jnp.max(values)
+
+
+def _charge_spin_pivot_diagnostics(
+    ham_data: HamChol,
+    *,
+    force_bias: jax.Array,
+    field_shifts: jax.Array,
+    shifted_fields: jax.Array,
+    mf_shifts: jax.Array,
+    sqrt_dt: jax.Array,
+) -> dict[str, jax.Array] | None:
+    masks = _charge_spin_pivot_masks(ham_data)
+    if masks is None:
+        return None
+    charge_mask, spin_mask = masks
+
+    fb_charge_mean, fb_charge_max = _mean_max(_masked_vector_norm(force_bias, charge_mask))
+    fb_spin_mean, fb_spin_max = _mean_max(_masked_vector_norm(force_bias, spin_mask))
+    shift_charge_mean, shift_charge_max = _mean_max(_masked_vector_norm(field_shifts, charge_mask))
+    shift_spin_mean, shift_spin_max = _mean_max(_masked_vector_norm(field_shifts, spin_mask))
+    shifted_charge_mean, shifted_charge_max = _mean_max(
+        _masked_vector_norm(shifted_fields, charge_mask)
+    )
+    shifted_spin_mean, shifted_spin_max = _mean_max(_masked_vector_norm(shifted_fields, spin_mask))
+
+    charge_phase = jnp.imag(
+        -sqrt_dt
+        * jnp.sum(
+            jnp.where(charge_mask[None, :], shifted_fields, 0.0) * mf_shifts[None, :],
+            axis=1,
+        )
+    )
+    spin_phase = jnp.imag(
+        -sqrt_dt
+        * jnp.sum(
+            jnp.where(spin_mask[None, :], shifted_fields, 0.0) * mf_shifts[None, :],
+            axis=1,
+        )
+    )
+    phase_charge_mean, phase_charge_max = _mean_max(jnp.abs(charge_phase))
+    phase_spin_mean, phase_spin_max = _mean_max(jnp.abs(spin_phase))
+
+    return {
+        "force_bias_norm_charge_pivot_mean": fb_charge_mean,
+        "force_bias_norm_charge_pivot_max": fb_charge_max,
+        "force_bias_norm_spin_pivot_mean": fb_spin_mean,
+        "force_bias_norm_spin_pivot_max": fb_spin_max,
+        "field_shift_norm_charge_pivot_mean": shift_charge_mean,
+        "field_shift_norm_charge_pivot_max": shift_charge_max,
+        "field_shift_norm_spin_pivot_mean": shift_spin_mean,
+        "field_shift_norm_spin_pivot_max": shift_spin_max,
+        "shifted_field_norm_charge_pivot_mean": shifted_charge_mean,
+        "shifted_field_norm_charge_pivot_max": shifted_charge_max,
+        "shifted_field_norm_spin_pivot_mean": shifted_spin_mean,
+        "shifted_field_norm_spin_pivot_max": shifted_spin_max,
+        "field_phase_abs_charge_pivot_mean": phase_charge_mean,
+        "field_phase_abs_charge_pivot_max": phase_charge_max,
+        "field_phase_abs_spin_pivot_mean": phase_spin_mean,
+        "field_phase_abs_spin_pivot_max": phase_spin_max,
+    }
+
+
 def init_prop_state(
     *,
     sys: System,
@@ -63,6 +168,7 @@ def init_prop_state(
     pop_shift = e_est
 
     node_encounters = jnp.asarray(0)
+    diagnostics = _empty_charge_spin_pivot_diagnostics(ham_data)
 
     state = PropState(
         walkers=initial_walkers,
@@ -72,6 +178,7 @@ def init_prop_state(
         pop_control_ene_shift=pop_shift,
         e_estimate=e_est,
         node_encounters=node_encounters,
+        diagnostics=diagnostics,
     )
     return shard_prop_state(state, mesh)
 
@@ -98,6 +205,14 @@ def afqmc_step(
     )(state.walkers, ham_data, meas_ctx, trial_data)
     field_shifts = -prop_ctx.sqrt_dt * (1.0j * force_bias - prop_ctx.mf_shifts)
     shifted_fields = fields - field_shifts
+    diagnostics = _charge_spin_pivot_diagnostics(
+        ham_data,
+        force_bias=force_bias,
+        field_shifts=field_shifts,
+        shifted_fields=shifted_fields,
+        mf_shifts=prop_ctx.mf_shifts,
+        sqrt_dt=prop_ctx.sqrt_dt,
+    )
 
     shift_term = jnp.sum(shifted_fields * prop_ctx.mf_shifts, axis=1)
     fb_term = jnp.sum(fields * field_shifts - 0.5 * field_shifts * field_shifts, axis=1)
@@ -141,6 +256,7 @@ def afqmc_step(
         pop_control_ene_shift=pop_shift_new,
         e_estimate=state.e_estimate,
         node_encounters=node_encounters_new,
+        diagnostics=diagnostics,
     )
 
 

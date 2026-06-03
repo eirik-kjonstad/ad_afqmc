@@ -35,6 +35,7 @@ class HamChol:
     chol: jax.Array
     basis: HamBasis = "restricted"
     nchol: int | None = None
+    pivot_channels: tuple[str, ...] | None = None
 
     def __post_init__(self):
         if self.basis not in ("restricted", "generalized", "charge_spin"):
@@ -49,19 +50,31 @@ class HamChol:
             object.__setattr__(self, "nchol", n_chol_shape)
         elif n_chol_shape not in (0, int(nchol)):
             raise ValueError(f"nchol={nchol} is inconsistent with chol.shape[0]={n_chol_shape}")
+        if self.pivot_channels is not None and len(self.pivot_channels) != int(self.nchol):
+            raise ValueError(
+                f"pivot_channels length {len(self.pivot_channels)} is inconsistent with "
+                f"nchol={self.nchol}"
+            )
 
     def tree_flatten(self):
         children = (self.h0, self.h1, self.chol)
         nchol = self.nchol
         assert nchol is not None
-        aux = (self.basis, int(nchol))
+        aux = (self.basis, int(nchol), self.pivot_channels)
         return children, aux
 
     @classmethod
     def tree_unflatten(cls, aux, children):
         h0, h1, chol = children
-        basis, nchol = aux
-        return cls(h0=h0, h1=h1, chol=chol, basis=basis, nchol=nchol)
+        basis, nchol, pivot_channels = aux
+        return cls(
+            h0=h0,
+            h1=h1,
+            chol=chol,
+            basis=basis,
+            nchol=nchol,
+            pivot_channels=pivot_channels,
+        )
 
 
 def n_fields(ham: HamChol) -> int:
@@ -96,4 +109,15 @@ def slice_ham_level(ham: HamChol, *, norb_keep: int | None, nchol_keep: int | No
         assert ham_nchol is not None
         new_nchol = min(int(ham_nchol), nchol_keep)
 
-    return HamChol(h0=h0, h1=h1, chol=chol, basis=ham.basis, nchol=new_nchol)
+    pivot_channels = ham.pivot_channels
+    if pivot_channels is not None and nchol_keep is not None:
+        pivot_channels = pivot_channels[:new_nchol]
+
+    return HamChol(
+        h0=h0,
+        h1=h1,
+        chol=chol,
+        basis=ham.basis,
+        nchol=new_nchol,
+        pivot_channels=pivot_channels,
+    )
