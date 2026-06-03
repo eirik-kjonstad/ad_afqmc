@@ -298,11 +298,7 @@ def _rotate_chol_to_mo(chol_vec: Array, basis_coeff: Array) -> Array:
     nchol = int(chol_vec.shape[0])
     out_dtype = np.result_type(chol_vec.dtype, C.dtype)
 
-    reuse_storage = nao == norb and out_dtype == chol_vec.dtype
-    if reuse_storage:
-        chol = chol_vec.reshape(nchol, nao, nao)
-    else:
-        chol = np.empty((nchol, norb, norb), dtype=out_dtype)
+    chol = np.empty((nchol, norb, norb), dtype=out_dtype)
 
     Cdag = np.asarray(C.conj().T)
     tmp = np.empty((nao, norb), dtype=out_dtype)
