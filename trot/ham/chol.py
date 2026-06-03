@@ -26,9 +26,8 @@ class HamChol:
     basis="charge_spin":
       h1:   (2, norb, norb)
       chol: (n_fields, 2, norb, norb)
-      spin index 0 is alpha and spin index 1 is beta.  This represents the
-      UHF charge/spin HS factorization in spin-resolved form:
-      L_alpha = L_0 + L_z, L_beta = L_0 - L_z.
+      spin index 0 is charge and spin index 1 is spin:
+      L_alpha = L_c + L_s, L_beta = L_c - L_s.
     """
 
     h0: jax.Array

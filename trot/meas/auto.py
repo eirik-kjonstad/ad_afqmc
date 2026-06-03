@@ -12,6 +12,11 @@ from ..core.ops import MeasOps, TrialOps, k_energy, k_force_bias
 from ..core.system import System
 from ..core.typing import trial_data
 from ..ham.chol import HamChol
+from ..prop.chol_afqmc_ops import (
+    _charge_spin_chol_to_alpha_beta,
+    _charge_spin_h1_to_alpha_beta,
+    _charge_spin_matrix_to_alpha_beta,
+)
 
 
 @tree_util.register_pytree_node_class
@@ -41,13 +46,19 @@ class AutoMeasCtx:
 
 def _v0_from_chol(chol: jax.Array, basis: str = "restricted") -> jax.Array:
     if basis == "charge_spin":
-        return 0.5 * jnp.einsum("gsik,gskj->sij", chol, chol, optimize="optimal")
+        chol_ab = _charge_spin_chol_to_alpha_beta(chol)
+        return 0.5 * jnp.einsum("gsik,gskj->sij", chol_ab, chol_ab, optimize="optimal")
     return 0.5 * jnp.einsum("gik,gjk->ij", chol, chol, optimize="optimal")
 
 
 def build_meas_ctx(ham_data: HamChol, _trial_data: trial_data, eps: float = 1.0e-4) -> AutoMeasCtx:
     v0 = _v0_from_chol(ham_data.chol, ham_data.basis)
-    h1_eff = ham_data.h1 - v0
+    h1 = (
+        _charge_spin_h1_to_alpha_beta(ham_data.h1)
+        if ham_data.basis == "charge_spin"
+        else ham_data.h1
+    )
+    h1_eff = h1 - v0
     return AutoMeasCtx(h1_eff=h1_eff, eps=jnp.asarray(eps))
 
 
@@ -134,7 +145,8 @@ def force_bias_kernel_uw_rh(
 
     def f(x_gamma: jax.Array) -> jax.Array:
         if ham_data.basis == "charge_spin":
-            x_chol = jnp.einsum("gsij,g->sij", chol, x_gamma, optimize="optimal")
+            x_chol_cs = jnp.einsum("gsij,g->sij", chol, x_gamma, optimize="optimal")
+            x_chol = _charge_spin_matrix_to_alpha_beta(x_chol_cs)
             wu1 = wu + x_chol[0] @ wu
             wd1 = wd + x_chol[1] @ wd
         else:
@@ -249,8 +261,9 @@ def energy_kernel_uw_rh(
 
         def body(acc, chol_i):
             if ham_data.basis == "charge_spin":
-                chol_a = chol_i[0]
-                chol_b = chol_i[1]
+                chol_ab = _charge_spin_matrix_to_alpha_beta(chol_i)
+                chol_a = chol_ab[0]
+                chol_b = chol_ab[1]
                 wu1 = wu + x * (chol_a @ wu) + 0.5 * (x * x) * (chol_a @ (chol_a @ wu))
                 wd1 = wd + x * (chol_b @ wd) + 0.5 * (x * x) * (chol_b @ (chol_b @ wd))
             else:

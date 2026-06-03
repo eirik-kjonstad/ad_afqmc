@@ -78,10 +78,27 @@ def _get_dm(rdm1: jax.Array, ham_basis: str) -> jax.Array:
     return dm
 
 
+def _charge_spin_h1_to_alpha_beta(h1: jax.Array) -> jax.Array:
+    return jnp.stack([h1[0] + h1[1], h1[0] - h1[1]], axis=0)
+
+
+def _charge_spin_chol_to_alpha_beta(chol: jax.Array) -> jax.Array:
+    return jnp.stack([chol[:, 0] + chol[:, 1], chol[:, 0] - chol[:, 1]], axis=1)
+
+
+def _charge_spin_matrix_to_alpha_beta(mat: jax.Array) -> jax.Array:
+    return jnp.stack([mat[0] + mat[1], mat[0] - mat[1]], axis=0)
+
+
+def _spin_rdm_to_charge_spin(dm: jax.Array) -> jax.Array:
+    return jnp.stack([dm[0] + dm[1], dm[0] - dm[1]], axis=0)
+
+
 def _mf_shifts(ham_data: HamChol, rdm1: jax.Array) -> jax.Array:
     dm = _get_dm(rdm1, ham_data.basis)
     if ham_data.basis == "charge_spin":
-        return 1.0j * jnp.einsum("gsij,sji->g", ham_data.chol, dm, optimize="optimal")
+        dm_cs = _spin_rdm_to_charge_spin(dm)
+        return 1.0j * jnp.einsum("gsij,sji->g", ham_data.chol, dm_cs, optimize="optimal")
     return 1.0j * jnp.einsum("gij,ji->g", ham_data.chol, dm, optimize="optimal")
 
 
@@ -113,12 +130,14 @@ def _get_h1_eff(ham_data: HamChol, mf: jax.Array) -> jax.Array:
             v1m = jnp.einsum("g,gik->ik", mf_r, ham_data.chol, optimize="optimal")
             h1_eff = ham_data.h1 - v0m - v1m
         case "charge_spin":
+            h1_ab = _charge_spin_h1_to_alpha_beta(ham_data.h1)
+            chol_ab = _charge_spin_chol_to_alpha_beta(ham_data.chol)
             v0m = 0.5 * jnp.einsum(
-                "gsik,gskj->sij", ham_data.chol, ham_data.chol, optimize="optimal"
+                "gsik,gskj->sij", chol_ab, chol_ab, optimize="optimal"
             )
             mf_r = (1.0j * mf).real
-            v1m = jnp.einsum("g,gsik->sik", mf_r, ham_data.chol, optimize="optimal")
-            h1_eff = ham_data.h1 - v0m - v1m
+            v1m = jnp.einsum("g,gsik->sik", mf_r, chol_ab, optimize="optimal")
+            h1_eff = h1_ab - v0m - v1m
         case _:
             raise ValueError(f"Unknown Hamiltonian basis kind: {ham_data.basis}")
 
@@ -289,11 +308,12 @@ def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = F
         )
 
     def make_vhs_charge_spin(field: jax.Array, ctx: CholAfqmcCtx) -> jax.Array:
-        return _make_vhs_spin_split_flat(
+        vhs_cs = _make_vhs_spin_split_flat(
             chol_flat=ctx.chol_flat,
             x=field.astype(vhs_complex_dtype),
             n=ctx.norb,
         )
+        return _charge_spin_matrix_to_alpha_beta(vhs_cs)
 
     if walker_kind not in ("restricted", "unrestricted", "generalized"):
         raise ValueError(f"unknown walker_kind: {walker_kind}")

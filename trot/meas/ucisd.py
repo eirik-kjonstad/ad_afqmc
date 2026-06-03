@@ -9,15 +9,24 @@ from jax import lax, tree_util, vmap
 from ..core.ops import MeasOps, k_energy, k_force_bias
 from ..core.system import System
 from ..ham.chol import HamChol
+from ..prop.chol_afqmc_ops import _charge_spin_chol_to_alpha_beta, _charge_spin_h1_to_alpha_beta
 from ..trial.ucisd import UcisdTrial, overlap_g, overlap_r, overlap_u
 
 
 def _chol_alpha(ham_data: HamChol) -> jax.Array:
-    return ham_data.chol[:, 0] if ham_data.basis == "charge_spin" else ham_data.chol
+    return (
+        _charge_spin_chol_to_alpha_beta(ham_data.chol)[:, 0]
+        if ham_data.basis == "charge_spin"
+        else ham_data.chol
+    )
 
 
 def _h1_alpha(ham_data: HamChol) -> jax.Array:
-    return ham_data.h1[0] if ham_data.basis == "charge_spin" else ham_data.h1
+    return (
+        _charge_spin_h1_to_alpha_beta(ham_data.h1)[0]
+        if ham_data.basis == "charge_spin"
+        else ham_data.h1
+    )
 
 
 def _half_green_from_overlap_matrix(w: jax.Array, ovlp_mat: jax.Array) -> jax.Array:
@@ -1269,8 +1278,8 @@ def build_meas_ctx(
     h1_a = _h1_alpha(ham_data)
     chol_a = _chol_alpha(ham_data)
     if ham_data.basis == "charge_spin":
-        h1_b_src = ham_data.h1[1]
-        chol_b_src = ham_data.chol[:, 1]
+        h1_b_src = _charge_spin_h1_to_alpha_beta(ham_data.h1)[1]
+        chol_b_src = _charge_spin_chol_to_alpha_beta(ham_data.chol)[:, 1]
     else:
         h1_b_src = ham_data.h1
         chol_b_src = ham_data.chol

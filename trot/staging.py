@@ -343,8 +343,8 @@ def _factorize_charge_spin_cholesky_full(spin_chol: Array) -> Array:
     Input is spin-resolved Cholesky factors with shape (nchol, 2, norb, norb),
     where spin 0/1 are alpha/beta.  We build charge/spin factors
     L0=(La+Lb)/2 and Lz=(La-Lb)/2, assemble the full compound-index matrix
-    Vcs[(a,pq),(b,rs)], diagonalize it, and return alpha/beta factors for the
-    resulting HS fields.
+    Vcs[(a,pq),(b,rs)], diagonalize it, and return charge/spin factors for the
+    resulting HS fields.  The returned spin index 0/1 is charge/spin.
     """
     chol = np.asarray(spin_chol)
     if chol.ndim != 4 or chol.shape[1] != 2:
@@ -386,7 +386,15 @@ def _factorize_charge_spin_cholesky_full(spin_chol: Array) -> Array:
 
     l0_new = cs_factors[:, :n2].reshape(-1, norb, norb)
     lz_new = cs_factors[:, n2:].reshape(-1, norb, norb)
-    return np.stack([l0_new + lz_new, l0_new - lz_new], axis=1)
+    return np.stack([l0_new, lz_new], axis=1)
+
+
+def _spin_cholesky_to_charge_spin(spin_chol: Array) -> Array:
+    """Convert alpha/beta Cholesky factors to charge/spin operator factors."""
+    chol = np.asarray(spin_chol)
+    if chol.ndim != 4 or chol.shape[1] != 2:
+        raise ValueError(f"spin_chol must have shape (nchol, 2, norb, norb), got {chol.shape}")
+    return np.stack([0.5 * (chol[:, 0] + chol[:, 1]), 0.5 * (chol[:, 0] - chol[:, 1])], axis=1)
 
 
 def _stage_frozen(frozen: int | ArrayLike | None) -> int | NDArray | None:
@@ -953,13 +961,9 @@ def _stage_ham_input(
             C_alpha, C_beta = basis_coeff
         else:
             C_alpha = C_beta = np.asarray(basis_coeff)
-        h1 = np.stack(
-            [
-                C_alpha.T.conj() @ hcore @ C_alpha,
-                C_beta.T.conj() @ hcore @ C_beta,
-            ],
-            axis=0,
-        )
+        h1_alpha = C_alpha.T.conj() @ hcore @ C_alpha
+        h1_beta = C_beta.T.conj() @ hcore @ C_beta
+        h1 = np.stack([0.5 * (h1_alpha + h1_beta), 0.5 * (h1_alpha - h1_beta)], axis=0)
     else:
         h1 = basis_coeff.T.conj() @ hcore @ basis_coeff
     h1 = np.asarray(h1)
@@ -1000,7 +1004,7 @@ def _stage_ham_input(
         if hamiltonian_decomposition == "charge_spin":
             chol = _factorize_charge_spin_cholesky_full(spin_chol)
         else:
-            chol = spin_chol
+            chol = _spin_cholesky_to_charge_spin(spin_chol)
     elif scf_obj.kind != "ghf":
         C = np.asarray(basis_coeff)
         norb = int(basis_coeff.shape[1])
@@ -1126,13 +1130,9 @@ def _stage_ham_input_from_fcidump(
     if hamiltonian_decomposition.startswith("charge_spin"):
         assert isinstance(basis_coeff, tuple)
         C_alpha, C_beta = basis_coeff
-        h1 = np.stack(
-            [
-                C_alpha.T.conj() @ h1_ao @ C_alpha,
-                C_beta.T.conj() @ h1_ao @ C_beta,
-            ],
-            axis=0,
-        )
+        h1_alpha = C_alpha.T.conj() @ h1_ao @ C_alpha
+        h1_beta = C_beta.T.conj() @ h1_ao @ C_beta
+        h1 = np.stack([0.5 * (h1_alpha + h1_beta), 0.5 * (h1_alpha - h1_beta)], axis=0)
     else:
         assert not isinstance(basis_coeff, tuple)
         h1 = basis_coeff.T.conj() @ h1_ao @ basis_coeff
@@ -1177,7 +1177,7 @@ def _stage_ham_input_from_fcidump(
         if hamiltonian_decomposition == "charge_spin":
             chol = _factorize_charge_spin_cholesky_full(spin_chol)
         else:
-            chol = spin_chol
+            chol = _spin_cholesky_to_charge_spin(spin_chol)
         ham_basis = "charge_spin"
     else:
         assert not isinstance(basis_coeff, tuple)
