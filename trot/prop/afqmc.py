@@ -61,6 +61,16 @@ def _empty_charge_spin_pivot_diagnostics(ham_data: HamChol) -> dict[str, jax.Arr
         "field_phase_abs_charge_pivot_max": zero,
         "field_phase_abs_spin_pivot_mean": zero,
         "field_phase_abs_spin_pivot_max": zero,
+        "spin_pivot_field_shift_cap": zero,
+        "spin_pivot_field_shift_cap_n_applied": zero,
+        "spin_pivot_field_shift_cap_fraction": zero,
+        "spin_pivot_field_shift_cap_scale_min": zero,
+        "spin_pivot_field_shift_cap_excess_mean": zero,
+        "spin_pivot_field_shift_cap_excess_max": zero,
+        "field_shift_uncapped_norm_spin_pivot_mean": zero,
+        "field_shift_uncapped_norm_spin_pivot_max": zero,
+        "field_shift_uncapped_norm_per_pivot_spin_pivot_mean": zero,
+        "field_shift_uncapped_norm_per_pivot_spin_pivot_max": zero,
         "n_floor": zero,
         "n_nonfinite": zero,
         "n_imp_cap": zero,
@@ -87,6 +97,74 @@ def _per_pivot(values: jax.Array, mask: jax.Array) -> jax.Array:
     n_pivots = jnp.sum(mask)
     denom = jnp.sqrt(jnp.asarray(n_pivots, dtype=values.dtype))
     return jnp.where(n_pivots > 0, values / denom, 0.0)
+
+
+def _empty_spin_pivot_field_shift_cap_diagnostics(dtype: Any = jnp.float64) -> dict[str, jax.Array]:
+    zero = jnp.asarray(0.0, dtype=dtype)
+    return {
+        "spin_pivot_field_shift_cap": zero,
+        "spin_pivot_field_shift_cap_n_applied": zero,
+        "spin_pivot_field_shift_cap_fraction": zero,
+        "spin_pivot_field_shift_cap_scale_min": zero,
+        "spin_pivot_field_shift_cap_excess_mean": zero,
+        "spin_pivot_field_shift_cap_excess_max": zero,
+        "field_shift_uncapped_norm_spin_pivot_mean": zero,
+        "field_shift_uncapped_norm_spin_pivot_max": zero,
+        "field_shift_uncapped_norm_per_pivot_spin_pivot_mean": zero,
+        "field_shift_uncapped_norm_per_pivot_spin_pivot_max": zero,
+    }
+
+
+def _cap_spin_pivot_field_shifts(
+    field_shifts: jax.Array,
+    spin_mask: jax.Array,
+    cap: float | None,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    if cap is None or cap <= 0.0:
+        return field_shifts, _empty_spin_pivot_field_shift_cap_diagnostics(field_shifts.real.dtype)
+
+    cap_value = jnp.asarray(cap, dtype=field_shifts.real.dtype)
+    spin_norm = _masked_vector_norm(field_shifts, spin_mask)
+    has_spin_pivots = jnp.sum(spin_mask) > 0
+    over_cap = has_spin_pivots & (spin_norm > cap_value)
+    tiny = jnp.asarray(jnp.finfo(field_shifts.real.dtype).tiny, dtype=field_shifts.real.dtype)
+    scale = jnp.where(over_cap, cap_value / jnp.maximum(spin_norm, tiny), 1.0)
+    capped = jnp.where(
+        spin_mask[None, :],
+        field_shifts * scale[:, None],
+        field_shifts,
+    )
+    n_applied = jnp.asarray(jnp.sum(over_cap), dtype=field_shifts.real.dtype)
+    excess = jnp.where(over_cap, spin_norm - cap_value, 0.0)
+    uncapped_pp = _per_pivot(spin_norm, spin_mask)
+    uncapped_pp_mean, uncapped_pp_max = _mean_max(uncapped_pp)
+    uncapped_mean, uncapped_max = _mean_max(spin_norm)
+    diagnostics = {
+        "spin_pivot_field_shift_cap": cap_value,
+        "spin_pivot_field_shift_cap_n_applied": n_applied,
+        "spin_pivot_field_shift_cap_fraction": n_applied
+        / jnp.asarray(field_shifts.shape[0], dtype=field_shifts.real.dtype),
+        "spin_pivot_field_shift_cap_scale_min": jnp.min(scale),
+        "spin_pivot_field_shift_cap_excess_mean": jnp.mean(excess),
+        "spin_pivot_field_shift_cap_excess_max": jnp.max(excess),
+        "field_shift_uncapped_norm_spin_pivot_mean": uncapped_mean,
+        "field_shift_uncapped_norm_spin_pivot_max": uncapped_max,
+        "field_shift_uncapped_norm_per_pivot_spin_pivot_mean": uncapped_pp_mean,
+        "field_shift_uncapped_norm_per_pivot_spin_pivot_max": uncapped_pp_max,
+    }
+    return capped, diagnostics
+
+
+def _apply_spin_pivot_field_shift_cap(
+    ham_data: HamChol,
+    field_shifts: jax.Array,
+    cap: float | None,
+) -> tuple[jax.Array, dict[str, jax.Array] | None]:
+    masks = _charge_spin_pivot_masks(ham_data)
+    if masks is None:
+        return field_shifts, None
+    _, spin_mask = masks
+    return _cap_spin_pivot_field_shifts(field_shifts, spin_mask, cap)
 
 
 def _charge_spin_pivot_diagnostics(
@@ -284,6 +362,11 @@ def afqmc_step(
         fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
     )(state.walkers, ham_data, meas_ctx, trial_data)
     field_shifts = -prop_ctx.sqrt_dt * (1.0j * force_bias - prop_ctx.mf_shifts)
+    field_shifts, cap_diagnostics = _apply_spin_pivot_field_shift_cap(
+        ham_data,
+        field_shifts,
+        getattr(params, "spin_pivot_field_shift_cap", None),
+    )
     shifted_fields = fields - field_shifts
     diagnostics = _charge_spin_pivot_diagnostics(
         ham_data,
@@ -293,6 +376,8 @@ def afqmc_step(
         mf_shifts=prop_ctx.mf_shifts,
         sqrt_dt=prop_ctx.sqrt_dt,
     )
+    if diagnostics is not None and cap_diagnostics is not None:
+        diagnostics = {**diagnostics, **cap_diagnostics}
 
     shift_term = jnp.sum(shifted_fields * prop_ctx.mf_shifts, axis=1)
     fb_term = jnp.sum(fields * field_shifts - 0.5 * field_shifts * field_shifts, axis=1)

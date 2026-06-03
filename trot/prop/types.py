@@ -46,6 +46,7 @@ class QmcParams(QmcParamsBase):
     weight_cap: float = 100.0
     shift_ema: float = 0.1
     n_eql_blocks: int = 20
+    spin_pivot_field_shift_cap: float | None = None
 
 
 @dataclass(frozen=True)

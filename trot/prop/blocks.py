@@ -21,6 +21,8 @@ DIAGNOSTIC_PREFIXES = (
     "field_shift_norm_",
     "shifted_field_norm_",
     "field_phase_abs_",
+    "spin_pivot_field_shift_cap",
+    "field_shift_uncapped_norm_",
     "n_floor",
     "n_nonfinite",
     "n_imp_cap",
