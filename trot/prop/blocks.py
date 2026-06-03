@@ -21,6 +21,13 @@ DIAGNOSTIC_PREFIXES = (
     "field_shift_norm_",
     "shifted_field_norm_",
     "field_phase_abs_",
+    "n_floor",
+    "n_nonfinite",
+    "n_imp_cap",
+    "n_weight_cap",
+    "n_node_encounters",
+    "abs_ratio_",
+    "imp_raw_",
 )
 
 

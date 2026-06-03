@@ -11,25 +11,71 @@ DIAGNOSTIC_KEYS = (
     "force_bias_norm_charge_pivot_max",
     "force_bias_norm_spin_pivot_mean",
     "force_bias_norm_spin_pivot_max",
+    "force_bias_norm_per_pivot_charge_pivot_mean",
+    "force_bias_norm_per_pivot_charge_pivot_max",
+    "force_bias_norm_per_pivot_spin_pivot_mean",
+    "force_bias_norm_per_pivot_spin_pivot_max",
     "field_shift_norm_charge_pivot_mean",
     "field_shift_norm_charge_pivot_max",
     "field_shift_norm_spin_pivot_mean",
     "field_shift_norm_spin_pivot_max",
+    "field_shift_norm_per_pivot_charge_pivot_mean",
+    "field_shift_norm_per_pivot_charge_pivot_max",
+    "field_shift_norm_per_pivot_spin_pivot_mean",
+    "field_shift_norm_per_pivot_spin_pivot_max",
     "shifted_field_norm_charge_pivot_mean",
     "shifted_field_norm_charge_pivot_max",
     "shifted_field_norm_spin_pivot_mean",
     "shifted_field_norm_spin_pivot_max",
+    "shifted_field_norm_per_pivot_charge_pivot_mean",
+    "shifted_field_norm_per_pivot_charge_pivot_max",
+    "shifted_field_norm_per_pivot_spin_pivot_mean",
+    "shifted_field_norm_per_pivot_spin_pivot_max",
     "field_phase_abs_charge_pivot_mean",
     "field_phase_abs_charge_pivot_max",
     "field_phase_abs_spin_pivot_mean",
     "field_phase_abs_spin_pivot_max",
+    "n_floor",
+    "n_nonfinite",
+    "n_imp_cap",
+    "n_weight_cap",
+    "n_node_encounters",
+    "abs_ratio_mean",
+    "abs_ratio_max",
+    "imp_raw_mean",
+    "imp_raw_min",
+    "imp_raw_max",
 )
 
 PAIR_PREFIXES = (
     "force_bias_norm",
+    "force_bias_norm_per_pivot",
     "field_shift_norm",
+    "field_shift_norm_per_pivot",
     "shifted_field_norm",
+    "shifted_field_norm_per_pivot",
     "field_phase_abs",
+)
+
+EVENT_KEYS = (
+    "n_floor",
+    "n_nonfinite",
+    "n_imp_cap",
+    "n_weight_cap",
+    "n_node_encounters",
+)
+
+CONTEXT_KEYS = EVENT_KEYS + (
+    "abs_ratio_mean",
+    "abs_ratio_max",
+    "imp_raw_mean",
+    "imp_raw_min",
+    "imp_raw_max",
+)
+
+OUTLIER_KEYS = (
+    "force_bias_norm_spin_pivot_max",
+    "field_shift_norm_spin_pivot_max",
 )
 
 
@@ -72,7 +118,7 @@ def _safe_ratio(num: np.ndarray, den: np.ndarray) -> np.ndarray:
     return np.divide(num, den, out=np.full_like(num, np.nan, dtype=float), where=den != 0.0)
 
 
-def _write_csv(data: dict[str, np.ndarray], out_path: Path) -> None:
+def _write_csv(data: dict[str, np.ndarray], out_path: Path, *, top: int) -> None:
     rows = []
     for key in sorted(data):
         row = {"metric": key, **_stats(data[key])}
@@ -85,6 +131,21 @@ def _write_csv(data: dict[str, np.ndarray], out_path: Path) -> None:
             if c_key in data and s_key in data:
                 ratio_key = f"{prefix}_spin_over_charge_{suffix}"
                 rows.append({"metric": ratio_key, **_stats(_safe_ratio(data[s_key], data[c_key]))})
+
+    for outlier_key in OUTLIER_KEYS:
+        if outlier_key not in data:
+            continue
+        idx = _finite_top_indices(np.asarray(data[outlier_key], dtype=float), top)
+        if idx.size == 0:
+            continue
+        for key in CONTEXT_KEYS:
+            if key in data:
+                rows.append(
+                    {
+                        "metric": f"outlier_context/{outlier_key}/{key}",
+                        **_stats(np.asarray(data[key], dtype=float)[idx]),
+                    }
+                )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="") as f:
@@ -114,6 +175,8 @@ def _print_report(data: dict[str, np.ndarray], top: int) -> None:
             f"spin/charge_p95={r_stats['p95']:.6g}"
         )
 
+    _print_outlier_context(data, top=top)
+
     score_key = "field_phase_abs_spin_pivot_max"
     if score_key in data:
         scores = np.asarray(data[score_key])
@@ -123,6 +186,45 @@ def _print_report(data: dict[str, np.ndarray], top: int) -> None:
             print(f"Top {min(top, order.size)} spin-pivot phase steps:")
             for idx in order:
                 print(f"  step={idx} {score_key}={scores[idx]:.6g}")
+
+
+def _finite_top_indices(values: np.ndarray, top: int) -> np.ndarray:
+    if top <= 0:
+        return np.zeros((0,), dtype=int)
+    finite_idx = np.flatnonzero(np.isfinite(values))
+    if finite_idx.size == 0:
+        return np.zeros((0,), dtype=int)
+    return finite_idx[np.argsort(values[finite_idx])[-top:]][::-1]
+
+
+def _print_outlier_context(data: dict[str, np.ndarray], top: int) -> None:
+    for outlier_key in OUTLIER_KEYS:
+        if outlier_key not in data:
+            continue
+        scores = np.asarray(data[outlier_key], dtype=float)
+        idx = _finite_top_indices(scores, top)
+        if idx.size == 0:
+            continue
+
+        print(f"Top {idx.size} {outlier_key} outlier context:")
+        print(f"  outlier steps: {', '.join(str(int(i)) for i in idx)}")
+        for key in CONTEXT_KEYS:
+            if key not in data:
+                continue
+            values = np.asarray(data[key], dtype=float)
+            out_values = values[idx]
+            all_stats = _stats(values)
+            out_stats = _stats(out_values)
+            if key in EVENT_KEYS:
+                print(
+                    f"  {key}: outlier_sum={np.nansum(out_values):.6g} "
+                    f"outlier_mean={out_stats['mean']:.6g} all_mean={all_stats['mean']:.6g}"
+                )
+            else:
+                print(
+                    f"  {key}: outlier_mean={out_stats['mean']:.6g} "
+                    f"outlier_max={out_stats['max']:.6g} all_mean={all_stats['mean']:.6g}"
+                )
 
 
 def main() -> None:
@@ -141,7 +243,7 @@ def main() -> None:
     _print_report(data, top=max(args.top, 0))
 
     if args.out is not None:
-        _write_csv(data, args.out)
+        _write_csv(data, args.out, top=max(args.top, 0))
         print(f"Wrote {args.out}")
 
 

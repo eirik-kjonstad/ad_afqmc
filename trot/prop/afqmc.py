@@ -37,18 +37,40 @@ def _empty_charge_spin_pivot_diagnostics(ham_data: HamChol) -> dict[str, jax.Arr
         "force_bias_norm_charge_pivot_max": zero,
         "force_bias_norm_spin_pivot_mean": zero,
         "force_bias_norm_spin_pivot_max": zero,
+        "force_bias_norm_per_pivot_charge_pivot_mean": zero,
+        "force_bias_norm_per_pivot_charge_pivot_max": zero,
+        "force_bias_norm_per_pivot_spin_pivot_mean": zero,
+        "force_bias_norm_per_pivot_spin_pivot_max": zero,
         "field_shift_norm_charge_pivot_mean": zero,
         "field_shift_norm_charge_pivot_max": zero,
         "field_shift_norm_spin_pivot_mean": zero,
         "field_shift_norm_spin_pivot_max": zero,
+        "field_shift_norm_per_pivot_charge_pivot_mean": zero,
+        "field_shift_norm_per_pivot_charge_pivot_max": zero,
+        "field_shift_norm_per_pivot_spin_pivot_mean": zero,
+        "field_shift_norm_per_pivot_spin_pivot_max": zero,
         "shifted_field_norm_charge_pivot_mean": zero,
         "shifted_field_norm_charge_pivot_max": zero,
         "shifted_field_norm_spin_pivot_mean": zero,
         "shifted_field_norm_spin_pivot_max": zero,
+        "shifted_field_norm_per_pivot_charge_pivot_mean": zero,
+        "shifted_field_norm_per_pivot_charge_pivot_max": zero,
+        "shifted_field_norm_per_pivot_spin_pivot_mean": zero,
+        "shifted_field_norm_per_pivot_spin_pivot_max": zero,
         "field_phase_abs_charge_pivot_mean": zero,
         "field_phase_abs_charge_pivot_max": zero,
         "field_phase_abs_spin_pivot_mean": zero,
         "field_phase_abs_spin_pivot_max": zero,
+        "n_floor": zero,
+        "n_nonfinite": zero,
+        "n_imp_cap": zero,
+        "n_weight_cap": zero,
+        "n_node_encounters": zero,
+        "abs_ratio_mean": zero,
+        "abs_ratio_max": zero,
+        "imp_raw_mean": zero,
+        "imp_raw_min": zero,
+        "imp_raw_max": zero,
     }
 
 
@@ -59,6 +81,12 @@ def _masked_vector_norm(values: jax.Array, mask: jax.Array) -> jax.Array:
 
 def _mean_max(values: jax.Array) -> tuple[jax.Array, jax.Array]:
     return jnp.mean(values), jnp.max(values)
+
+
+def _per_pivot(values: jax.Array, mask: jax.Array) -> jax.Array:
+    n_pivots = jnp.sum(mask)
+    denom = jnp.sqrt(jnp.asarray(n_pivots, dtype=values.dtype))
+    return jnp.where(n_pivots > 0, values / denom, 0.0)
 
 
 def _charge_spin_pivot_diagnostics(
@@ -75,14 +103,27 @@ def _charge_spin_pivot_diagnostics(
         return None
     charge_mask, spin_mask = masks
 
-    fb_charge_mean, fb_charge_max = _mean_max(_masked_vector_norm(force_bias, charge_mask))
-    fb_spin_mean, fb_spin_max = _mean_max(_masked_vector_norm(force_bias, spin_mask))
-    shift_charge_mean, shift_charge_max = _mean_max(_masked_vector_norm(field_shifts, charge_mask))
-    shift_spin_mean, shift_spin_max = _mean_max(_masked_vector_norm(field_shifts, spin_mask))
-    shifted_charge_mean, shifted_charge_max = _mean_max(
-        _masked_vector_norm(shifted_fields, charge_mask)
+    fb_charge = _masked_vector_norm(force_bias, charge_mask)
+    fb_spin = _masked_vector_norm(force_bias, spin_mask)
+    shift_charge = _masked_vector_norm(field_shifts, charge_mask)
+    shift_spin = _masked_vector_norm(field_shifts, spin_mask)
+    shifted_charge = _masked_vector_norm(shifted_fields, charge_mask)
+    shifted_spin = _masked_vector_norm(shifted_fields, spin_mask)
+
+    fb_charge_mean, fb_charge_max = _mean_max(fb_charge)
+    fb_spin_mean, fb_spin_max = _mean_max(fb_spin)
+    fb_charge_pp_mean, fb_charge_pp_max = _mean_max(_per_pivot(fb_charge, charge_mask))
+    fb_spin_pp_mean, fb_spin_pp_max = _mean_max(_per_pivot(fb_spin, spin_mask))
+    shift_charge_mean, shift_charge_max = _mean_max(shift_charge)
+    shift_spin_mean, shift_spin_max = _mean_max(shift_spin)
+    shift_charge_pp_mean, shift_charge_pp_max = _mean_max(_per_pivot(shift_charge, charge_mask))
+    shift_spin_pp_mean, shift_spin_pp_max = _mean_max(_per_pivot(shift_spin, spin_mask))
+    shifted_charge_mean, shifted_charge_max = _mean_max(shifted_charge)
+    shifted_spin_mean, shifted_spin_max = _mean_max(shifted_spin)
+    shifted_charge_pp_mean, shifted_charge_pp_max = _mean_max(
+        _per_pivot(shifted_charge, charge_mask)
     )
-    shifted_spin_mean, shifted_spin_max = _mean_max(_masked_vector_norm(shifted_fields, spin_mask))
+    shifted_spin_pp_mean, shifted_spin_pp_max = _mean_max(_per_pivot(shifted_spin, spin_mask))
 
     charge_phase = jnp.imag(
         -sqrt_dt
@@ -106,18 +147,57 @@ def _charge_spin_pivot_diagnostics(
         "force_bias_norm_charge_pivot_max": fb_charge_max,
         "force_bias_norm_spin_pivot_mean": fb_spin_mean,
         "force_bias_norm_spin_pivot_max": fb_spin_max,
+        "force_bias_norm_per_pivot_charge_pivot_mean": fb_charge_pp_mean,
+        "force_bias_norm_per_pivot_charge_pivot_max": fb_charge_pp_max,
+        "force_bias_norm_per_pivot_spin_pivot_mean": fb_spin_pp_mean,
+        "force_bias_norm_per_pivot_spin_pivot_max": fb_spin_pp_max,
         "field_shift_norm_charge_pivot_mean": shift_charge_mean,
         "field_shift_norm_charge_pivot_max": shift_charge_max,
         "field_shift_norm_spin_pivot_mean": shift_spin_mean,
         "field_shift_norm_spin_pivot_max": shift_spin_max,
+        "field_shift_norm_per_pivot_charge_pivot_mean": shift_charge_pp_mean,
+        "field_shift_norm_per_pivot_charge_pivot_max": shift_charge_pp_max,
+        "field_shift_norm_per_pivot_spin_pivot_mean": shift_spin_pp_mean,
+        "field_shift_norm_per_pivot_spin_pivot_max": shift_spin_pp_max,
         "shifted_field_norm_charge_pivot_mean": shifted_charge_mean,
         "shifted_field_norm_charge_pivot_max": shifted_charge_max,
         "shifted_field_norm_spin_pivot_mean": shifted_spin_mean,
         "shifted_field_norm_spin_pivot_max": shifted_spin_max,
+        "shifted_field_norm_per_pivot_charge_pivot_mean": shifted_charge_pp_mean,
+        "shifted_field_norm_per_pivot_charge_pivot_max": shifted_charge_pp_max,
+        "shifted_field_norm_per_pivot_spin_pivot_mean": shifted_spin_pp_mean,
+        "shifted_field_norm_per_pivot_spin_pivot_max": shifted_spin_pp_max,
         "field_phase_abs_charge_pivot_mean": phase_charge_mean,
         "field_phase_abs_charge_pivot_max": phase_charge_max,
         "field_phase_abs_spin_pivot_mean": phase_spin_mean,
         "field_phase_abs_spin_pivot_max": phase_spin_max,
+    }
+
+
+def _phaseless_event_diagnostics(
+    *,
+    ratio: jax.Array,
+    imp_ph_raw: jax.Array,
+    imp_after_imp_cap: jax.Array,
+    weights_before: jax.Array,
+    w_floor: float,
+    w_cap: float,
+) -> dict[str, jax.Array]:
+    finite = jnp.isfinite(imp_ph_raw)
+    weights_raw = weights_before * imp_after_imp_cap
+    abs_ratio = jnp.abs(ratio)
+    dtype = imp_ph_raw.dtype
+    return {
+        "n_floor": jnp.asarray(jnp.sum(finite & (imp_ph_raw < w_floor)), dtype=dtype),
+        "n_nonfinite": jnp.asarray(jnp.sum(~finite), dtype=dtype),
+        "n_imp_cap": jnp.asarray(jnp.sum(finite & (imp_ph_raw > w_cap)), dtype=dtype),
+        "n_weight_cap": jnp.asarray(jnp.sum(weights_raw > w_cap), dtype=dtype),
+        "n_node_encounters": jnp.asarray(jnp.sum(imp_after_imp_cap <= 0.0), dtype=dtype),
+        "abs_ratio_mean": jnp.mean(abs_ratio),
+        "abs_ratio_max": jnp.max(abs_ratio),
+        "imp_raw_mean": jnp.mean(jnp.where(finite, imp_ph_raw, 0.0)),
+        "imp_raw_min": jnp.min(jnp.where(finite, imp_ph_raw, 0.0)),
+        "imp_raw_max": jnp.max(jnp.where(finite, imp_ph_raw, 0.0)),
     }
 
 
@@ -232,14 +312,26 @@ def afqmc_step(
     imp_fun = jnp.exp(exponent) * ratio
 
     theta = jnp.angle(jnp.exp(-prop_ctx.sqrt_dt * shift_term) * ratio)
-    imp_ph = jnp.abs(imp_fun) * jnp.cos(theta)
+    imp_ph_raw = jnp.abs(imp_fun) * jnp.cos(theta)
 
     w_floor = float(getattr(params, "weight_floor", 1.0e-3))
     w_cap = float(getattr(params, "weight_cap", 100.0))
 
-    imp_ph = jnp.where(~jnp.isfinite(imp_ph) | (imp_ph < w_floor), 0.0, imp_ph)
+    imp_ph = jnp.where(~jnp.isfinite(imp_ph_raw) | (imp_ph_raw < w_floor), 0.0, imp_ph_raw)
     node_encounters_new = state.node_encounters + jnp.sum(imp_ph <= 0.0)
     imp_ph = jnp.where(imp_ph > w_cap, 0.0, imp_ph)
+    if diagnostics is not None:
+        diagnostics = {
+            **diagnostics,
+            **_phaseless_event_diagnostics(
+                ratio=ratio,
+                imp_ph_raw=imp_ph_raw,
+                imp_after_imp_cap=imp_ph,
+                weights_before=state.weights,
+                w_floor=w_floor,
+                w_cap=w_cap,
+            ),
+        }
 
     weights_new = state.weights * imp_ph
     weights_new = jnp.where(weights_new > w_cap, 0.0, weights_new)
