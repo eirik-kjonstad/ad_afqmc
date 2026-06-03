@@ -97,8 +97,9 @@ class Afqmc:
         Number of chunks if params is not provided, by default 1
     hamiltonian_decomposition : str, optional
         ``"standard"`` keeps the existing Hamiltonian staging. ``"charge_spin"``
-        stages spin-resolved UHF alpha/beta Cholesky factors for the charge/spin
-        HS experiment.
+        stages the UHF charge/spin HS experiment by factorizing the full charge/spin
+        matrix. ``"charge_spin_cholesky"`` uses the AO-Cholesky-induced charge/spin
+        factors directly.
     """
 
     params_cls = QmcParams
@@ -138,9 +139,10 @@ class Afqmc:
         self.norb_frozen_core = resolved_norb_frozen
         self.norb_frozen = resolved_norb_frozen
         self.chol_cut = float(chol_cut)
-        if hamiltonian_decomposition not in ("standard", "charge_spin"):
+        if hamiltonian_decomposition not in ("standard", "charge_spin", "charge_spin_cholesky"):
             raise ValueError(
-                "hamiltonian_decomposition must be 'standard' or 'charge_spin', got "
+                "hamiltonian_decomposition must be 'standard', 'charge_spin', or "
+                "'charge_spin_cholesky', got "
                 f"{hamiltonian_decomposition!r}."
             )
         self.hamiltonian_decomposition = hamiltonian_decomposition

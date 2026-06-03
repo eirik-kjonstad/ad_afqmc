@@ -340,6 +340,59 @@ def _rotate_chol_to_ghf_mo(chol_vec: Array, basis_coeff: Array) -> Array:
     return chol
 
 
+def _factorize_charge_spin_cholesky_full(spin_chol: Array) -> Array:
+    """
+    Factorize the full charge/spin interaction matrix.
+
+    Input is spin-resolved Cholesky factors with shape (nchol, 2, norb, norb),
+    where spin 0/1 are alpha/beta.  We build charge/spin factors
+    L0=(La+Lb)/2 and Lz=(La-Lb)/2, assemble the full compound-index matrix
+    Vcs[(a,pq),(b,rs)], diagonalize it, and return alpha/beta factors for the
+    resulting HS fields.
+    """
+    chol = np.asarray(spin_chol)
+    if chol.ndim != 4 or chol.shape[1] != 2:
+        raise ValueError(f"spin_chol must have shape (nchol, 2, norb, norb), got {chol.shape}")
+
+    _, _, norb, norb2 = chol.shape
+    if norb != norb2:
+        raise ValueError(f"spin_chol orbital blocks must be square, got {chol.shape[-2:]}")
+
+    n2 = norb * norb
+    l_alpha = chol[:, 0].reshape(chol.shape[0], n2)
+    l_beta = chol[:, 1].reshape(chol.shape[0], n2)
+    l0 = 0.5 * (l_alpha + l_beta)
+    lz = 0.5 * (l_alpha - l_beta)
+    low_rank_factors = np.concatenate([l0, lz], axis=1)
+
+    v_charge_spin = low_rank_factors.T @ low_rank_factors
+    v_charge_spin = 0.5 * (v_charge_spin + v_charge_spin.T.conj())
+
+    eigvals, eigvecs = np.linalg.eigh(v_charge_spin)
+    max_eval = float(np.max(np.abs(eigvals))) if eigvals.size else 0.0
+    dtype = np.real(eigvals).dtype
+    eps = np.finfo(dtype).eps if np.issubdtype(dtype, np.floating) else np.finfo(np.float64).eps
+    tol = max(10.0 * eps * max(v_charge_spin.shape) * max(max_eval, 1.0), 0.0)
+    min_eval = float(np.min(np.real(eigvals))) if eigvals.size else 0.0
+    if min_eval < -tol:
+        raise ValueError(
+            "Full charge/spin interaction matrix has a negative eigenvalue below numerical "
+            f"tolerance: min={min_eval:g}, tol={tol:g}."
+        )
+
+    keep = np.real(eigvals) > tol
+    eigvals_keep = np.real(eigvals[keep])
+    eigvecs_keep = eigvecs[:, keep]
+    cs_factors = (np.sqrt(eigvals_keep)[:, None] * eigvecs_keep.T).astype(
+        np.result_type(chol.dtype, eigvecs.dtype, eigvals_keep.dtype),
+        copy=False,
+    )
+
+    l0_new = cs_factors[:, :n2].reshape(-1, norb, norb)
+    lz_new = cs_factors[:, n2:].reshape(-1, norb, norb)
+    return np.stack([l0_new + lz_new, l0_new - lz_new], axis=1)
+
+
 def _stage_frozen(frozen: int | ArrayLike | None) -> int | NDArray | None:
     if isinstance(frozen, (list, tuple, np.ndarray)):
         frozen = np.asarray(frozen, dtype=int)
@@ -727,8 +780,9 @@ def stage(
             Print timing/info.
         hamiltonian_decomposition:
             ``"standard"`` keeps the existing Hamiltonian basis convention. ``"charge_spin"``
-            stages collinear spin-resolved alpha/beta Cholesky factors for the UHF
-            charge/spin HS experiment.
+            stages the UHF charge/spin HS experiment by assembling and factorizing the full
+            2*norb**2 by 2*norb**2 charge/spin matrix. ``"charge_spin_cholesky"`` uses the
+            cheaper AO-Cholesky-induced charge/spin factors directly.
         ham:
             Optionally provide HamInput. If None, will be staged from obj.
         trial:
@@ -852,12 +906,13 @@ def _stage_ham_input(
     mol = obj.mol
     scf_obj = obj.mf
 
-    if hamiltonian_decomposition not in ("standard", "charge_spin"):
+    if hamiltonian_decomposition not in ("standard", "charge_spin", "charge_spin_cholesky"):
         raise ValueError(
-            "hamiltonian_decomposition must be 'standard' or 'charge_spin', got "
+            "hamiltonian_decomposition must be 'standard', 'charge_spin', or "
+            "'charge_spin_cholesky', got "
             f"{hamiltonian_decomposition!r}."
         )
-    if hamiltonian_decomposition == "charge_spin" and scf_obj.kind != "uhf":
+    if hamiltonian_decomposition.startswith("charge_spin") and scf_obj.kind != "uhf":
         raise ValueError("charge_spin decomposition currently requires a UHF reference.")
 
     match scf_obj.kind:
@@ -867,13 +922,13 @@ def _stage_ham_input(
             mo_coeff = scf_obj.mo_coeff
             basis_coeff = (
                 (np.asarray(mo_coeff[0]), np.asarray(mo_coeff[1]))
-                if hamiltonian_decomposition == "charge_spin"
+                if hamiltonian_decomposition.startswith("charge_spin")
                 else np.asarray(mo_coeff[0])
             )
         case _:
             raise ValueError(f"Unreachable: '{scf_obj.kind}'.")
 
-    if hamiltonian_decomposition == "charge_spin":
+    if hamiltonian_decomposition.startswith("charge_spin"):
         ham_basis = "charge_spin"
     else:
         match scf_obj.kind:
@@ -931,13 +986,17 @@ def _stage_ham_input(
         norb = int(C_alpha.shape[1])
         if int(C_beta.shape[1]) != norb:
             raise ValueError("Alpha and beta MO coefficient blocks must have the same nmo.")
-        chol = np.stack(
+        spin_chol = np.stack(
             [
                 _rotate_chol_to_mo(chol_vec, C_alpha),
                 _rotate_chol_to_mo(chol_vec, C_beta),
             ],
             axis=1,
         )
+        if hamiltonian_decomposition == "charge_spin":
+            chol = _factorize_charge_spin_cholesky_full(spin_chol)
+        else:
+            chol = spin_chol
     elif scf_obj.kind != "ghf":
         C = np.asarray(basis_coeff)
         norb = int(basis_coeff.shape[1])
@@ -1123,7 +1182,7 @@ def _stage_trial_input(
     if stage_tr_fun is _stage_mf_input:
         return _stage_mf_input(obj, hamiltonian_decomposition=hamiltonian_decomposition)
 
-    if hamiltonian_decomposition == "charge_spin":
+    if hamiltonian_decomposition.startswith("charge_spin"):
         raise NotImplementedError(
             "charge_spin staging currently supports mean-field Slater trials only."
         )
@@ -1172,7 +1231,7 @@ def _stage_mf_input(
             Ca = np.asarray(obj.mo_coeff[0])
             Cb = np.asarray(obj.mo_coeff[1])
 
-            if hamiltonian_decomposition == "charge_spin":
+            if hamiltonian_decomposition.startswith("charge_spin"):
                 # Alpha and beta walkers live in their own UHF MO bases.
                 moa = _mf_coeff_helper(Ca, Ca, S, frozen)
                 mob = _mf_coeff_helper(Cb, Cb, S, frozen)
