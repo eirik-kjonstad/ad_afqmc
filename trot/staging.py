@@ -1190,9 +1190,12 @@ def _stage_trial_input(
     if stage_tr_fun is _stage_mf_input:
         return _stage_mf_input(obj, hamiltonian_decomposition=hamiltonian_decomposition)
 
+    if stage_tr_fun is _stage_ucisd_input:
+        return _stage_ucisd_input(obj, hamiltonian_decomposition=hamiltonian_decomposition)
+
     if hamiltonian_decomposition.startswith("charge_spin"):
         raise NotImplementedError(
-            "charge_spin staging currently supports mean-field Slater trials only."
+            "charge_spin staging currently supports mean-field Slater and UCCSD/UCISD trials only."
         )
 
     return stage_tr_fun(obj)
@@ -1315,7 +1318,11 @@ def _stage_cisd_input(obj: StagedMfOrCc) -> TrialInput:
     )
 
 
-def _stage_ucisd_input(obj: StagedMfOrCc) -> TrialInput:
+def _stage_ucisd_input(
+    obj: StagedMfOrCc,
+    *,
+    hamiltonian_decomposition: str = "standard",
+) -> TrialInput:
     if obj.kind != "uccsd":
         raise ValueError(f"Unreachable: '{obj.kind}'.")
 
@@ -1333,7 +1340,10 @@ def _stage_ucisd_input(obj: StagedMfOrCc) -> TrialInput:
     ci2ab = np.asarray(t2ab) + np.einsum("ia,jb->ijab", np.asarray(t1a), np.asarray(t1b))
     ci2ab = ci2ab.transpose(0, 2, 1, 3)
 
-    _uhf_input = _stage_mf_input(obj)
+    _uhf_input = _stage_mf_input(
+        obj,
+        hamiltonian_decomposition=hamiltonian_decomposition,
+    )
     moa = _uhf_input.data["mo_a"]
     mob = _uhf_input.data["mo_b"]
 
