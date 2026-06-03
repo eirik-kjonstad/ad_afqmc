@@ -20,6 +20,7 @@ from .staging import (
     _stage_end,
     _stage_ham_input,
     _stage_ham_input_from_fcidump,
+    charge_spin_field_summary,
     dump,
     load,
 )
@@ -518,6 +519,8 @@ def stage_from_ccpy(
             "basis": getattr(mol, "basis", None),
         },
     }
+    if ham.basis == "charge_spin":
+        meta["charge_spin_fields"] = charge_spin_field_summary(ham.chol)
 
     staged = StagedInputs(ham=ham, trial=trial, meta=meta)
 

@@ -397,6 +397,69 @@ def _spin_cholesky_to_charge_spin(spin_chol: Array) -> Array:
     return np.stack([0.5 * (chol[:, 0] + chol[:, 1]), 0.5 * (chol[:, 0] - chol[:, 1])], axis=1)
 
 
+def charge_spin_field_summary(
+    chol: Array,
+    *,
+    dominance_threshold: float = 0.9,
+    zero_tol: float | None = None,
+) -> Dict[str, Any]:
+    """
+    Count charge-dominant, spin-dominant, mixed, and near-zero charge/spin fields.
+
+    ``chol`` must use the charge-spin convention ``(n_fields, 2, norb, norb)``,
+    where axis 1 is ``(charge, spin)``.  A field is charge-dominant when
+    ``||L_c||^2 / (||L_c||^2 + ||L_s||^2) >= dominance_threshold`` and
+    spin-dominant by the analogous spin criterion.
+    """
+    arr = np.asarray(chol)
+    if arr.ndim != 4 or arr.shape[1] != 2:
+        raise ValueError(
+            f"charge-spin chol must have shape (n_fields, 2, norb, norb), got {arr.shape}"
+        )
+    if not 0.5 <= dominance_threshold <= 1.0:
+        raise ValueError(
+            f"dominance_threshold must be between 0.5 and 1.0, got {dominance_threshold!r}."
+        )
+
+    charge_norm2 = np.sum(np.abs(arr[:, 0]) ** 2, axis=(1, 2))
+    spin_norm2 = np.sum(np.abs(arr[:, 1]) ** 2, axis=(1, 2))
+    total_norm2 = charge_norm2 + spin_norm2
+    if zero_tol is None:
+        max_norm2 = float(np.max(total_norm2)) if total_norm2.size else 0.0
+        zero_tol = 100.0 * np.finfo(np.asarray(total_norm2).dtype).eps * max(max_norm2, 1.0)
+
+    nonzero = total_norm2 > float(zero_tol)
+    charge_fraction = np.divide(
+        charge_norm2,
+        total_norm2,
+        out=np.zeros_like(total_norm2, dtype=np.result_type(total_norm2, np.float64)),
+        where=nonzero,
+    )
+    spin_fraction = np.divide(
+        spin_norm2,
+        total_norm2,
+        out=np.zeros_like(total_norm2, dtype=np.result_type(total_norm2, np.float64)),
+        where=nonzero,
+    )
+
+    charge_mask = nonzero & (charge_fraction >= dominance_threshold)
+    spin_mask = nonzero & (spin_fraction >= dominance_threshold)
+    mixed_mask = nonzero & ~(charge_mask | spin_mask)
+    zero_mask = ~nonzero
+
+    return {
+        "n_fields": int(arr.shape[0]),
+        "n_charge": int(np.count_nonzero(charge_mask)),
+        "n_spin": int(np.count_nonzero(spin_mask)),
+        "n_mixed": int(np.count_nonzero(mixed_mask)),
+        "n_zero": int(np.count_nonzero(zero_mask)),
+        "dominance_threshold": float(dominance_threshold),
+        "zero_tol": float(zero_tol),
+        "charge_norm2_sum": float(np.sum(charge_norm2)),
+        "spin_norm2_sum": float(np.sum(spin_norm2)),
+    }
+
+
 def _stage_frozen(frozen: int | ArrayLike | None) -> int | NDArray | None:
     if isinstance(frozen, (list, tuple, np.ndarray)):
         frozen = np.asarray(frozen, dtype=int)
@@ -850,6 +913,8 @@ def stage(
             "basis": getattr(mol, "basis", None),
         },
     }
+    if ham is not None and ham.basis == "charge_spin":
+        meta["charge_spin_fields"] = charge_spin_field_summary(ham.chol)
 
     staged = StagedInputs(ham=ham, trial=trial, meta=meta)
 
