@@ -79,5 +79,32 @@ def test_build_interpolated_spin_prop_ctx_shapes_and_matches_charge_scalars():
     assert jnp.allclose(ctx_spin.exp_h1_half, ctx_charge.exp_h1_half)
 
 
+def test_build_spin_null_prop_ctx_shapes_and_matches_charge_scalars():
+    norb, n_fields = 5, 7
+    ham = _make_small_ham(norb=norb, n_fields=n_fields, h0=1.5)
+
+    dm_a = jnp.diag(jnp.array([1.0, 1.0, 0.0, 0.0, 0.0]))
+    dm_b = jnp.diag(jnp.array([1.0, 0.0, 0.0, 0.0, 0.0]))
+    dm = jnp.stack([dm_a, dm_b], axis=0)
+    dt = 0.2
+    eta = 0.75
+
+    ctx_charge = _build_prop_ctx(ham, dm, dt)
+    ctx_null = _build_prop_ctx(
+        ham,
+        dm,
+        dt,
+        decomposition="spin_null",
+        spin_null_eta=eta,
+    )
+
+    assert ctx_null.spin_null_eta == eta
+    assert ctx_null.mf_shifts.shape == (3 * n_fields,)
+    assert ctx_null.chol_flat.shape == (3 * n_fields, norb * norb)
+    assert ctx_null.exp_h1_half.shape == (norb, norb)
+    assert jnp.allclose(ctx_null.h0_prop, ctx_charge.h0_prop)
+    assert jnp.allclose(ctx_null.exp_h1_half, ctx_charge.exp_h1_half)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

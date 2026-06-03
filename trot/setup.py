@@ -107,6 +107,7 @@ def _make_prop(
     mixed_precision: bool,
     decomposition: CholDecomposition = "charge",
     spin_decomposition_lambda: float = 1.0,
+    spin_null_eta: float = 0.0,
 ) -> Any:
     return make_prop_ops(
         ham_data.basis,
@@ -114,6 +115,7 @@ def _make_prop(
         mixed_precision=mixed_precision,
         decomposition=decomposition,
         spin_decomposition_lambda=spin_decomposition_lambda,
+        spin_null_eta=spin_null_eta,
     )
 
 
@@ -157,6 +159,7 @@ def _make_trial_bundle(
     mixed_precision: bool,
     decomposition: CholDecomposition = "charge",
     spin_decomposition_lambda: float = 1.0,
+    spin_null_eta: float = 0.0,
 ) -> tuple[Any, Any, Any]:
     """
     Return (trial_data, trial_ops, meas_ops)
@@ -170,21 +173,22 @@ def _make_trial_bundle(
     def meas_ops_for_decomposition(trial_ops: TrialOps, manual_meas_ops: MeasOps) -> MeasOps:
         if decomposition == "charge":
             return manual_meas_ops
-        if decomposition != "spin":
+        if decomposition not in ("spin", "spin_null"):
             raise ValueError(f"unknown decomposition: {decomposition}")
         if kind not in {"uhf", "rohf", "ucisd", "ucisdt", "ucisdtq"}:
-            raise NotImplementedError(f"Spin decomposition is not wired for trial kind {kind!r}.")
+            raise NotImplementedError(f"{decomposition} decomposition is not wired for trial kind {kind!r}.")
         if sys.walker_kind.lower() not in {"unrestricted", "generalized"}:
             raise NotImplementedError(
-                "Spin decomposition currently supports unrestricted or generalized walkers."
+                f"{decomposition} decomposition currently supports unrestricted or generalized walkers."
             )
         from .meas.auto import make_auto_meas_ops
 
         return make_auto_meas_ops(
             sys=sys,
             trial_ops_=trial_ops,
-            decomposition="spin",
+            decomposition=decomposition,
             spin_decomposition_lambda=spin_decomposition_lambda,
+            spin_null_eta=spin_null_eta,
         )
 
     if kind == "rhf":
@@ -308,6 +312,7 @@ class Job:
     mesh: Mesh | None = None
     decomposition: CholDecomposition = "charge"
     spin_decomposition_lambda: float = 1.0
+    spin_null_eta: float = 0.0
     _runtime_prop_ctx: object | None = field(default=None, init=False, repr=False)
     _runtime_meas_ctx: object | None = field(default=None, init=False, repr=False)
     _runtime_state: PropState | None = field(default=None, init=False, repr=False)
@@ -396,6 +401,7 @@ def _assemble_job(
     prop_kwargs: dict[str, Any] | None = None,
     decomposition: CholDecomposition = "charge",
     spin_decomposition_lambda: float = 1.0,
+    spin_null_eta: float = 0.0,
     params_builder: Callable[..., QmcParamsBase],
     prop_builder: Callable[..., Any],
     default_block_fn: Callable[..., Any],
@@ -404,6 +410,8 @@ def _assemble_job(
 ) -> Job:
     if not 0.0 <= spin_decomposition_lambda <= 1.0:
         raise ValueError("spin_decomposition_lambda must be between 0 and 1.")
+    if spin_null_eta < 0.0:
+        raise ValueError("spin_null_eta must be non-negative.")
 
     if prop_kwargs is not None and "decomposition" in prop_kwargs:
         prop_decomposition = cast(CholDecomposition, prop_kwargs["decomposition"])
@@ -421,8 +429,18 @@ def _assemble_job(
                 "and prop_kwargs['spin_decomposition_lambda']."
             )
         spin_decomposition_lambda = prop_lambda
+    if prop_kwargs is not None and "spin_null_eta" in prop_kwargs:
+        prop_eta = float(prop_kwargs["spin_null_eta"])
+        if spin_null_eta != 0.0 and prop_eta != spin_null_eta:
+            raise ValueError(
+                "Conflicting spin_null_eta values were provided in setup(...) "
+                "and prop_kwargs['spin_null_eta']."
+            )
+        spin_null_eta = prop_eta
     if not 0.0 <= spin_decomposition_lambda <= 1.0:
         raise ValueError("spin_decomposition_lambda must be between 0 and 1.")
+    if spin_null_eta < 0.0:
+        raise ValueError("spin_null_eta must be non-negative.")
 
     trial_data_override = trial_data
     trial_ops_override = trial_ops
@@ -456,6 +474,7 @@ def _assemble_job(
             mixed_precision,
             decomposition,
             spin_decomposition_lambda,
+            spin_null_eta,
         )
         trial_data = td if trial_data is None else trial_data
         trial_ops = to if trial_ops is None else trial_ops
@@ -478,6 +497,7 @@ def _assemble_job(
         prop_kwargs_ = dict(prop_kwargs or {})
         prop_kwargs_.setdefault("decomposition", decomposition)
         prop_kwargs_.setdefault("spin_decomposition_lambda", spin_decomposition_lambda)
+        prop_kwargs_.setdefault("spin_null_eta", spin_null_eta)
         prop_ops = prop_builder(
             ham_data,
             sys.walker_kind,
@@ -503,6 +523,7 @@ def _assemble_job(
         mesh=mesh,
         decomposition=decomposition,
         spin_decomposition_lambda=spin_decomposition_lambda,
+        spin_null_eta=spin_null_eta,
     )
 
 
@@ -533,6 +554,7 @@ def setup(
     prop_kwargs: dict[str, Any] | None = None,
     decomposition: CholDecomposition = "charge",
     spin_decomposition_lambda: float = 1.0,
+    spin_null_eta: float = 0.0,
 ) -> Job:
     """
     Assemble a runnable AFQMC Job from either:
@@ -570,6 +592,7 @@ def setup(
         prop_kwargs=prop_kwargs,
         decomposition=decomposition,
         spin_decomposition_lambda=spin_decomposition_lambda,
+        spin_null_eta=spin_null_eta,
         params_builder=_make_params,
         prop_builder=_make_prop,
         default_block_fn=default_block,

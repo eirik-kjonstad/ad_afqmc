@@ -12,7 +12,7 @@ from .utils import taylor_expm_action
 
 # contains low level details of AFQMC chol propagation
 
-CholDecomposition = Literal["charge", "spin"]
+CholDecomposition = Literal["charge", "spin", "spin_null"]
 
 
 @tree_util.register_pytree_node_class
@@ -27,6 +27,7 @@ class CholAfqmcCtx:
     norb: int
     decomposition: CholDecomposition = "charge"
     spin_decomposition_lambda: float = 1.0
+    spin_null_eta: float = 0.0
 
     def tree_flatten(self):
         return (
@@ -36,12 +37,12 @@ class CholAfqmcCtx:
             self.mf_shifts,
             self.h0_prop,
             self.chol_flat,
-        ), (self.norb, self.decomposition, self.spin_decomposition_lambda)
+        ), (self.norb, self.decomposition, self.spin_decomposition_lambda, self.spin_null_eta)
 
     @classmethod
     def tree_unflatten(cls, aux, children):
         dt, sqrt_dt, exp_h1_half, mf_shifts, h0_prop, chol_flat = children
-        norb, decomposition, spin_decomposition_lambda = aux
+        norb, decomposition, spin_decomposition_lambda, spin_null_eta = aux
 
         return cls(
             dt=dt,
@@ -53,6 +54,7 @@ class CholAfqmcCtx:
             norb=norb,
             decomposition=decomposition,
             spin_decomposition_lambda=spin_decomposition_lambda,
+            spin_null_eta=spin_null_eta,
         )
 
 
@@ -120,6 +122,31 @@ def _spin_mf_shifts(
     )
 
 
+def _spin_null_mf_shifts(
+    ham_data: HamChol,
+    rdm1: jax.Array,
+    *,
+    spin_null_eta: float = 0.0,
+) -> jax.Array:
+    if ham_data.basis != "restricted":
+        raise ValueError("spin_null decomposition currently requires a restricted Hamiltonian basis.")
+    if rdm1.ndim != 3 or rdm1.shape[0] != 2:
+        raise ValueError(
+            "spin_null decomposition requires a spin-block rdm1 with shape (2, norb, norb)."
+        )
+    if spin_null_eta < 0.0:
+        raise ValueError("spin_null_eta must be non-negative.")
+
+    dm_a, dm_b = rdm1[0], rdm1[1]
+    tr_a = jnp.einsum("gij,ji->g", ham_data.chol, dm_a, optimize="optimal")
+    tr_b = jnp.einsum("gij,ji->g", ham_data.chol, dm_b, optimize="optimal")
+    eta = jnp.asarray(spin_null_eta, dtype=jnp.real(tr_a).dtype)
+    charge_mf = 1.0j * (tr_a + tr_b)
+    minus_mf = eta * 1.0j * (tr_a - tr_b)
+    null_mf = -eta * (tr_a - tr_b)
+    return jnp.concatenate([charge_mf, minus_mf, null_mf], axis=0)
+
+
 def _build_exp_h1_half_from_h1(h1: jax.Array, dt: jax.Array) -> jax.Array:
     return jax.scipy.linalg.expm(-0.5 * dt * h1)
 
@@ -181,6 +208,31 @@ def _make_spin_vhs_split_flat_with_lambda(
     )
 
 
+def _make_spin_null_vhs_split_flat(
+    *,
+    chol_flat: jax.Array,
+    field: jax.Array,
+    n: int,
+    spin_null_eta: float,
+) -> tuple[jax.Array, jax.Array]:
+    n_chol = field.shape[0] // 3
+    chol = chol_flat[:n_chol]
+    field_c = field[:n_chol]
+    field_m = field[n_chol : 2 * n_chol]
+    field_n = field[2 * n_chol :]
+
+    eta = jnp.asarray(spin_null_eta, dtype=jnp.real(field).dtype)
+    coeff_charge = 1.0j * field_c
+    coeff_minus = 1.0j * eta * field_m
+    coeff_null = eta * field_n
+    coeff_a = coeff_charge + coeff_minus - coeff_null
+    coeff_b = coeff_charge - coeff_minus + coeff_null
+    return (
+        _make_vhs_split_flat(chol_flat=chol, x=coeff_a, n=n),
+        _make_vhs_split_flat(chol_flat=chol, x=coeff_b, n=n),
+    )
+
+
 def _get_h1_eff(ham_data: HamChol, mf: jax.Array) -> jax.Array:
     match ham_data.basis:
         case "restricted" | "generalized":
@@ -201,11 +253,14 @@ def _build_prop_ctx(
     chol_flat_precision: jnp.dtype = jnp.float64,
     decomposition: CholDecomposition = "charge",
     spin_decomposition_lambda: float = 1.0,
+    spin_null_eta: float = 0.0,
 ) -> CholAfqmcCtx:
     dt_a = jnp.array(dt)
     sqrt_dt = jnp.sqrt(dt_a)
     if not 0.0 <= spin_decomposition_lambda <= 1.0:
         raise ValueError("spin_decomposition_lambda must be between 0 and 1.")
+    if spin_null_eta < 0.0:
+        raise ValueError("spin_null_eta must be non-negative.")
 
     if decomposition == "charge":
         mf = _mf_shifts(ham_data, rdm1)
@@ -216,6 +271,9 @@ def _build_prop_ctx(
             rdm1,
             spin_decomposition_lambda=spin_decomposition_lambda,
         )
+        charge_mf = _mf_shifts(ham_data, rdm1)
+    elif decomposition == "spin_null":
+        mf = _spin_null_mf_shifts(ham_data, rdm1, spin_null_eta=spin_null_eta)
         charge_mf = _mf_shifts(ham_data, rdm1)
     else:
         raise ValueError(f"Unknown Cholesky decomposition: {decomposition!r}")
@@ -228,6 +286,8 @@ def _build_prop_ctx(
     if decomposition == "spin":
         n_copies = 3 if spin_decomposition_lambda >= 1.0 else 4
         chol_flat_base = jnp.concatenate([chol_flat_base] * n_copies, axis=0)
+    elif decomposition == "spin_null":
+        chol_flat_base = jnp.concatenate([chol_flat_base] * 3, axis=0)
     chol_flat = chol_flat_base.astype(chol_flat_precision)
     norb = ham_data.chol.shape[1]
     return CholAfqmcCtx(
@@ -240,6 +300,7 @@ def _build_prop_ctx(
         norb=norb,
         decomposition=decomposition,
         spin_decomposition_lambda=float(spin_decomposition_lambda),
+        spin_null_eta=float(spin_null_eta),
     )
 
 
@@ -420,12 +481,15 @@ def make_trotter_ops(
     mixed_precision: bool = False,
     decomposition: CholDecomposition = "charge",
     spin_decomposition_lambda: float = 1.0,
+    spin_null_eta: float = 0.0,
 ) -> TrotterOps:
     assert isinstance(ham_basis, str)
     assert isinstance(walker_kind, str)
     assert isinstance(mixed_precision, bool)
     if not 0.0 <= spin_decomposition_lambda <= 1.0:
         raise ValueError("spin_decomposition_lambda must be between 0 and 1.")
+    if spin_null_eta < 0.0:
+        raise ValueError("spin_null_eta must be non-negative.")
 
     walker_kind = walker_kind.lower()
 
@@ -442,6 +506,13 @@ def make_trotter_ops(
         )
 
     def make_vhs_spin(field: jax.Array, ctx: CholAfqmcCtx) -> tuple[jax.Array, jax.Array]:
+        if ctx.decomposition == "spin_null":
+            return _make_spin_null_vhs_split_flat(
+                chol_flat=ctx.chol_flat,
+                field=field.astype(vhs_complex_dtype),
+                n=ctx.norb,
+                spin_null_eta=ctx.spin_null_eta,
+            )
         return _make_spin_vhs_split_flat_with_lambda(
             chol_flat=ctx.chol_flat,
             field=field.astype(vhs_complex_dtype),
@@ -455,13 +526,13 @@ def make_trotter_ops(
     if ham_basis not in ("restricted", "generalized"):
         raise ValueError(f"unknown ham_basis: {ham_basis}")
 
-    if decomposition not in ("charge", "spin"):
+    if decomposition not in ("charge", "spin", "spin_null"):
         raise ValueError(f"unknown decomposition: {decomposition}")
 
-    if decomposition == "spin":
+    if decomposition in ("spin", "spin_null"):
         if ham_basis != "restricted":
             raise NotImplementedError(
-                "Spin decomposition is only implemented for restricted Hamiltonians."
+                f"{decomposition} decomposition is only implemented for restricted Hamiltonians."
             )
         match walker_kind:
             case "unrestricted":
@@ -474,7 +545,7 @@ def make_trotter_ops(
                 )
             case _:
                 raise NotImplementedError(
-                    "Spin decomposition currently supports unrestricted or generalized walkers."
+                    f"{decomposition} decomposition currently supports unrestricted or generalized walkers."
                 )
         return TrotterOps(apply_trotter)
 

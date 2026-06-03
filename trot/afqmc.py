@@ -101,12 +101,14 @@ class Afqmc:
         ``QmcParams.weight_floor``.
     diagnostics_dir : str | Path | None, optional
         If provided, write per-block phaseless diagnostic ``.npz`` files to this directory.
-    decomposition : {"charge", "spin"}, optional
+    decomposition : {"charge", "spin", "spin_null"}, optional
         Auxiliary-field decomposition to use for phaseless propagation, by default "charge".
     spin_decomposition_lambda : float, optional
         Interpolation parameter for ``decomposition="spin"``. ``1`` is the full spin
         decomposition and values in ``[0, 1)`` mix in a charge channel with the
         spin channels scaled by ``sqrt(lambda)``.
+    spin_null_eta : float, optional
+        Null spin-pair amplitude for ``decomposition="spin_null"``, by default 0.
     """
 
     params_cls = QmcParams
@@ -131,9 +133,12 @@ class Afqmc:
         diagnostics_dir: Union[str, Path] | None = None,
         decomposition: CholDecomposition = "charge",
         spin_decomposition_lambda: float = 1.0,
+        spin_null_eta: float = 0.0,
     ):
         if not 0.0 <= spin_decomposition_lambda <= 1.0:
             raise ValueError("spin_decomposition_lambda must be between 0 and 1.")
+        if spin_null_eta < 0.0:
+            raise ValueError("spin_null_eta must be non-negative.")
 
         self._obj = mf_or_cc
         self._cc: Any = None
@@ -160,6 +165,7 @@ class Afqmc:
         self.mixed_precision = True
         self.decomposition = decomposition
         self.spin_decomposition_lambda = float(spin_decomposition_lambda)
+        self.spin_null_eta = float(spin_null_eta)
         self.diagnostics_dir = diagnostics_dir
 
         self.params: QmcParamsBase | None = None  # resolved in kernel
@@ -249,6 +255,8 @@ class Afqmc:
         print(f" decomposition   = {job.decomposition}")
         if job.decomposition == "spin":
             print(f" spin_lambda     = {job.spin_decomposition_lambda:g}")
+        if job.decomposition == "spin_null":
+            print(f" spin_null_eta   = {job.spin_null_eta:g}")
         print(f" mixed_precision = {self.mixed_precision}\n")
         meas_cfg = self._resolve_meas_cfg(job)
         if meas_cfg is not None:
@@ -366,6 +374,7 @@ class Afqmc:
             if (
                 self._job.decomposition == self.decomposition
                 and self._job.spin_decomposition_lambda == self.spin_decomposition_lambda
+                and self._job.spin_null_eta == self.spin_null_eta
             ):
                 return self._job
 
@@ -392,6 +401,7 @@ class Afqmc:
             prop_kwargs=prop_kwargs,
             decomposition=self.decomposition,
             spin_decomposition_lambda=self.spin_decomposition_lambda,
+            spin_null_eta=self.spin_null_eta,
         )
         self._job = job
         return job
@@ -449,6 +459,7 @@ class Afqmc:
         n_chunks: int = 1,
         decomposition: CholDecomposition = "charge",
         spin_decomposition_lambda: float = 1.0,
+        spin_null_eta: float = 0.0,
     ) -> Afqmc:
         """
         Returns a new AFQMC object from a previously staged calculations
@@ -470,6 +481,7 @@ class Afqmc:
             n_chunks=n_chunks,
             decomposition=decomposition,
             spin_decomposition_lambda=spin_decomposition_lambda,
+            spin_null_eta=spin_null_eta,
         )
 
 
