@@ -480,7 +480,7 @@ class HamInput:
     chol_cut: float
     frozen: int | NDArray
     source_kind: str  # "mf" or "cc"
-    basis: HamBasis  # "restricted" or "generalized"
+    basis: HamBasis  # "restricted", "generalized", or "charge_spin"
 
 
 @dataclass(frozen=True, slots=True)
@@ -793,7 +793,15 @@ def stage(
     """
     cache_path = Path(cache).expanduser().resolve() if cache is not None else None
     if cache_path is not None and cache_path.exists() and not overwrite:
-        return load(cache_path)
+        staged_cached = load(cache_path)
+        cached_decomposition = staged_cached.meta.get("hamiltonian_decomposition", "standard")
+        if cached_decomposition != hamiltonian_decomposition:
+            raise ValueError(
+                f"Cache {cache_path} was staged with hamiltonian_decomposition="
+                f"{cached_decomposition!r}, but {hamiltonian_decomposition!r} was requested. "
+                "Use overwrite=True or a different cache path."
+            )
+        return staged_cached
 
     t0 = time.time()
 
