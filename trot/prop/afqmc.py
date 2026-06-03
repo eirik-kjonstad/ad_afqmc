@@ -32,6 +32,7 @@ def _empty_charge_spin_pivot_diagnostics(ham_data: HamChol) -> dict[str, jax.Arr
     if masks is None:
         return None
     zero = jnp.asarray(0.0)
+    one = jnp.asarray(1.0)
     return {
         "force_bias_norm_charge_pivot_mean": zero,
         "force_bias_norm_charge_pivot_max": zero,
@@ -64,7 +65,7 @@ def _empty_charge_spin_pivot_diagnostics(ham_data: HamChol) -> dict[str, jax.Arr
         "spin_pivot_field_shift_cap": zero,
         "spin_pivot_field_shift_cap_n_applied": zero,
         "spin_pivot_field_shift_cap_fraction": zero,
-        "spin_pivot_field_shift_cap_scale_min": zero,
+        "spin_pivot_field_shift_cap_scale_min": one,
         "spin_pivot_field_shift_cap_excess_mean": zero,
         "spin_pivot_field_shift_cap_excess_max": zero,
         "field_shift_uncapped_norm_spin_pivot_mean": zero,
@@ -101,11 +102,12 @@ def _per_pivot(values: jax.Array, mask: jax.Array) -> jax.Array:
 
 def _empty_spin_pivot_field_shift_cap_diagnostics(dtype: Any = jnp.float64) -> dict[str, jax.Array]:
     zero = jnp.asarray(0.0, dtype=dtype)
+    one = jnp.asarray(1.0, dtype=dtype)
     return {
         "spin_pivot_field_shift_cap": zero,
         "spin_pivot_field_shift_cap_n_applied": zero,
         "spin_pivot_field_shift_cap_fraction": zero,
-        "spin_pivot_field_shift_cap_scale_min": zero,
+        "spin_pivot_field_shift_cap_scale_min": one,
         "spin_pivot_field_shift_cap_excess_mean": zero,
         "spin_pivot_field_shift_cap_excess_max": zero,
         "field_shift_uncapped_norm_spin_pivot_mean": zero,
@@ -120,30 +122,46 @@ def _cap_spin_pivot_field_shifts(
     spin_mask: jax.Array,
     cap: float | None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    if cap is None or cap <= 0.0:
-        return field_shifts, _empty_spin_pivot_field_shift_cap_diagnostics(field_shifts.real.dtype)
-
-    cap_value = jnp.asarray(cap, dtype=field_shifts.real.dtype)
+    dtype = field_shifts.real.dtype
+    zero = jnp.asarray(0.0, dtype=dtype)
+    one = jnp.asarray(1.0, dtype=dtype)
     spin_norm = _masked_vector_norm(field_shifts, spin_mask)
+    uncapped_pp = _per_pivot(spin_norm, spin_mask)
+    uncapped_pp_mean, uncapped_pp_max = _mean_max(uncapped_pp)
+    uncapped_mean, uncapped_max = _mean_max(spin_norm)
+
+    if cap is None or cap <= 0.0:
+        diagnostics = {
+            "spin_pivot_field_shift_cap": zero,
+            "spin_pivot_field_shift_cap_n_applied": zero,
+            "spin_pivot_field_shift_cap_fraction": zero,
+            "spin_pivot_field_shift_cap_scale_min": one,
+            "spin_pivot_field_shift_cap_excess_mean": zero,
+            "spin_pivot_field_shift_cap_excess_max": zero,
+            "field_shift_uncapped_norm_spin_pivot_mean": uncapped_mean,
+            "field_shift_uncapped_norm_spin_pivot_max": uncapped_max,
+            "field_shift_uncapped_norm_per_pivot_spin_pivot_mean": uncapped_pp_mean,
+            "field_shift_uncapped_norm_per_pivot_spin_pivot_max": uncapped_pp_max,
+        }
+        return field_shifts, diagnostics
+
+    cap_value = jnp.asarray(cap, dtype=dtype)
     has_spin_pivots = jnp.sum(spin_mask) > 0
     over_cap = has_spin_pivots & (spin_norm > cap_value)
-    tiny = jnp.asarray(jnp.finfo(field_shifts.real.dtype).tiny, dtype=field_shifts.real.dtype)
+    tiny = jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
     scale = jnp.where(over_cap, cap_value / jnp.maximum(spin_norm, tiny), 1.0)
     capped = jnp.where(
         spin_mask[None, :],
         field_shifts * scale[:, None],
         field_shifts,
     )
-    n_applied = jnp.asarray(jnp.sum(over_cap), dtype=field_shifts.real.dtype)
+    n_applied = jnp.asarray(jnp.sum(over_cap), dtype=dtype)
     excess = jnp.where(over_cap, spin_norm - cap_value, 0.0)
-    uncapped_pp = _per_pivot(spin_norm, spin_mask)
-    uncapped_pp_mean, uncapped_pp_max = _mean_max(uncapped_pp)
-    uncapped_mean, uncapped_max = _mean_max(spin_norm)
     diagnostics = {
         "spin_pivot_field_shift_cap": cap_value,
         "spin_pivot_field_shift_cap_n_applied": n_applied,
         "spin_pivot_field_shift_cap_fraction": n_applied
-        / jnp.asarray(field_shifts.shape[0], dtype=field_shifts.real.dtype),
+        / jnp.asarray(field_shifts.shape[0], dtype=dtype),
         "spin_pivot_field_shift_cap_scale_min": jnp.min(scale),
         "spin_pivot_field_shift_cap_excess_mean": jnp.mean(excess),
         "spin_pivot_field_shift_cap_excess_max": jnp.max(excess),
