@@ -20,6 +20,7 @@ from .staging import (
     _stage_end,
     _stage_ham_input,
     _stage_ham_input_from_fcidump,
+    _format_charge_spin_field_summary,
     charge_spin_field_summary,
     dump,
     load,
@@ -474,7 +475,16 @@ def stage_from_ccpy(
             verbose=verbose,
             hamiltonian_decomposition=hamiltonian_decomposition,
         )
-    _stage_end(t_ham, "Hamiltonian ready", details=f"norb={ham.norb} nchol={ham.chol.shape[0]}")
+    charge_spin_summary: Dict[str, Any] | None = None
+    if ham.basis == "charge_spin":
+        charge_spin_summary = charge_spin_field_summary(ham.chol)
+        ham_details = (
+            f"norb={ham.norb} nchol={ham.chol.shape[0]} | "
+            f"{_format_charge_spin_field_summary(charge_spin_summary)}"
+        )
+    else:
+        ham_details = f"norb={ham.norb} nchol={ham.chol.shape[0]}"
+    _stage_end(t_ham, "Hamiltonian ready", details=ham_details)
 
     t_trial = _stage_begin("building trial input")
     if order <= 2:
@@ -519,8 +529,8 @@ def stage_from_ccpy(
             "basis": getattr(mol, "basis", None),
         },
     }
-    if ham.basis == "charge_spin":
-        meta["charge_spin_fields"] = charge_spin_field_summary(ham.chol)
+    if charge_spin_summary is not None:
+        meta["charge_spin_fields"] = charge_spin_summary
 
     staged = StagedInputs(ham=ham, trial=trial, meta=meta)
 

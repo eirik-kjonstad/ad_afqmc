@@ -460,6 +460,14 @@ def charge_spin_field_summary(
     }
 
 
+def _format_charge_spin_field_summary(summary: Dict[str, Any]) -> str:
+    return (
+        f"fields charge={summary['n_charge']} spin={summary['n_spin']} "
+        f"mixed={summary['n_mixed']} zero={summary['n_zero']} "
+        f"threshold={summary['dominance_threshold']:.2f}"
+    )
+
+
 def _stage_frozen(frozen: int | ArrayLike | None) -> int | NDArray | None:
     if isinstance(frozen, (list, tuple, np.ndarray)):
         frozen = np.asarray(frozen, dtype=int)
@@ -875,6 +883,7 @@ def stage(
     resolved_frozen = _resolve_stage_frozen_arg(norb_frozen_core, norb_frozen, frozen_orbitals)
     obj = StagedMfOrCc(obj, resolved_frozen)
     mol = obj.mol
+    charge_spin_summary: Dict[str, Any] | None = None
 
     if ham is None:
         t_ham = _stage_begin("building Hamiltonian")
@@ -884,11 +893,21 @@ def stage(
             verbose=verbose,
             hamiltonian_decomposition=hamiltonian_decomposition,
         )
+        if ham.basis == "charge_spin":
+            charge_spin_summary = charge_spin_field_summary(ham.chol)
+            ham_details = (
+                f"norb={ham.norb} nchol={ham.chol.shape[0]} | "
+                f"{_format_charge_spin_field_summary(charge_spin_summary)}"
+            )
+        else:
+            ham_details = f"norb={ham.norb} nchol={ham.chol.shape[0]}"
         _stage_end(
             t_ham,
             "Hamiltonian ready",
-            details=f"norb={ham.norb} nchol={ham.chol.shape[0]}",
+            details=ham_details,
         )
+    elif ham.basis == "charge_spin":
+        charge_spin_summary = charge_spin_field_summary(ham.chol)
 
     if trial is None:
         t_trial = _stage_begin("building trial input")
@@ -913,8 +932,8 @@ def stage(
             "basis": getattr(mol, "basis", None),
         },
     }
-    if ham is not None and ham.basis == "charge_spin":
-        meta["charge_spin_fields"] = charge_spin_field_summary(ham.chol)
+    if charge_spin_summary is not None:
+        meta["charge_spin_fields"] = charge_spin_summary
 
     staged = StagedInputs(ham=ham, trial=trial, meta=meta)
 
