@@ -304,6 +304,42 @@ def test_stage_from_ccpy_order2_charge_spin_builds_charge_spin_hamiltonian():
     np.testing.assert_allclose(staged.trial.data["mo_coeff_b"], np.eye(staged.ham.norb), atol=1e-12)
 
 
+def test_stage_from_ccpy_order2_charge_spin_uses_fcidump_integrals():
+    from pyscf import gto, scf
+
+    mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", spin=0, symmetry="c1", verbose=0)
+    mf = scf.UHF(mol)
+    mf.run(conv_tol=1.0e-12)
+    assert mf.converged
+
+    n_oa, n_ob = map(int, mol.nelec)
+    nmo = int(mf.mo_coeff[0].shape[1])
+    n_va = nmo - n_oa
+    n_vb = nmo - n_ob
+    driver = _make_driver(n_oa, n_va, n_ob, n_vb, order_cc=2, rng=np.random.default_rng(29))
+    fcidump = {
+        "H1": mf.get_hcore(),
+        "H2": mol.intor("int2e_sph"),
+        "NORB": nmo,
+        "NELEC": mol.nelectron,
+        "MS2": mol.spin,
+        "ECORE": mol.energy_nuc(),
+    }
+
+    staged = stage_from_ccpy(
+        driver,
+        mf,
+        order=2,
+        chol_cut=1.0e-8,
+        fcidump=fcidump,
+        hamiltonian_decomposition="charge_spin",
+    )
+
+    assert staged.ham.basis == "charge_spin"
+    assert staged.meta["ham_source"] == "fcidump"
+    assert staged.ham.chol.shape[1:] == (2, staged.ham.norb, staged.ham.norb)
+
+
 def test_stage_from_ccpy_order_lt_2_raises():
     from pyscf import gto, scf
 

@@ -1080,6 +1080,7 @@ def _stage_ham_input_from_fcidump(
     fcidump: Union[str, Path, Dict[str, Any]],
     chol_cut: float,
     verbose: bool,
+    hamiltonian_decomposition: str = "standard",
 ) -> HamInput:
     """
     Build HamInput from FCIDUMP integrals while preserving the trial MO basis convention.
@@ -1090,40 +1091,59 @@ def _stage_ham_input_from_fcidump(
     if scf_obj.kind == "ghf":
         raise NotImplementedError("FCIDUMP staging for stage_from_ccpy does not support GHF.")
 
+    if hamiltonian_decomposition not in ("standard", "charge_spin", "charge_spin_cholesky"):
+        raise ValueError(
+            "hamiltonian_decomposition must be 'standard', 'charge_spin', or "
+            f"'charge_spin_cholesky', got {hamiltonian_decomposition!r}."
+        )
+    if hamiltonian_decomposition.startswith("charge_spin") and scf_obj.kind != "uhf":
+        raise ValueError("charge_spin FCIDUMP staging currently requires a UHF reference.")
+
     match scf_obj.kind:
         case "rhf" | "rohf":
             basis_coeff = np.asarray(scf_obj.mo_coeff)
         case "uhf":
-            basis_coeff = np.asarray(scf_obj.mo_coeff[0])
+            mo_coeff = scf_obj.mo_coeff
+            basis_coeff = (
+                (np.asarray(mo_coeff[0]), np.asarray(mo_coeff[1]))
+                if hamiltonian_decomposition.startswith("charge_spin")
+                else np.asarray(mo_coeff[0])
+            )
         case _:
             raise ValueError(f"Unreachable: '{scf_obj.kind}'.")
 
     ctx = _load_fcidump_context(fcidump)
     norb = int(ctx["NORB"])
-    if basis_coeff.shape[1] != norb:
-        raise ValueError(
-            "FCIDUMP NORB does not match mf orbital count: " f"{norb} != {basis_coeff.shape[1]}."
-        )
+    coeffs_to_check = basis_coeff if isinstance(basis_coeff, tuple) else (basis_coeff,)
+    for coeff in coeffs_to_check:
+        if coeff.shape[0] != norb or coeff.shape[1] != norb:
+            raise ValueError(
+                "charge_spin FCIDUMP staging expects square MO coefficient matrices matching "
+                f"FCIDUMP NORB={norb}, got {coeff.shape}."
+            )
 
     h0 = float(ctx.get("ECORE", 0.0))
     h1_ao = np.asarray(ctx["H1"])
     if h1_ao.shape != (norb, norb):
         raise ValueError(f"FCIDUMP H1 must have shape ({norb}, {norb}), got {h1_ao.shape}.")
     h1_ao = 0.5 * (h1_ao + h1_ao.T.conj())
-    h1 = basis_coeff.T.conj() @ h1_ao @ basis_coeff
+    if hamiltonian_decomposition.startswith("charge_spin"):
+        assert isinstance(basis_coeff, tuple)
+        C_alpha, C_beta = basis_coeff
+        h1 = np.stack(
+            [
+                C_alpha.T.conj() @ h1_ao @ C_alpha,
+                C_beta.T.conj() @ h1_ao @ C_beta,
+            ],
+            axis=0,
+        )
+    else:
+        assert not isinstance(basis_coeff, tuple)
+        h1 = basis_coeff.T.conj() @ h1_ao @ basis_coeff
     h1 = np.asarray(h1)
 
     h2_raw = np.asarray(ctx["H2"])
     eri_ao = ao2mo.restore(1, h2_raw, norb)
-    eri_mo = np.einsum(
-        "pi,qj,rk,sl,pqrs->ijkl",
-        basis_coeff.conj(),
-        basis_coeff.conj(),
-        basis_coeff,
-        basis_coeff,
-        eri_ao,
-        optimize=True,
-    )
 
     nelec_tot = int(ctx["NELEC"])
     ms2 = int(ctx.get("MS2", 0))
@@ -1146,8 +1166,37 @@ def _stage_ham_input_from_fcidump(
         )
 
     t0 = time.time()
-    eri_s4 = ao2mo.restore(4, np.asarray(eri_mo), norb)
-    chol = modified_cholesky(eri_s4, max_error=chol_cut)
+    if hamiltonian_decomposition.startswith("charge_spin"):
+        eri_s4 = ao2mo.restore(4, np.asarray(eri_ao), norb)
+        chol_src = modified_cholesky(eri_s4, max_error=chol_cut)
+        assert isinstance(basis_coeff, tuple)
+        C_alpha, C_beta = basis_coeff
+        spin_chol = np.stack(
+            [
+                _rotate_chol_to_mo(chol_src, C_alpha),
+                _rotate_chol_to_mo(chol_src, C_beta),
+            ],
+            axis=1,
+        )
+        if hamiltonian_decomposition == "charge_spin":
+            chol = _factorize_charge_spin_cholesky_full(spin_chol)
+        else:
+            chol = spin_chol
+        ham_basis = "charge_spin"
+    else:
+        assert not isinstance(basis_coeff, tuple)
+        eri_mo = np.einsum(
+            "pi,qj,rk,sl,pqrs->ijkl",
+            basis_coeff.conj(),
+            basis_coeff.conj(),
+            basis_coeff,
+            basis_coeff,
+            eri_ao,
+            optimize=True,
+        )
+        eri_s4 = ao2mo.restore(4, np.asarray(eri_mo), norb)
+        chol = modified_cholesky(eri_s4, max_error=chol_cut)
+        ham_basis = "restricted"
     if verbose:
         print(f"[stage] FCIDUMP cholesky: nchol={chol.shape[0]} in {time.time() - t0:.2f}s")
 
@@ -1160,7 +1209,7 @@ def _stage_ham_input_from_fcidump(
         chol_cut=float(chol_cut),
         frozen=norb_frozen,
         source_kind=obj.source,
-        basis="restricted",
+        basis=ham_basis,
     )
 
 

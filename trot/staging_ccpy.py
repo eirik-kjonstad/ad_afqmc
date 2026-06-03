@@ -442,25 +442,30 @@ def stage_from_ccpy(
 
     t_ham = _stage_begin("building Hamiltonian")
     ham_source = "mf"
-    if (
-        fcidump is not None
-        and int(obj.afqmc_frozen) == 0
-        and not hamiltonian_decomposition.startswith("charge_spin")
-    ):
+    if fcidump is not None and int(obj.afqmc_frozen) == 0:
         ham = _stage_ham_input_from_fcidump(
-            obj, fcidump=fcidump, chol_cut=chol_cut, verbose=verbose
+            obj,
+            fcidump=fcidump,
+            chol_cut=chol_cut,
+            verbose=verbose,
+            hamiltonian_decomposition=hamiltonian_decomposition,
         )
         ham_source = "fcidump"
     else:
+        if (
+            fcidump is not None
+            and int(obj.afqmc_frozen) > 0
+            and hamiltonian_decomposition.startswith("charge_spin")
+        ):
+            raise NotImplementedError(
+                "stage_from_ccpy charge_spin with fcidump currently requires "
+                "norb_frozen_core=0. If the FCIDUMP is already an active-space Hamiltonian, "
+                "pass norb_frozen_core=0."
+            )
         if fcidump is not None and int(obj.afqmc_frozen) > 0 and verbose:
             print(
                 "[stage] FCIDUMP + norb_frozen>0 requested; "
                 "using existing MF frozen-core Hamiltonian staging."
-            )
-        elif fcidump is not None and hamiltonian_decomposition.startswith("charge_spin") and verbose:
-            print(
-                "[stage] FCIDUMP + charge_spin requested; "
-                "using MF-based charge/spin Hamiltonian staging."
             )
         ham = _stage_ham_input(
             obj,
