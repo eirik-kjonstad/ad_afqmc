@@ -173,23 +173,24 @@ def _spin_channel_norm_diagnostics(
             f"{name}_s_max": nan,
         }
 
-    if prop_ctx.spin_decomposition_lambda >= 1.0:
+    if prop_ctx.decomposition == "spin_null":
+        nan = jnp.asarray(jnp.nan, dtype=dtype)
+        n_chol = values.shape[1] // 3
+        charge = jnp.linalg.norm(values[:, :n_chol], axis=1)
+        minus = jnp.linalg.norm(values[:, n_chol : 2 * n_chol], axis=1)
+        null = jnp.linalg.norm(values[:, 2 * n_chol :], axis=1)
+        alpha = jnp.full((values.shape[0],), nan, dtype=dtype)
+        beta = jnp.full((values.shape[0],), nan, dtype=dtype)
+        spin = jnp.full((values.shape[0],), nan, dtype=dtype)
+    elif prop_ctx.spin_decomposition_lambda >= 1.0:
         nan = jnp.asarray(jnp.nan, dtype=dtype)
         n_chol = values.shape[1] // 3
         charge = jnp.full((values.shape[0],), nan, dtype=dtype)
-        if prop_ctx.decomposition == "spin_null":
-            charge = jnp.linalg.norm(values[:, :n_chol], axis=1)
-            minus = jnp.linalg.norm(values[:, n_chol : 2 * n_chol], axis=1)
-            null = jnp.linalg.norm(values[:, 2 * n_chol :], axis=1)
-            alpha = jnp.full((values.shape[0],), nan, dtype=dtype)
-            beta = jnp.full((values.shape[0],), nan, dtype=dtype)
-            spin = jnp.full((values.shape[0],), nan, dtype=dtype)
-        else:
-            minus = jnp.full((values.shape[0],), nan, dtype=dtype)
-            null = jnp.full((values.shape[0],), nan, dtype=dtype)
-            alpha = jnp.linalg.norm(values[:, :n_chol], axis=1)
-            beta = jnp.linalg.norm(values[:, n_chol : 2 * n_chol], axis=1)
-            spin = jnp.linalg.norm(values[:, 2 * n_chol :], axis=1)
+        minus = jnp.full((values.shape[0],), nan, dtype=dtype)
+        null = jnp.full((values.shape[0],), nan, dtype=dtype)
+        alpha = jnp.linalg.norm(values[:, :n_chol], axis=1)
+        beta = jnp.linalg.norm(values[:, n_chol : 2 * n_chol], axis=1)
+        spin = jnp.linalg.norm(values[:, 2 * n_chol :], axis=1)
     else:
         nan = jnp.asarray(jnp.nan, dtype=dtype)
         n_chol = values.shape[1] // 4
