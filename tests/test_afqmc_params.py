@@ -52,12 +52,16 @@ def test_afqmc_source_kind_mf():
 def test_afqmc_make_params_from_self_attributes():
     af = Afqmc(DUMMY_MF, dt=0.01, n_walkers=50, seed=7)
     af.spin_pivot_field_shift_cap = 0.5
+    af.spin_pivot_field_shift_scale = 2.0
+    af.spin_pivot_reference_drift = 0.25
     params = af._make_params()
     assert isinstance(params, QmcParams)
     assert params.dt == 0.01
     assert params.n_walkers == 50
     assert params.seed == 7
     assert params.spin_pivot_field_shift_cap == 0.5
+    assert params.spin_pivot_field_shift_scale == 2.0
+    assert params.spin_pivot_reference_drift == 0.25
 
 
 def test_afqmc_make_params_uses_defaults():

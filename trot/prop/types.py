@@ -47,6 +47,8 @@ class QmcParams(QmcParamsBase):
     shift_ema: float = 0.1
     n_eql_blocks: int = 20
     spin_pivot_field_shift_cap: float | None = None
+    spin_pivot_field_shift_scale: float = 1.0
+    spin_pivot_reference_drift: float = 0.0
 
 
 @dataclass(frozen=True)

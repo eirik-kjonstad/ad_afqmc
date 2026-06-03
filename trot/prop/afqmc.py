@@ -72,6 +72,10 @@ def _empty_charge_spin_pivot_diagnostics(ham_data: HamChol) -> dict[str, jax.Arr
         "field_shift_uncapped_norm_spin_pivot_max": zero,
         "field_shift_uncapped_norm_per_pivot_spin_pivot_mean": zero,
         "field_shift_uncapped_norm_per_pivot_spin_pivot_max": zero,
+        "spin_pivot_field_shift_scale": one,
+        "spin_pivot_reference_drift": zero,
+        "spin_pivot_reference_drift_norm": zero,
+        "spin_pivot_reference_drift_norm_per_pivot": zero,
         "n_floor": zero,
         "n_nonfinite": zero,
         "n_imp_cap": zero,
@@ -115,6 +119,57 @@ def _empty_spin_pivot_field_shift_cap_diagnostics(dtype: Any = jnp.float64) -> d
         "field_shift_uncapped_norm_per_pivot_spin_pivot_mean": zero,
         "field_shift_uncapped_norm_per_pivot_spin_pivot_max": zero,
     }
+
+
+def _empty_spin_pivot_field_shift_bias_diagnostics(
+    dtype: Any = jnp.float64,
+) -> dict[str, jax.Array]:
+    zero = jnp.asarray(0.0, dtype=dtype)
+    one = jnp.asarray(1.0, dtype=dtype)
+    return {
+        "spin_pivot_field_shift_scale": one,
+        "spin_pivot_reference_drift": zero,
+        "spin_pivot_reference_drift_norm": zero,
+        "spin_pivot_reference_drift_norm_per_pivot": zero,
+    }
+
+
+def _bias_spin_pivot_field_shifts(
+    field_shifts: jax.Array,
+    spin_mask: jax.Array,
+    *,
+    scale: float = 1.0,
+    reference_drift: float = 0.0,
+    mf_shifts: jax.Array,
+    sqrt_dt: jax.Array,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    dtype = field_shifts.real.dtype
+    scale_value = jnp.asarray(scale, dtype=dtype)
+    drift_value = jnp.asarray(reference_drift, dtype=dtype)
+
+    scaled = jnp.where(
+        spin_mask[None, :],
+        field_shifts * scale_value,
+        field_shifts,
+    )
+    ref_shift = drift_value * sqrt_dt * mf_shifts
+    ref_shift = jnp.where(spin_mask, ref_shift, 0.0)
+    biased = scaled + ref_shift[None, :]
+
+    drift_norm = jnp.sqrt(jnp.sum(jnp.abs(ref_shift) ** 2))
+    n_pivots = jnp.sum(spin_mask)
+    drift_norm_per_pivot = jnp.where(
+        n_pivots > 0,
+        drift_norm / jnp.sqrt(jnp.asarray(n_pivots, dtype=dtype)),
+        0.0,
+    )
+    diagnostics = {
+        "spin_pivot_field_shift_scale": scale_value,
+        "spin_pivot_reference_drift": drift_value,
+        "spin_pivot_reference_drift_norm": drift_norm,
+        "spin_pivot_reference_drift_norm_per_pivot": drift_norm_per_pivot,
+    }
+    return biased, diagnostics
 
 
 def _cap_spin_pivot_field_shifts(
@@ -183,6 +238,28 @@ def _apply_spin_pivot_field_shift_cap(
         return field_shifts, None
     _, spin_mask = masks
     return _cap_spin_pivot_field_shifts(field_shifts, spin_mask, cap)
+
+
+def _apply_spin_pivot_field_shift_biases(
+    ham_data: HamChol,
+    field_shifts: jax.Array,
+    prop_ctx: CholAfqmcCtx,
+    *,
+    scale: float,
+    reference_drift: float,
+) -> tuple[jax.Array, dict[str, jax.Array] | None]:
+    masks = _charge_spin_pivot_masks(ham_data)
+    if masks is None:
+        return field_shifts, None
+    _, spin_mask = masks
+    return _bias_spin_pivot_field_shifts(
+        field_shifts,
+        spin_mask,
+        scale=scale,
+        reference_drift=reference_drift,
+        mf_shifts=prop_ctx.mf_shifts,
+        sqrt_dt=prop_ctx.sqrt_dt,
+    )
 
 
 def _charge_spin_pivot_diagnostics(
@@ -380,6 +457,13 @@ def afqmc_step(
         fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
     )(state.walkers, ham_data, meas_ctx, trial_data)
     field_shifts = -prop_ctx.sqrt_dt * (1.0j * force_bias - prop_ctx.mf_shifts)
+    field_shifts, bias_diagnostics = _apply_spin_pivot_field_shift_biases(
+        ham_data,
+        field_shifts,
+        prop_ctx,
+        scale=getattr(params, "spin_pivot_field_shift_scale", 1.0),
+        reference_drift=getattr(params, "spin_pivot_reference_drift", 0.0),
+    )
     field_shifts, cap_diagnostics = _apply_spin_pivot_field_shift_cap(
         ham_data,
         field_shifts,
@@ -394,8 +478,11 @@ def afqmc_step(
         mf_shifts=prop_ctx.mf_shifts,
         sqrt_dt=prop_ctx.sqrt_dt,
     )
-    if diagnostics is not None and cap_diagnostics is not None:
-        diagnostics = {**diagnostics, **cap_diagnostics}
+    if diagnostics is not None:
+        if bias_diagnostics is not None:
+            diagnostics = {**diagnostics, **bias_diagnostics}
+        if cap_diagnostics is not None:
+            diagnostics = {**diagnostics, **cap_diagnostics}
 
     shift_term = jnp.sum(shifted_fields * prop_ctx.mf_shifts, axis=1)
     fb_term = jnp.sum(fields * field_shifts - 0.5 * field_shifts * field_shifts, axis=1)
