@@ -693,6 +693,7 @@ def stage(
     cache: Union[str, Path] | None = None,
     overwrite: bool = False,
     verbose: bool = False,
+    hamiltonian_decomposition: str = "standard",
     ham: HamInput | None = None,
     trial: TrialInput | None = None,
 ) -> StagedInputs:
@@ -724,6 +725,10 @@ def stage(
             If True and cache is provided, recompute and overwrite cache.
         verbose:
             Print timing/info.
+        hamiltonian_decomposition:
+            ``"standard"`` keeps the existing Hamiltonian basis convention. ``"charge_spin"``
+            stages collinear spin-resolved alpha/beta Cholesky factors for the UHF
+            charge/spin HS experiment.
         ham:
             Optionally provide HamInput. If None, will be staged from obj.
         trial:
@@ -748,6 +753,7 @@ def stage(
             obj,
             chol_cut=chol_cut,
             verbose=verbose,
+            hamiltonian_decomposition=hamiltonian_decomposition,
         )
         _stage_end(
             t_ham,
@@ -757,7 +763,10 @@ def stage(
 
     if trial is None:
         t_trial = _stage_begin("building trial input")
-        trial = _stage_trial_input(obj)
+        trial = _stage_trial_input(
+            obj,
+            hamiltonian_decomposition=hamiltonian_decomposition,
+        )
         _stage_end(t_trial, "trial input ready", details=f"kind={trial.kind}")
 
     meta: Dict[str, Any] = {
@@ -766,6 +775,7 @@ def stage(
         "source_kind": obj.source,
         "frozen": _freeze_meta_value(obj.afqmc_frozen),
         "chol_cut": ham.chol_cut if ham is not None else chol_cut,
+        "hamiltonian_decomposition": hamiltonian_decomposition,
         "mol": {
             "nao": int(mol.nao),
             "nelectron": int(mol.nelectron),
@@ -826,7 +836,13 @@ def _is_cc_like(obj: Any) -> bool:
     return hasattr(obj, "t1") and hasattr(obj, "t2")
 
 
-def _stage_ham_input(obj: StagedMfOrCc, *, chol_cut: float, verbose: bool) -> HamInput:
+def _stage_ham_input(
+    obj: StagedMfOrCc,
+    *,
+    chol_cut: float,
+    verbose: bool,
+    hamiltonian_decomposition: str = "standard",
+) -> HamInput:
     """
     Produce h0/h1/chol in a single orthonormal basis.
     For UHF, we use the alpha MO basis for integrals.
@@ -836,28 +852,57 @@ def _stage_ham_input(obj: StagedMfOrCc, *, chol_cut: float, verbose: bool) -> Ha
     mol = obj.mol
     scf_obj = obj.mf
 
+    if hamiltonian_decomposition not in ("standard", "charge_spin"):
+        raise ValueError(
+            "hamiltonian_decomposition must be 'standard' or 'charge_spin', got "
+            f"{hamiltonian_decomposition!r}."
+        )
+    if hamiltonian_decomposition == "charge_spin" and scf_obj.kind != "uhf":
+        raise ValueError("charge_spin decomposition currently requires a UHF reference.")
+
     match scf_obj.kind:
         case "rhf" | "rohf" | "ghf":
             basis_coeff = np.asarray(scf_obj.mo_coeff)
         case "uhf":
-            basis_coeff = np.asarray(scf_obj.mo_coeff[0])
+            mo_coeff = scf_obj.mo_coeff
+            basis_coeff = (
+                (np.asarray(mo_coeff[0]), np.asarray(mo_coeff[1]))
+                if hamiltonian_decomposition == "charge_spin"
+                else np.asarray(mo_coeff[0])
+            )
         case _:
             raise ValueError(f"Unreachable: '{scf_obj.kind}'.")
 
-    match scf_obj.kind:
-        case "rhf" | "rohf" | "uhf":
-            ham_basis = "restricted"
-        case "ghf":
-            ham_basis = "generalized"
-        case _:
-            raise ValueError(f"Unreachable: '{scf_obj.kind}'.")
+    if hamiltonian_decomposition == "charge_spin":
+        ham_basis = "charge_spin"
+    else:
+        match scf_obj.kind:
+            case "rhf" | "rohf" | "uhf":
+                ham_basis = "restricted"
+            case "ghf":
+                ham_basis = "generalized"
+            case _:
+                raise ValueError(f"Unreachable: '{scf_obj.kind}'.")
 
     # nuclear energy (without frozen core correction)
     h0 = float(scf_obj.energy_nuc())
 
     # one body
     hcore = scf_obj.get_hcore()
-    h1 = basis_coeff.T.conj() @ hcore @ basis_coeff
+    if ham_basis == "charge_spin":
+        if isinstance(basis_coeff, tuple):
+            C_alpha, C_beta = basis_coeff
+        else:
+            C_alpha = C_beta = np.asarray(basis_coeff)
+        h1 = np.stack(
+            [
+                C_alpha.T.conj() @ hcore @ C_alpha,
+                C_beta.T.conj() @ hcore @ C_beta,
+            ],
+            axis=0,
+        )
+    else:
+        h1 = basis_coeff.T.conj() @ hcore @ basis_coeff
     h1 = np.asarray(h1)
 
     # ao cholesky
@@ -873,16 +918,37 @@ def _stage_ham_input(obj: StagedMfOrCc, *, chol_cut: float, verbose: bool) -> Ha
     assert isinstance(norb_frozen, int)
 
     # mo Cholesky
-    C = np.asarray(basis_coeff)
-    if scf_obj.kind != "ghf":
+    if ham_basis == "charge_spin":
+        if norb_frozen > 0:
+            raise NotImplementedError(
+                "Frozen-core charge_spin Hamiltonian staging is not implemented because "
+                "the current frozen-core path assumes one common spatial MO basis."
+            )
+        if isinstance(basis_coeff, tuple):
+            C_alpha, C_beta = basis_coeff
+        else:
+            C_alpha = C_beta = np.asarray(basis_coeff)
+        norb = int(C_alpha.shape[1])
+        if int(C_beta.shape[1]) != norb:
+            raise ValueError("Alpha and beta MO coefficient blocks must have the same nmo.")
+        chol = np.stack(
+            [
+                _rotate_chol_to_mo(chol_vec, C_alpha),
+                _rotate_chol_to_mo(chol_vec, C_beta),
+            ],
+            axis=1,
+        )
+    elif scf_obj.kind != "ghf":
+        C = np.asarray(basis_coeff)
         norb = int(basis_coeff.shape[1])
         chol = _rotate_chol_to_mo(chol_vec, C)
     else:
+        C = np.asarray(basis_coeff)
         norb = basis_coeff.shape[1] // 2
         chol = _rotate_chol_to_ghf_mo(chol_vec, C)
 
     # freeze core
-    if norb_frozen > 0 and scf_obj.kind != "ghf":
+    if norb_frozen > 0 and scf_obj.kind != "ghf" and ham_basis != "charge_spin":
 
         if isinstance(norb_frozen, int):
             if norb_frozen > min(nelec):
@@ -1031,7 +1097,11 @@ def _stage_ham_input_from_fcidump(
     )
 
 
-def _stage_trial_input(obj: StagedMfOrCc) -> TrialInput:
+def _stage_trial_input(
+    obj: StagedMfOrCc,
+    *,
+    hamiltonian_decomposition: str = "standard",
+) -> TrialInput:
     """
     Produce TrialInput consistent with the Hamiltonian basis and frozen core choice
     """
@@ -1050,6 +1120,14 @@ def _stage_trial_input(obj: StagedMfOrCc) -> TrialInput:
         case _:
             raise ValueError(f"Unreachable: '{obj.kind}'.")
 
+    if stage_tr_fun is _stage_mf_input:
+        return _stage_mf_input(obj, hamiltonian_decomposition=hamiltonian_decomposition)
+
+    if hamiltonian_decomposition == "charge_spin":
+        raise NotImplementedError(
+            "charge_spin staging currently supports mean-field Slater trials only."
+        )
+
     return stage_tr_fun(obj)
 
 
@@ -1065,7 +1143,11 @@ def _apply_frozen_mask(vec: NDArray, frozen: int | NDArray) -> NDArray:
     return vec[_active_orbital_indices(vec.shape[0], frozen)]
 
 
-def _stage_mf_input(obj: StagedMfOrCc) -> TrialInput:
+def _stage_mf_input(
+    obj: StagedMfOrCc,
+    *,
+    hamiltonian_decomposition: str = "standard",
+) -> TrialInput:
 
     mol = obj.mol
     S = obj.get_ovlp(mol)
@@ -1090,9 +1172,14 @@ def _stage_mf_input(obj: StagedMfOrCc) -> TrialInput:
             Ca = np.asarray(obj.mo_coeff[0])
             Cb = np.asarray(obj.mo_coeff[1])
 
-            # basis is alpha MOs, represent alpha and beta orbitals in this basis
-            moa = _mf_coeff_helper(Ca, Ca, S, frozen)
-            mob = _mf_coeff_helper(Ca, Cb, S, frozen)
+            if hamiltonian_decomposition == "charge_spin":
+                # Alpha and beta walkers live in their own UHF MO bases.
+                moa = _mf_coeff_helper(Ca, Ca, S, frozen)
+                mob = _mf_coeff_helper(Cb, Cb, S, frozen)
+            else:
+                # basis is alpha MOs, represent alpha and beta orbitals in this basis
+                moa = _mf_coeff_helper(Ca, Ca, S, frozen)
+                mob = _mf_coeff_helper(Ca, Cb, S, frozen)
             data = {"mo_a": np.asarray(moa), "mo_b": np.asarray(mob)}
         case _:
             raise ValueError(f"Unreachable: '{obj.kind}'.")

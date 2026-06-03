@@ -95,6 +95,10 @@ class Afqmc:
         Number of walkers if params is not provided, by default None
     n_chunk : int | None, optional
         Number of chunks if params is not provided, by default 1
+    hamiltonian_decomposition : str, optional
+        ``"standard"`` keeps the existing Hamiltonian staging. ``"charge_spin"``
+        stages spin-resolved UHF alpha/beta Cholesky factors for the charge/spin
+        HS experiment.
     """
 
     params_cls = QmcParams
@@ -115,6 +119,7 @@ class Afqmc:
         dt: float | None = None,
         n_walkers: int | None = None,
         n_chunks: int | None = None,
+        hamiltonian_decomposition: str = "standard",
     ):
         self._obj = mf_or_cc
         self._cc: Any = None
@@ -133,6 +138,12 @@ class Afqmc:
         self.norb_frozen_core = resolved_norb_frozen
         self.norb_frozen = resolved_norb_frozen
         self.chol_cut = float(chol_cut)
+        if hamiltonian_decomposition not in ("standard", "charge_spin"):
+            raise ValueError(
+                "hamiltonian_decomposition must be 'standard' or 'charge_spin', got "
+                f"{hamiltonian_decomposition!r}."
+            )
+        self.hamiltonian_decomposition = hamiltonian_decomposition
         self.cache = Path(cache).expanduser().resolve() if cache is not None else None
         self.overwrite_cache = False
         self.verbose = False
@@ -219,6 +230,7 @@ class Afqmc:
         print(f" nchol           = {nchol}")
         print(f" source_kind     = {src}")
         print(f" trial_kind      = {trial.kind}")
+        print(f" ham_basis       = {job.staged.ham.basis}")
         print(f" chol_cut        = {chol_cut:g}")
         print(f" cache           = {str(self.cache) if self.cache else None}")
         print(f" walker_kind     = {sys.walker_kind}")
@@ -238,6 +250,7 @@ class Afqmc:
             self.source_kind,
             _frozen_cache_key(self.norb_frozen_core),
             float(self.chol_cut),
+            self.hamiltonian_decomposition,
             str(self.cache) if self.cache is not None else None,
             bool(self.overwrite_cache),
             cache_mtime,
@@ -274,6 +287,7 @@ class Afqmc:
             cache=self.cache,
             overwrite=self.overwrite_cache if self.cache is not None else False,
             verbose=self.verbose,
+            hamiltonian_decomposition=self.hamiltonian_decomposition,
         )
         self._staged = staged
         self._cache_key = key
@@ -452,6 +466,7 @@ class AfqmcFp(Afqmc):
         n_chunks: int = 1,
         ene0: float | None = None,
         n_traj: int | None = None,
+        hamiltonian_decomposition: str = "standard",
     ):
         super().__init__(
             mf_or_cc,
@@ -465,6 +480,7 @@ class AfqmcFp(Afqmc):
             dt=dt,
             n_walkers=n_walkers,
             n_chunks=n_chunks,
+            hamiltonian_decomposition=hamiltonian_decomposition,
         )
         defaults = self.params_cls()
         self.n_prop_steps = defaults.n_prop_steps if n_prop_steps is None else n_prop_steps

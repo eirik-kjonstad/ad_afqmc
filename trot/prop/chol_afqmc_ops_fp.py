@@ -62,7 +62,7 @@ def _build_prop_ctx_fp(
     h1_eff = _get_h1_eff(ham_data, mf)
     exp_h1_half = _build_exp_h1_half_from_h1(h1_eff, dt_a)
     chol_flat = ham_data.chol.reshape(ham_data.chol.shape[0], -1).astype(chol_flat_precision)
-    norb = ham_data.chol.shape[1]
+    norb = ham_data.chol.shape[2] if ham_data.basis == "charge_spin" else ham_data.chol.shape[1]
     return FpCholAfqmcCtx(
         dt=dt_a,
         sqrt_dt=sqrt_dt,

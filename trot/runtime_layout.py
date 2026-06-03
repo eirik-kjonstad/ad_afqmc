@@ -98,7 +98,8 @@ def _make_ham_data(ham: HamInput | HamChol, mesh: Mesh | None, *, compact_chol: 
                 f"to shard evenly over n_model={_model_axis_size(mesh)}.",
                 flush=True,
             )
-        chol = np.zeros((0, 0, 0), dtype=np.asarray(chol).dtype)
+        chol_shape = (0, 0, 0, 0) if ham.basis == "charge_spin" else (0, 0, 0)
+        chol = np.zeros(chol_shape, dtype=np.asarray(chol).dtype)
 
     if mesh is not None and mesh.size > 1 and has_model_axis(mesh):
         return HamChol(

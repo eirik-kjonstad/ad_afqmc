@@ -39,12 +39,14 @@ class AutoMeasCtx:
         )
 
 
-def _v0_from_chol(chol: jax.Array) -> jax.Array:
+def _v0_from_chol(chol: jax.Array, basis: str = "restricted") -> jax.Array:
+    if basis == "charge_spin":
+        return 0.5 * jnp.einsum("gsik,gskj->sij", chol, chol, optimize="optimal")
     return 0.5 * jnp.einsum("gik,gjk->ij", chol, chol, optimize="optimal")
 
 
 def build_meas_ctx(ham_data: HamChol, _trial_data: trial_data, eps: float = 1.0e-4) -> AutoMeasCtx:
-    v0 = _v0_from_chol(ham_data.chol)
+    v0 = _v0_from_chol(ham_data.chol, ham_data.basis)
     h1_eff = ham_data.h1 - v0
     return AutoMeasCtx(h1_eff=h1_eff, eps=jnp.asarray(eps))
 
@@ -131,9 +133,14 @@ def force_bias_kernel_uw_rh(
     n_fields = chol.shape[0]
 
     def f(x_gamma: jax.Array) -> jax.Array:
-        x_chol = jnp.einsum("gij,g->ij", chol, x_gamma, optimize="optimal")
-        wu1 = wu + x_chol @ wu
-        wd1 = wd + x_chol @ wd
+        if ham_data.basis == "charge_spin":
+            x_chol = jnp.einsum("gsij,g->sij", chol, x_gamma, optimize="optimal")
+            wu1 = wu + x_chol[0] @ wu
+            wd1 = wd + x_chol[1] @ wd
+        else:
+            x_chol = jnp.einsum("gij,g->ij", chol, x_gamma, optimize="optimal")
+            wu1 = wu + x_chol @ wu
+            wd1 = wd + x_chol @ wd
         return overlap((wu1, wd1), trial_data)
 
     x0 = jnp.zeros((n_fields,), dtype=wu.dtype)
@@ -226,8 +233,12 @@ def energy_kernel_uw_rh(
 
     # one-body derivative via jvp
     def f1(x: jax.Array) -> jax.Array:
-        wu1 = wu + x * (h1_eff @ wu)
-        wd1 = wd + x * (h1_eff @ wd)
+        if ham_data.basis == "charge_spin":
+            wu1 = wu + x * (h1_eff[0] @ wu)
+            wd1 = wd + x * (h1_eff[1] @ wd)
+        else:
+            wu1 = wu + x * (h1_eff @ wu)
+            wd1 = wd + x * (h1_eff @ wd)
         return overlap((wu1, wd1), trial_data)
 
     x0 = jnp.asarray(0.0)
@@ -237,8 +248,14 @@ def energy_kernel_uw_rh(
         acc0 = jnp.zeros((), dtype=ovlp0.dtype)
 
         def body(acc, chol_i):
-            wu1 = wu + x * (chol_i @ wu) + 0.5 * (x * x) * (chol_i @ (chol_i @ wu))
-            wd1 = wd + x * (chol_i @ wd) + 0.5 * (x * x) * (chol_i @ (chol_i @ wd))
+            if ham_data.basis == "charge_spin":
+                chol_a = chol_i[0]
+                chol_b = chol_i[1]
+                wu1 = wu + x * (chol_a @ wu) + 0.5 * (x * x) * (chol_a @ (chol_a @ wu))
+                wd1 = wd + x * (chol_b @ wd) + 0.5 * (x * x) * (chol_b @ (chol_b @ wd))
+            else:
+                wu1 = wu + x * (chol_i @ wu) + 0.5 * (x * x) * (chol_i @ (chol_i @ wu))
+                wd1 = wd + x * (chol_i @ wd) + 0.5 * (x * x) * (chol_i @ (chol_i @ wd))
             return acc + overlap((wu1, wd1), trial_data), None
 
         acc, _ = lax.scan(body, acc0, chol)

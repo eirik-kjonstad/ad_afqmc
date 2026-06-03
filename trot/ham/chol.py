@@ -6,7 +6,7 @@ from typing import Literal
 import jax
 from jax import tree_util
 
-HamBasis = Literal["restricted", "generalized"]
+HamBasis = Literal["restricted", "generalized", "charge_spin"]
 
 
 @tree_util.register_pytree_node_class
@@ -22,6 +22,13 @@ class HamChol:
     basis="generalized":
       h1:   (nso, nso)   where nso = 2*norb
       chol: (n_fields, nso, nso)
+
+    basis="charge_spin":
+      h1:   (2, norb, norb)
+      chol: (n_fields, 2, norb, norb)
+      spin index 0 is alpha and spin index 1 is beta.  This represents the
+      UHF charge/spin HS factorization in spin-resolved form:
+      L_alpha = L_0 + L_z, L_beta = L_0 - L_z.
     """
 
     h0: jax.Array
@@ -31,7 +38,7 @@ class HamChol:
     nchol: int | None = None
 
     def __post_init__(self):
-        if self.basis not in ("restricted", "generalized"):
+        if self.basis not in ("restricted", "generalized", "charge_spin"):
             raise ValueError(f"unknown basis: {self.basis}")
         chol_shape = getattr(self.chol, "shape", None)
         if chol_shape is None:
@@ -77,8 +84,12 @@ def slice_ham_level(ham: HamChol, *, norb_keep: int | None, nchol_keep: int | No
     new_nchol = ham.nchol
 
     if norb_keep is not None:
-        h1 = h1[:norb_keep, :norb_keep]
-        chol = chol[:, :norb_keep, :norb_keep]
+        if ham.basis == "charge_spin":
+            h1 = h1[:, :norb_keep, :norb_keep]
+            chol = chol[:, :, :norb_keep, :norb_keep]
+        else:
+            h1 = h1[:norb_keep, :norb_keep]
+            chol = chol[:, :norb_keep, :norb_keep]
 
     if nchol_keep is not None:
         chol = chol[:nchol_keep]

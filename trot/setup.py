@@ -120,6 +120,7 @@ def _resolve_staged(
     cache: Union[str, Path] | None,
     overwrite: bool,
     verbose: bool,
+    hamiltonian_decomposition: str = "standard",
 ) -> StagedInputs:
     staged: StagedInputs
     if isinstance(obj_or_staged, StagedInputs):
@@ -142,6 +143,7 @@ def _resolve_staged(
         cache=cache,
         overwrite=overwrite,
         verbose=verbose,
+        hamiltonian_decomposition=hamiltonian_decomposition,
     )
     return staged
 
@@ -169,12 +171,16 @@ def _make_trial_bundle(
         return trial_data, trial_ops, meas_ops
 
     if kind in {"rohf", "uhf"}:
+        from .meas.auto import make_auto_meas_ops
         from .meas.uhf import make_uhf_meas_ops
         from .trial.uhf import make_uhf_trial_data, make_uhf_trial_ops
 
         trial_data = make_uhf_trial_data(data, sys)
         trial_ops = make_uhf_trial_ops(sys=sys)
-        meas_ops = make_uhf_meas_ops(sys=sys)
+        if staged.ham.basis == "charge_spin":
+            meas_ops = make_auto_meas_ops(sys=sys, trial_ops_=trial_ops)
+        else:
+            meas_ops = make_uhf_meas_ops(sys=sys)
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 
@@ -245,6 +251,8 @@ def _make_trial_bundle(
 
 def _resolve_default_walker_kind(ham: Any, walker_kind: WalkerKind | None) -> WalkerKind:
     if walker_kind is None:
+        if ham.basis == "charge_spin":
+            return "unrestricted"
         return cast(WalkerKind, ham.basis)
     return walker_kind
 
@@ -341,6 +349,7 @@ def _assemble_job(
     cache: Union[str, Path] | None = None,
     overwrite: bool = False,
     verbose: bool = False,
+    hamiltonian_decomposition: str = "standard",
     walker_kind: WalkerKind | None = None,
     mesh: Mesh | None = None,
     mixed_precision: bool = True,
@@ -375,6 +384,7 @@ def _assemble_job(
         cache=cache,
         overwrite=overwrite,
         verbose=verbose,
+        hamiltonian_decomposition=hamiltonian_decomposition,
     )
     ham = staged.ham
 
@@ -439,6 +449,7 @@ def setup(
     cache: Union[str, Path] | None = None,
     overwrite: bool = False,
     verbose: bool = False,
+    hamiltonian_decomposition: str = "standard",
     # system/prop options
     walker_kind: WalkerKind | None = None,
     mesh: Mesh | None = None,
@@ -478,6 +489,7 @@ def setup(
         cache=cache,
         overwrite=overwrite,
         verbose=verbose,
+        hamiltonian_decomposition=hamiltonian_decomposition,
         walker_kind=walker_kind,
         mesh=mesh,
         mixed_precision=mixed_precision,

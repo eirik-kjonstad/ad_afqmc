@@ -76,6 +76,8 @@ def _resolve_fp_walker_kind(ham: Any, walker_kind: WalkerKind | None) -> WalkerK
             return "unrestricted"
         case "generalized", _:
             return "generalized"
+        case "charge_spin", _:
+            return "unrestricted"
 
     raise ValueError(f"Unsupported ham.basis: {ham.basis!r}")
 
@@ -99,6 +101,7 @@ def setup_fp(
     cache: Union[str, Path] | None = None,
     overwrite: bool = False,
     verbose: bool = False,
+    hamiltonian_decomposition: str = "standard",
     # system/prop options
     walker_kind: WalkerKind | None = None,
     mesh: Mesh | None = None,
@@ -140,6 +143,7 @@ def setup_fp(
             cache=cache,
             overwrite=overwrite,
             verbose=verbose,
+            hamiltonian_decomposition=hamiltonian_decomposition,
             walker_kind=walker_kind,
             mesh=mesh,
             mixed_precision=mixed_precision,
