@@ -16,6 +16,13 @@ from ..core.system import System
 from ..walkers import SrFn
 from .types import PropOps, PropState, QmcParams, QmcParamsFp
 
+DIAGNOSTIC_PREFIXES = (
+    "force_bias_norm_",
+    "field_shift_norm_",
+    "shifted_field_norm_",
+    "field_phase_abs_",
+)
+
 
 class BlockFn(Protocol):
     def __call__(
@@ -205,7 +212,15 @@ def make_block_state_logger(
             sr_fn=sr_fn,
             observable_names=observable_names,
         )
-        _ = io_callback(_write_state, result_spec, state, ordered=True)
+        diagnostic_obs = {
+            key: value
+            for key, value in obs.observables.items()
+            if key.startswith(DIAGNOSTIC_PREFIXES)
+        }
+        state_to_write = state._replace(
+            diagnostics=diagnostic_obs if diagnostic_obs else state.diagnostics
+        )
+        _ = io_callback(_write_state, result_spec, state_to_write, ordered=True)
         return state, obs
 
     return logging_block_fn
@@ -245,7 +260,10 @@ def block(
         return carry, carry.diagnostics
 
     state, diagnostics = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
-    state = state._replace(diagnostics=diagnostics)
+    if diagnostics is not None:
+        state = state._replace(
+            diagnostics=tree_util.tree_map(lambda x: x[-1], diagnostics),
+        )
 
     walkers_new = wk.orthonormalize(state.walkers, sys.walker_kind)
     overlaps_new = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
@@ -277,6 +295,8 @@ def block(
     )
 
     obs_samples: dict[str, jax.Array] = {}
+    if diagnostics is not None:
+        obs_samples.update(diagnostics)
     for name in observable_names:
         kernel = meas_ops.require_observable(name)
         samples = wk.vmap_chunked(kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None))(
