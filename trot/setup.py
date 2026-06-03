@@ -205,16 +205,12 @@ def _make_trial_bundle(
         return trial_data, trial_ops, meas_ops
 
     if kind == "ucisd":
-        from .meas.auto import make_auto_meas_ops
         from .meas.ucisd import make_ucisd_meas_ops
         from .trial.ucisd import make_ucisd_trial_data, make_ucisd_trial_ops
 
         trial_data = make_ucisd_trial_data(data, sys)
         trial_ops = make_ucisd_trial_ops(sys=sys)
-        if staged.ham.basis == "charge_spin":
-            meas_ops = make_auto_meas_ops(sys=sys, trial_ops_=trial_ops)
-        else:
-            meas_ops = make_ucisd_meas_ops(sys=sys, mixed_precision=mixed_precision)
+        meas_ops = make_ucisd_meas_ops(sys=sys, mixed_precision=mixed_precision)
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 

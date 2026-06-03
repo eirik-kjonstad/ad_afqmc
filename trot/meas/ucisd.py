@@ -12,6 +12,14 @@ from ..ham.chol import HamChol
 from ..trial.ucisd import UcisdTrial, overlap_g, overlap_r, overlap_u
 
 
+def _chol_alpha(ham_data: HamChol) -> jax.Array:
+    return ham_data.chol[:, 0] if ham_data.basis == "charge_spin" else ham_data.chol
+
+
+def _h1_alpha(ham_data: HamChol) -> jax.Array:
+    return ham_data.h1[0] if ham_data.basis == "charge_spin" else ham_data.h1
+
+
 def _half_green_from_overlap_matrix(w: jax.Array, ovlp_mat: jax.Array) -> jax.Array:
     """
     green_half = (w @ inv(ovlp_mat)).T
@@ -172,7 +180,7 @@ def force_bias_kernel_uw_rh(
     greenp_a = jnp.vstack((green_occ_a, -jnp.eye(n_va)))
     greenp_b = jnp.vstack((green_occ_b, -jnp.eye(n_vb)))
 
-    chol_a = ham_data.chol
+    chol_a = _chol_alpha(ham_data)
     chol_b = meas_ctx.chol_b
     rot_chol_a = meas_ctx.rot_chol_a
     rot_chol_b = meas_ctx.rot_chol_b
@@ -304,7 +312,7 @@ def force_bias_kernel_gw_rh(
     greenp_ab = jnp.vstack((green_occ_ab, -jnp.zeros((n_va, n_vb))))
     greenp_ba = jnp.vstack((green_occ_ba, -jnp.zeros((n_vb, n_va))))
 
-    chol_aa = ham_data.chol
+    chol_aa = _chol_alpha(ham_data)
     chol_bb = meas_ctx.chol_b
 
     rot_chol_aa = meas_ctx.rot_chol_a
@@ -500,12 +508,13 @@ def energy_kernel_uw_rh(
     lci1_a = meas_ctx.lci1_a
     lci1_b = meas_ctx.lci1_b
 
-    chol_a = ham_data.chol
+    chol_a = _chol_alpha(ham_data)
     chol_b = meas_ctx.chol_b
     rot_chol_a = meas_ctx.rot_chol_a
     rot_chol_b = meas_ctx.rot_chol_b
 
-    h1_a = (ham_data.h1 + ham_data.h1.T) / 2.0
+    h1_a_raw = _h1_alpha(ham_data)
+    h1_a = (h1_a_raw + h1_a_raw.T) / 2.0
     h1_b = meas_ctx.h1_b
     hg_a = jnp.einsum("pj,pj->", h1_a[:n_oa, :], green_a)
     hg_b = jnp.einsum("pj,pj->", h1_b[:n_ob, :], green_b)
@@ -814,7 +823,7 @@ def energy_kernel_gw_rh(
 
     greenp = jnp.block([[greenp_aa, greenp_ab], [greenp_ba, greenp_bb]])
 
-    h1_aa = ham_data.h1
+    h1_aa = _h1_alpha(ham_data)
     h1_bb = meas_ctx.h1_b
     # h1 = la.block_diag(h1_aa, h1_bb)
 
@@ -822,7 +831,7 @@ def energy_kernel_gw_rh(
     rot_h1_bb = h1_bb[:n_ob, :]
     # rot_h1 = la.block_diag(rot_h1_aa, rot_h1_bb)
 
-    chol_aa = ham_data.chol
+    chol_aa = _chol_alpha(ham_data)
     chol_bb = meas_ctx.chol_b
     nchol = jnp.shape(chol_aa)[0]
 
@@ -1250,23 +1259,33 @@ def energy_kernel_gw_rh(
 def build_meas_ctx(
     ham_data: HamChol, trial_data: UcisdTrial, cfg: UcisdMeasCfg = UcisdMeasCfg()
 ) -> UcisdMeasCtx:
-    if ham_data.basis != "restricted":
-        raise ValueError("UCISD MeasOps currently assumes HamChol.basis == 'restricted'.")
+    if ham_data.basis not in ("restricted", "charge_spin"):
+        raise ValueError(
+            "UCISD MeasOps currently assumes HamChol.basis is 'restricted' or 'charge_spin'."
+        )
     n_oa, n_ob = trial_data.nocc
     cb = trial_data.mo_coeff_b  # (norb, nocc[1])
     cbH = trial_data.mo_coeff_b.conj().T  # (nocc[1], norb)
-    h1_b = 0.5 * (cbH @ (ham_data.h1 + ham_data.h1.T) @ cb)
-    chol_b = jnp.einsum("pi,gij,jq->gpq", cbH, ham_data.chol, cb)
-    rot_h1_a = ham_data.h1[:n_oa, :]  # (nocc[0], norb)
-    rot_h1_b = ham_data.h1[:n_ob, :]  # (nocc[1], norb)
-    rot_chol_a = ham_data.chol[:, :n_oa, :]
+    h1_a = _h1_alpha(ham_data)
+    chol_a = _chol_alpha(ham_data)
+    if ham_data.basis == "charge_spin":
+        h1_b_src = ham_data.h1[1]
+        chol_b_src = ham_data.chol[:, 1]
+    else:
+        h1_b_src = ham_data.h1
+        chol_b_src = ham_data.chol
+    h1_b = 0.5 * (cbH @ (h1_b_src + h1_b_src.T) @ cb)
+    chol_b = jnp.einsum("pi,gij,jq->gpq", cbH, chol_b_src, cb)
+    rot_h1_a = h1_a[:n_oa, :]  # (nocc[0], norb)
+    rot_h1_b = h1_b[:n_ob, :]  # (nocc[1], norb)
+    rot_chol_a = chol_a[:, :n_oa, :]
     rot_chol_b = chol_b[:, :n_ob, :]
     rot_chol_flat_a = rot_chol_a.reshape(rot_chol_a.shape[0], -1)
     rot_chol_flat_b = rot_chol_b.reshape(rot_chol_b.shape[0], -1)
 
     lci1_a = jnp.einsum(
         "git,pt->gip",
-        ham_data.chol[:, :, n_oa:],
+        chol_a[:, :, n_oa:],
         trial_data.c1a,
         optimize="optimal",
     )
