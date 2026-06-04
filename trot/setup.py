@@ -169,12 +169,16 @@ def _make_trial_bundle(
         return trial_data, trial_ops, meas_ops
 
     if kind in {"rohf", "uhf"}:
+        from .meas.auto import make_auto_meas_ops
         from .meas.uhf import make_uhf_meas_ops
         from .trial.uhf import make_uhf_trial_data, make_uhf_trial_ops
 
         trial_data = make_uhf_trial_data(data, sys)
         trial_ops = make_uhf_trial_ops(sys=sys)
-        meas_ops = make_uhf_meas_ops(sys=sys)
+        if staged.ham.field_spin_coeffs is not None or staged.ham.field_factors is not None:
+            meas_ops = make_auto_meas_ops(sys=sys, trial_ops_=trial_ops)
+        else:
+            meas_ops = make_uhf_meas_ops(sys=sys)
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 
@@ -199,34 +203,46 @@ def _make_trial_bundle(
         return trial_data, trial_ops, meas_ops
 
     if kind == "ucisd":
+        from .meas.auto import make_auto_meas_ops
         from .meas.ucisd import make_ucisd_meas_ops
         from .trial.ucisd import make_ucisd_trial_data, make_ucisd_trial_ops
 
         trial_data = make_ucisd_trial_data(data, sys)
         trial_ops = make_ucisd_trial_ops(sys=sys)
-        meas_ops = make_ucisd_meas_ops(sys=sys, mixed_precision=mixed_precision)
+        if staged.ham.field_spin_coeffs is not None or staged.ham.field_factors is not None:
+            meas_ops = make_auto_meas_ops(sys=sys, trial_ops_=trial_ops)
+        else:
+            meas_ops = make_ucisd_meas_ops(sys=sys, mixed_precision=mixed_precision)
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 
     if kind == "ucisdt":
+        from .meas.auto import make_auto_meas_ops
         from .meas.ucisdt import make_ucisdt_meas_ops
         from .trial.ucisdt import make_ucisdt_trial_data, make_ucisdt_trial_ops
 
         trial_data = make_ucisdt_trial_data(data, sys)
         trial_ops = make_ucisdt_trial_ops(sys=sys)
-        meas_ops = make_ucisdt_meas_ops(
-            sys=sys, memory_mode="high", mixed_precision=mixed_precision
-        )
+        if staged.ham.field_spin_coeffs is not None or staged.ham.field_factors is not None:
+            meas_ops = make_auto_meas_ops(sys=sys, trial_ops_=trial_ops)
+        else:
+            meas_ops = make_ucisdt_meas_ops(
+                sys=sys, memory_mode="high", mixed_precision=mixed_precision
+            )
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 
     if kind == "ucisdtq":
+        from .meas.auto import make_auto_meas_ops
         from .meas.ucisdtq import make_ucisdtq_meas_ops
         from .trial.ucisdtq import make_ucisdtq_trial_data, make_ucisdtq_trial_ops
 
         trial_data = make_ucisdtq_trial_data(data, sys)
         trial_ops = make_ucisdtq_trial_ops(sys=sys)
-        meas_ops = make_ucisdtq_meas_ops(sys=sys, trial_ops=trial_ops)
+        if staged.ham.field_spin_coeffs is not None or staged.ham.field_factors is not None:
+            meas_ops = make_auto_meas_ops(sys=sys, trial_ops_=trial_ops)
+        else:
+            meas_ops = make_ucisdtq_meas_ops(sys=sys, trial_ops=trial_ops)
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind}")
         return trial_data, trial_ops, meas_ops
 
@@ -245,6 +261,8 @@ def _make_trial_bundle(
 
 def _resolve_default_walker_kind(ham: Any, walker_kind: WalkerKind | None) -> WalkerKind:
     if walker_kind is None:
+        if getattr(ham, "field_spin_coeffs", None) is not None:
+            return "unrestricted"
         return cast(WalkerKind, ham.basis)
     return walker_kind
 

@@ -174,6 +174,17 @@ def shard_ham_data(ham_data: THam, mesh: Mesh | None) -> THam:
                 chol=shard_model_axis(ham_data.chol, mesh),
                 basis=ham_data.basis,
                 nchol=nchol,
+                field_factors=(
+                    shard_model_axis(ham_data.field_factors, mesh)
+                    if ham_data.field_factors is not None
+                    else None
+                ),
+                field_spin_coeffs=(
+                    shard_model_axis(ham_data.field_spin_coeffs, mesh)
+                    if ham_data.field_spin_coeffs is not None
+                    else None
+                ),
+                field_labels=ham_data.field_labels,
             ),
         )
 

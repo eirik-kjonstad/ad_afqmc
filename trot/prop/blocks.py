@@ -83,6 +83,9 @@ def dump_prop_state_npz(
         "e_estimate": np.asarray(jax.device_get(state.e_estimate)),
         "node_encounters": np.asarray(jax.device_get(state.node_encounters)),
     }
+    if state.diagnostics is not None:
+        for key, value in state.diagnostics.items():
+            arrays[f"diag_{key}"] = np.asarray(jax.device_get(value))
 
     walkers = jax.device_get(state.walkers)
     if isinstance(walkers, tuple):
@@ -110,6 +113,12 @@ def load_prop_state_npz(path: str | Path) -> PropState:
         walker_keys = sorted(k for k in data.files if k.startswith("walkers_"))
         walkers = tuple(jnp.asarray(data[k]) for k in walker_keys)
 
+    diagnostics = {
+        key.removeprefix("diag_"): jnp.asarray(data[key])
+        for key in data.files
+        if key.startswith("diag_")
+    }
+
     return PropState(
         walkers=walkers,
         weights=jnp.asarray(data["weights"]),
@@ -118,6 +127,7 @@ def load_prop_state_npz(path: str | Path) -> PropState:
         pop_control_ene_shift=jnp.asarray(data["pop_control_ene_shift"]),
         e_estimate=jnp.asarray(data["e_estimate"]),
         node_encounters=jnp.asarray(data["node_encounters"]),
+        diagnostics=diagnostics or None,
     )
 
 
@@ -281,7 +291,11 @@ def block(
     )
 
     obs = BlockObs(
-        scalars={"energy": e_block, "weight": w_sum},
+        scalars={
+            "energy": e_block,
+            "weight": w_sum,
+            **(state.diagnostics or {}),
+        },
         observables=obs_samples,
     )
     return state, obs

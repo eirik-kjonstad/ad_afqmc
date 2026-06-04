@@ -428,6 +428,9 @@ class HamInput:
     frozen: int | NDArray
     source_kind: str  # "mf" or "cc"
     basis: HamBasis  # "restricted" or "generalized"
+    field_factors: Array | None = None
+    field_spin_coeffs: Array | None = None
+    field_metadata: Dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,6 +448,15 @@ class StagedInputs:
     ham: HamInput
     trial: TrialInput
     meta: Dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class RealFieldFitResult:
+    h1_shift: Array
+    chol: Array
+    field_factors: Array
+    field_spin_coeffs: Array
+    metadata: Dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -774,6 +786,8 @@ def stage(
             "basis": getattr(mol, "basis", None),
         },
     }
+    if ham.field_metadata is not None:
+        meta["field_metadata"] = ham.field_metadata
 
     staged = StagedInputs(ham=ham, trial=trial, meta=meta)
 
@@ -941,12 +955,196 @@ def _load_fcidump_context(fcidump: Union[str, Path, Dict[str, Any]]) -> Dict[str
     return ctx
 
 
+def _normalize_real_field_centers(
+    centers: Any,
+    *,
+    norb: int,
+) -> tuple[tuple[int, ...], ...]:
+    if centers is None:
+        return ()
+    if isinstance(centers, str):
+        groups: list[tuple[int, ...]] = []
+        for raw_group in centers.split(","):
+            group = raw_group.strip()
+            if not group:
+                continue
+            if ":" in group:
+                start_s, stop_s = group.split(":", 1)
+                start, stop = int(start_s), int(stop_s)
+                groups.append(tuple(range(start, stop)))
+            else:
+                groups.append((int(group),))
+        centers = groups
+
+    normalized: list[tuple[int, ...]] = []
+    for center in centers:
+        if isinstance(center, slice):
+            start = 0 if center.start is None else int(center.start)
+            stop = norb if center.stop is None else int(center.stop)
+            step = 1 if center.step is None else int(center.step)
+            orbitals = tuple(range(start, stop, step))
+        elif isinstance(center, str):
+            orbitals = _normalize_real_field_centers(center, norb=norb)
+            normalized.extend(orbitals)
+            continue
+        else:
+            arr = np.asarray(center, dtype=np.int64)
+            if arr.ndim == 0:
+                orbitals = (int(arr),)
+            elif arr.ndim == 1:
+                orbitals = tuple(int(x) for x in arr)
+            else:
+                raise ValueError("Each real-field center must be a scalar, slice, or 1D list.")
+        if not orbitals:
+            raise ValueError("Real-field centers may not be empty.")
+        if min(orbitals) < 0 or max(orbitals) >= norb:
+            raise ValueError(f"Real-field center orbitals must lie in [0, {norb}): {orbitals}")
+        if len(set(orbitals)) != len(orbitals):
+            raise ValueError(f"Real-field center contains duplicate orbitals: {orbitals}")
+        normalized.append(orbitals)
+    return tuple(normalized)
+
+
+def _rotate_one_body_to_mo(mat: Array, coeff: Array) -> Array:
+    return np.asarray(coeff).T.conj() @ np.asarray(mat) @ np.asarray(coeff)
+
+
+def _factorize_symmetric_supermatrix(
+    eri: Array,
+    *,
+    coeff: Array,
+    chol_cut: float,
+) -> tuple[Array, Array, Array, list[str]]:
+    norb = int(eri.shape[0])
+    supermat = np.asarray(eri).reshape(norb * norb, norb * norb)
+    supermat = 0.5 * (supermat + supermat.T.conj())
+    eigvals, eigvecs = np.linalg.eigh(supermat)
+    keep = np.abs(eigvals) > float(chol_cut)
+    kept_vals = eigvals[keep]
+    kept_vecs = eigvecs[:, keep]
+
+    chol_blocks: list[Array] = []
+    factors: list[complex] = []
+    spin_coeffs: list[tuple[float, float]] = []
+    labels: list[str] = []
+    for idx, value in enumerate(kept_vals):
+        local = (kept_vecs[:, idx] * np.sqrt(abs(value))).reshape(norb, norb)
+        local = 0.5 * (local + local.T.conj())
+        chol_blocks.append(_rotate_one_body_to_mo(local, coeff))
+        if value > 0.0:
+            factors.append(1.0j)
+            labels.append("residual_complex")
+        else:
+            factors.append(1.0)
+            labels.append("residual_real")
+        spin_coeffs.append((1.0, 1.0))
+
+    if not chol_blocks:
+        nmo = int(np.asarray(coeff).shape[1])
+        return (
+            np.zeros((0, nmo, nmo), dtype=np.asarray(eri).dtype),
+            np.zeros((0,), dtype=np.complex128),
+            np.zeros((0, 2), dtype=np.float64),
+            [],
+        )
+
+    return (
+        np.asarray(chol_blocks),
+        np.asarray(factors, dtype=np.complex128),
+        np.asarray(spin_coeffs, dtype=np.float64),
+        labels,
+    )
+
+
+def _build_hk_density_real_fields_from_eri(
+    eri_ao: Array,
+    *,
+    basis_coeff: Array,
+    centers: tuple[tuple[int, ...], ...],
+    chol_cut: float,
+) -> RealFieldFitResult:
+    norb = int(eri_ao.shape[0])
+    nmo = int(np.asarray(basis_coeff).shape[1])
+    eri_residual = np.array(eri_ao, copy=True)
+    h1_shift_ao = np.zeros((norb, norb), dtype=np.asarray(eri_ao).dtype)
+
+    real_chol: list[Array] = []
+    real_factors: list[complex] = []
+    real_spin_coeffs: list[tuple[float, float]] = []
+    labels: list[str] = []
+    extracted: list[dict[str, Any]] = []
+
+    for center_idx, orbitals in enumerate(centers):
+        for orb in orbitals:
+            u_value = float(np.real(eri_residual[orb, orb, orb, orb]))
+            if u_value <= float(chol_cut):
+                continue
+            local = np.zeros((norb, norb), dtype=np.asarray(eri_ao).dtype)
+            local[orb, orb] = np.sqrt(u_value)
+            real_chol.append(_rotate_one_body_to_mo(local, basis_coeff))
+            real_factors.append(1.0)
+            real_spin_coeffs.append((1.0, -1.0))
+            labels.append(f"hk_density_real:center{center_idx}:orb{orb}")
+            extracted.append({"center": center_idx, "orbital": int(orb), "U": u_value})
+
+            # U n_up n_down = -0.5 [sqrt(U) (n_up - n_down)]^2
+            #                 + 0.5 U (n_up + n_down)
+            eri_residual[orb, orb, orb, orb] -= u_value
+            h1_shift_ao[orb, orb] += 0.5 * u_value
+
+    residual_chol, residual_factors, residual_spin_coeffs, residual_labels = (
+        _factorize_symmetric_supermatrix(
+            eri_residual,
+            coeff=basis_coeff,
+            chol_cut=chol_cut,
+        )
+    )
+
+    if real_chol:
+        chol = np.concatenate([np.asarray(real_chol), residual_chol], axis=0)
+        field_factors = np.concatenate(
+            [np.asarray(real_factors, dtype=np.complex128), residual_factors], axis=0
+        )
+        field_spin_coeffs = np.concatenate(
+            [np.asarray(real_spin_coeffs, dtype=np.float64), residual_spin_coeffs], axis=0
+        )
+    else:
+        chol = residual_chol
+        field_factors = residual_factors
+        field_spin_coeffs = residual_spin_coeffs
+    labels.extend(residual_labels)
+
+    n_hk = len(real_chol)
+    n_residual_complex = sum(label == "residual_complex" for label in residual_labels)
+    n_residual_real = sum(label == "residual_real" for label in residual_labels)
+    metadata: Dict[str, Any] = {
+        "real_field_fit": "hk_density",
+        "centers": [list(center) for center in centers],
+        "extracted_terms": extracted,
+        "n_hk_real_fields": int(n_hk),
+        "n_residual_complex_fields": int(n_residual_complex),
+        "n_residual_real_fields": int(n_residual_real),
+        "field_labels": tuple(labels),
+    }
+
+    if chol.shape[0] == 0:
+        chol = np.zeros((0, nmo, nmo), dtype=np.asarray(eri_ao).dtype)
+    return RealFieldFitResult(
+        h1_shift=_rotate_one_body_to_mo(h1_shift_ao, basis_coeff),
+        chol=np.asarray(chol),
+        field_factors=np.asarray(field_factors, dtype=np.complex128),
+        field_spin_coeffs=np.asarray(field_spin_coeffs, dtype=np.float64),
+        metadata=metadata,
+    )
+
+
 def _stage_ham_input_from_fcidump(
     obj: StagedMfOrCc,
     *,
     fcidump: Union[str, Path, Dict[str, Any]],
     chol_cut: float,
     verbose: bool,
+    real_field_centers: Any = None,
 ) -> HamInput:
     """
     Build HamInput from FCIDUMP integrals while preserving the trial MO basis convention.
@@ -982,15 +1180,6 @@ def _stage_ham_input_from_fcidump(
 
     h2_raw = np.asarray(ctx["H2"])
     eri_ao = ao2mo.restore(1, h2_raw, norb)
-    eri_mo = np.einsum(
-        "pi,qj,rk,sl,pqrs->ijkl",
-        basis_coeff.conj(),
-        basis_coeff.conj(),
-        basis_coeff,
-        basis_coeff,
-        eri_ao,
-        optimize=True,
-    )
 
     nelec_tot = int(ctx["NELEC"])
     ms2 = int(ctx.get("MS2", 0))
@@ -1012,11 +1201,47 @@ def _stage_ham_input_from_fcidump(
             "Use stage_from_ccpy(..., fcidump=...) which falls back to the existing MF frozen-core path."
         )
 
+    field_factors: Array | None = None
+    field_spin_coeffs: Array | None = None
+    field_metadata: Dict[str, Any] | None = None
+
     t0 = time.time()
-    eri_s4 = ao2mo.restore(4, np.asarray(eri_mo), norb)
-    chol = modified_cholesky(eri_s4, max_error=chol_cut)
+    real_centers = _normalize_real_field_centers(real_field_centers, norb=norb)
+    if real_centers:
+        fit = _build_hk_density_real_fields_from_eri(
+            eri_ao,
+            basis_coeff=basis_coeff,
+            centers=real_centers,
+            chol_cut=chol_cut,
+        )
+        h1 = h1 + fit.h1_shift
+        chol = fit.chol
+        field_factors = fit.field_factors
+        field_spin_coeffs = fit.field_spin_coeffs
+        field_metadata = fit.metadata
+    else:
+        eri_mo = np.einsum(
+            "pi,qj,rk,sl,pqrs->ijkl",
+            basis_coeff.conj(),
+            basis_coeff.conj(),
+            basis_coeff,
+            basis_coeff,
+            eri_ao,
+            optimize=True,
+        )
+        eri_s4 = ao2mo.restore(4, np.asarray(eri_mo), norb)
+        chol = modified_cholesky(eri_s4, max_error=chol_cut)
     if verbose:
-        print(f"[stage] FCIDUMP cholesky: nchol={chol.shape[0]} in {time.time() - t0:.2f}s")
+        if field_metadata is not None:
+            print(
+                "[stage] FCIDUMP real-field fit: "
+                f"hk_real={field_metadata['n_hk_real_fields']} "
+                f"residual_complex={field_metadata['n_residual_complex_fields']} "
+                f"residual_real={field_metadata['n_residual_real_fields']} "
+                f"nchol={chol.shape[0]} in {time.time() - t0:.2f}s"
+            )
+        else:
+            print(f"[stage] FCIDUMP cholesky: nchol={chol.shape[0]} in {time.time() - t0:.2f}s")
 
     return HamInput(
         h0=float(h0),
@@ -1028,6 +1253,9 @@ def _stage_ham_input_from_fcidump(
         frozen=norb_frozen,
         source_kind=obj.source,
         basis="restricted",
+        field_factors=field_factors,
+        field_spin_coeffs=field_spin_coeffs,
+        field_metadata=field_metadata,
     )
 
 
@@ -1288,6 +1516,7 @@ def stage_from_ccpy(
     cache: Union[str, Path] | None = None,
     overwrite: bool = False,
     verbose: bool = False,
+    real_field_centers: Any = None,
 ) -> StagedInputs:
     from .staging_ccpy import stage_from_ccpy as _impl
 
@@ -1302,6 +1531,7 @@ def stage_from_ccpy(
         cache=cache,
         overwrite=overwrite,
         verbose=verbose,
+        real_field_centers=real_field_centers,
     )
 
 
@@ -1314,6 +1544,10 @@ def _dump_h5(staged: StagedInputs, path: Path) -> None:
         gham.create_dataset("h0", data=np.array(staged.ham.h0))
         gham.create_dataset("h1", data=staged.ham.h1)
         gham.create_dataset("chol", data=staged.ham.chol)
+        if staged.ham.field_factors is not None:
+            gham.create_dataset("field_factors", data=staged.ham.field_factors)
+        if staged.ham.field_spin_coeffs is not None:
+            gham.create_dataset("field_spin_coeffs", data=staged.ham.field_spin_coeffs)
         gham.create_dataset("nelec", data=np.array(staged.ham.nelec, dtype=np.int64))
         gham.attrs["norb"] = staged.ham.norb
         gham.attrs["chol_cut"] = staged.ham.chol_cut
@@ -1358,6 +1592,11 @@ def _load_h5(path: Path) -> StagedInputs:
             frozen=_load_frozen(gham),
             source_kind=str(gham.attrs["source_kind"]),
             basis=cast(HamBasis, str(gham.attrs["basis"])),
+            field_factors=(np.array(gham["field_factors"]) if "field_factors" in gham else None),
+            field_spin_coeffs=(
+                np.array(gham["field_spin_coeffs"]) if "field_spin_coeffs" in gham else None
+            ),
+            field_metadata=meta.get("field_metadata"),
         )
         _stage_end(
             t_ham, "Hamiltonian loaded", details=f"norb={ham.norb} nchol={ham.chol.shape[0]}"

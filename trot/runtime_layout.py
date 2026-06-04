@@ -88,7 +88,27 @@ def _padded_model_length(length: int, mesh: Mesh | None) -> int:
 
 def _make_ham_data(ham: HamInput | HamChol, mesh: Mesh | None, *, compact_chol: bool) -> HamChol:
     chol = ham.chol
+    field_factors = getattr(ham, "field_factors", None)
+    field_spin_coeffs = getattr(ham, "field_spin_coeffs", None)
+    field_labels = None
+    field_metadata = getattr(ham, "field_metadata", None)
+    if field_metadata is not None:
+        field_labels = field_metadata.get("field_labels")
+    if field_labels is None:
+        field_labels = getattr(ham, "field_labels", None)
     runtime_n_chol = _padded_model_length(int(chol.shape[0]), mesh)
+    if runtime_n_chol != int(chol.shape[0]):
+        pad = runtime_n_chol - int(chol.shape[0])
+        if field_factors is not None:
+            field_factors = np.pad(np.asarray(field_factors), (0, pad), constant_values=1.0j)
+        if field_spin_coeffs is not None:
+            field_spin_coeffs = np.pad(
+                np.asarray(field_spin_coeffs),
+                ((0, pad), (0, 0)),
+                constant_values=1.0,
+            )
+        if field_labels is not None:
+            field_labels = tuple(field_labels) + ("padding",) * pad
     if compact_chol:
         n_chol = int(chol.shape[0])
         if runtime_n_chol != n_chol:
@@ -107,6 +127,13 @@ def _make_ham_data(ham: HamInput | HamChol, mesh: Mesh | None, *, compact_chol: 
             shard_model_axis(chol, mesh),
             basis=ham.basis,
             nchol=runtime_n_chol if compact_chol else None,
+            field_factors=(
+                shard_model_axis(field_factors, mesh) if field_factors is not None else None
+            ),
+            field_spin_coeffs=(
+                shard_model_axis(field_spin_coeffs, mesh) if field_spin_coeffs is not None else None
+            ),
+            field_labels=field_labels,
         )
 
     return HamChol(
@@ -115,6 +142,11 @@ def _make_ham_data(ham: HamInput | HamChol, mesh: Mesh | None, *, compact_chol: 
         jnp.asarray(chol),
         basis=ham.basis,
         nchol=runtime_n_chol,
+        field_factors=jnp.asarray(field_factors) if field_factors is not None else None,
+        field_spin_coeffs=(
+            jnp.asarray(field_spin_coeffs) if field_spin_coeffs is not None else None
+        ),
+        field_labels=field_labels,
     )
 
 
@@ -135,34 +167,76 @@ def _build_restricted_prop_ctx_from_host(
     ham = staged.ham
     chol = np.asarray(ham.chol)
     h1 = np.asarray(ham.h1)
-    dm = _as_host_array(trial_rdm1)
-    if dm.ndim == 3 and dm.shape[0] == 2:
+    dm_raw = _as_host_array(trial_rdm1)
+    field_factors = getattr(ham, "field_factors", None)
+    if field_factors is None:
+        field_factors = np.full((chol.shape[0],), 1.0j, dtype=np.complex128)
+    else:
+        field_factors = np.asarray(field_factors)
+    field_spin_coeffs = getattr(ham, "field_spin_coeffs", None)
+    if field_spin_coeffs is not None:
+        field_spin_coeffs = np.asarray(field_spin_coeffs)
+        if dm_raw.ndim != 3 or dm_raw.shape[0] != 2:
+            raise ValueError(
+                "spin-resolved field coefficients require trial_rdm1 with shape (2, norb, norb)."
+            )
+    dm = dm_raw
+    if field_spin_coeffs is None and dm.ndim == 3 and dm.shape[0] == 2:
         dm = dm[0] + dm[1]
 
     n_chol = int(chol.shape[0])
     norb = int(chol.shape[1])
     mf = np.empty(n_chol, dtype=np.result_type(chol.dtype, dm.dtype, np.complex128))
-    v0m = np.zeros((norb, norb), dtype=np.result_type(h1.dtype, chol.dtype))
-    v1m = np.zeros((norb, norb), dtype=np.result_type(h1.dtype, chol.dtype))
+    if field_spin_coeffs is None:
+        v0m = np.zeros(
+            (norb, norb), dtype=np.result_type(h1.dtype, chol.dtype, field_factors.dtype)
+        )
+        v1m = np.zeros(
+            (norb, norb), dtype=np.result_type(h1.dtype, chol.dtype, field_factors.dtype)
+        )
+    else:
+        v0m = np.zeros(
+            (2, norb, norb), dtype=np.result_type(h1.dtype, chol.dtype, field_factors.dtype)
+        )
+        v1m = np.zeros(
+            (2, norb, norb), dtype=np.result_type(h1.dtype, chol.dtype, field_factors.dtype)
+        )
 
     for start in range(0, n_chol, _HOST_CHOL_BLOCK_SIZE):
         stop = min(start + _HOST_CHOL_BLOCK_SIZE, n_chol)
         chol_blk = chol[start:stop]
-        mf_blk = 1.0j * np.einsum("gij,ji->g", chol_blk, dm, optimize="optimal")
-        mf[start:stop] = mf_blk
-        v0m += 0.5 * np.einsum("gik,gkj->ij", chol_blk, chol_blk, optimize="optimal")
-        v1m += np.einsum(
-            "g,gik->ik",
-            np.real(1.0j * mf_blk),
-            chol_blk,
-            optimize="optimal",
-        )
+        factors_blk = field_factors[start:stop]
+        if field_spin_coeffs is None:
+            k_chol = factors_blk[:, None, None] * chol_blk
+            mf_blk = factors_blk * np.einsum("gij,ji->g", chol_blk, dm, optimize="optimal")
+            mf[start:stop] = mf_blk
+            v0m += 0.5 * np.einsum("gik,gkj->ij", k_chol, k_chol, optimize="optimal")
+            v1m += np.einsum("g,gik->ik", mf_blk, k_chol, optimize="optimal")
+        else:
+            spin_blk = field_spin_coeffs[start:stop]
+            spin_contractions = np.einsum("gij,sji->gs", chol_blk, dm_raw, optimize="optimal")
+            mf_blk = factors_blk * np.einsum(
+                "gs,gs->g", spin_blk, spin_contractions, optimize="optimal"
+            )
+            mf[start:stop] = mf_blk
+            k_chol = (
+                factors_blk[:, None, None, None]
+                * spin_blk[:, :, None, None]
+                * chol_blk[:, None, :, :]
+            )
+            v0m += 0.5 * np.einsum("gsik,gskj->sij", k_chol, k_chol, optimize="optimal")
+            v1m += np.einsum("g,gsik->sik", mf_blk, k_chol, optimize="optimal")
 
     h0_prop = -ham.h0 - 0.5 * np.sum(mf**2)
-    h1_eff = h1 - v0m - v1m
-    exp_h1_half_np = np.asarray(
-        jax.device_get(jax.scipy.linalg.expm(-0.5 * jnp.asarray(dt) * jnp.asarray(h1_eff)))
-    )
+    h1_eff = (h1[None, :, :] if field_spin_coeffs is not None else h1) + v0m - v1m
+    h1_eff_jax = jnp.asarray(h1_eff)
+    if h1_eff_jax.ndim == 3:
+        exp_h1_half = jax.vmap(lambda block: jax.scipy.linalg.expm(-0.5 * jnp.asarray(dt) * block))(
+            h1_eff_jax
+        )
+    else:
+        exp_h1_half = jax.scipy.linalg.expm(-0.5 * jnp.asarray(dt) * h1_eff_jax)
+    exp_h1_half_np = np.asarray(jax.device_get(exp_h1_half))
     chol_flat = chol.reshape(n_chol, -1)
     chol_flat_dtype = np.float32 if mixed_precision else chol_flat.dtype
 
@@ -178,6 +252,12 @@ def _build_restricted_prop_ctx_from_host(
             announce_padding=False,
         )
         h0_prop_a = replicate(np.asarray(h0_prop), mesh)
+        field_factors_a = shard_model_axis(field_factors, mesh, announce_padding=False)
+        field_spin_coeffs_a = (
+            shard_model_axis(field_spin_coeffs, mesh, announce_padding=False)
+            if field_spin_coeffs is not None
+            else None
+        )
     else:
         dt_a = jnp.asarray(dt)
         sqrt_dt = jnp.asarray(np.sqrt(dt))
@@ -185,6 +265,10 @@ def _build_restricted_prop_ctx_from_host(
         mf_shifts = jnp.asarray(mf)
         chol_flat_a = jnp.asarray(chol_flat, dtype=chol_flat_dtype)
         h0_prop_a = jnp.asarray(h0_prop)
+        field_factors_a = jnp.asarray(field_factors)
+        field_spin_coeffs_a = (
+            jnp.asarray(field_spin_coeffs) if field_spin_coeffs is not None else None
+        )
 
     return CholAfqmcCtx(
         dt=dt_a,
@@ -193,6 +277,8 @@ def _build_restricted_prop_ctx_from_host(
         mf_shifts=mf_shifts,
         h0_prop=h0_prop_a,
         chol_flat=chol_flat_a,
+        field_factors=field_factors_a,
+        field_spin_coeffs=field_spin_coeffs_a,
         norb=norb,
     )
 
@@ -354,6 +440,9 @@ def _compact_ham_data_for_runtime(ham_data: Any, meas_ctx: Any) -> Any:
             chol=compact_chol,
             basis=ham_data.basis,
             nchol=ham_data.nchol,
+            field_factors=ham_data.field_factors,
+            field_spin_coeffs=ham_data.field_spin_coeffs,
+            field_labels=ham_data.field_labels,
         )
 
     return ham_data

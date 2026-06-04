@@ -22,6 +22,8 @@ class CholAfqmcCtx:
     mf_shifts: jax.Array  # (n_fields,)
     h0_prop: jax.Array  # scalar
     chol_flat: jax.Array  # (n_fields, n*n)
+    field_factors: jax.Array  # (n_fields,)
+    field_spin_coeffs: jax.Array | None  # (n_fields, 2)
     norb: int
 
     def tree_flatten(self):
@@ -32,11 +34,22 @@ class CholAfqmcCtx:
             self.mf_shifts,
             self.h0_prop,
             self.chol_flat,
+            self.field_factors,
+            self.field_spin_coeffs,
         ), (self.norb,)
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        dt, sqrt_dt, exp_h1_half, mf_shifts, h0_prop, chol_flat = children
+        (
+            dt,
+            sqrt_dt,
+            exp_h1_half,
+            mf_shifts,
+            h0_prop,
+            chol_flat,
+            field_factors,
+            field_spin_coeffs,
+        ) = children
         (norb,) = aux
 
         return cls(
@@ -46,6 +59,8 @@ class CholAfqmcCtx:
             mf_shifts=mf_shifts,
             h0_prop=h0_prop,
             chol_flat=chol_flat,
+            field_factors=field_factors,
+            field_spin_coeffs=field_spin_coeffs,
             norb=norb,
         )
 
@@ -72,11 +87,26 @@ def _get_dm(rdm1: jax.Array, ham_basis: str) -> jax.Array:
 
 
 def _mf_shifts(ham_data: HamChol, rdm1: jax.Array) -> jax.Array:
+    field_factors = _field_factors(ham_data)
+    spin_coeffs = ham_data.field_spin_coeffs
+    if spin_coeffs is not None:
+        if ham_data.basis != "restricted":
+            raise NotImplementedError("spin-resolved field coefficients require restricted basis.")
+        if rdm1.ndim != 3 or rdm1.shape[0] != 2:
+            raise ValueError(
+                "spin-resolved field coefficients require rdm1 with shape (2, norb, norb)."
+            )
+        spin_contractions = jnp.einsum("gij,sji->gs", ham_data.chol, rdm1, optimize="optimal")
+        return field_factors * jnp.einsum(
+            "gs,gs->g", spin_coeffs, spin_contractions, optimize="optimal"
+        )
     dm = _get_dm(rdm1, ham_data.basis)
-    return 1.0j * jnp.einsum("gij,ji->g", ham_data.chol, dm, optimize="optimal")
+    return field_factors * jnp.einsum("gij,ji->g", ham_data.chol, dm, optimize="optimal")
 
 
 def _build_exp_h1_half_from_h1(h1: jax.Array, dt: jax.Array) -> jax.Array:
+    if h1.ndim == 3:
+        return jax.vmap(lambda block: jax.scipy.linalg.expm(-0.5 * dt * block))(h1)
     return jax.scipy.linalg.expm(-0.5 * dt * h1)
 
 
@@ -87,13 +117,57 @@ def _make_vhs_split_flat(*, chol_flat: jax.Array, x: jax.Array, n: int) -> jax.A
     return lax.complex(v_re, v_im).reshape(n, n)
 
 
+def _make_vhs_spin_resolved_flat(
+    *,
+    chol_flat: jax.Array,
+    field_factors: jax.Array,
+    field_spin_coeffs: jax.Array,
+    x: jax.Array,
+    n: int,
+) -> tuple[jax.Array, jax.Array]:
+    coeff = x * field_factors
+    alpha = _make_vhs_split_flat(
+        chol_flat=chol_flat,
+        x=coeff * field_spin_coeffs[:, 0],
+        n=n,
+    )
+    beta = _make_vhs_split_flat(
+        chol_flat=chol_flat,
+        x=coeff * field_spin_coeffs[:, 1],
+        n=n,
+    )
+    return alpha, beta
+
+
+def _field_factors(ham_data: HamChol) -> jax.Array:
+    if ham_data.field_factors is not None:
+        return ham_data.field_factors
+    n_chol = ham_data.nchol
+    n_fields = int(n_chol) if n_chol is not None else int(ham_data.chol.shape[0])
+    return jnp.full((n_fields,), 1.0j, dtype=jnp.complex128)
+
+
 def _get_h1_eff(ham_data: HamChol, mf: jax.Array) -> jax.Array:
+    field_factors = _field_factors(ham_data)
+    spin_coeffs = ham_data.field_spin_coeffs
+    if spin_coeffs is not None:
+        if ham_data.basis != "restricted":
+            raise NotImplementedError("spin-resolved field coefficients require restricted basis.")
+        k_chol = (
+            field_factors[:, None, None, None]
+            * spin_coeffs[:, :, None, None]
+            * ham_data.chol[:, None, :, :]
+        )
+        v0m = 0.5 * jnp.einsum("gsik,gskj->sij", k_chol, k_chol, optimize="optimal")
+        v1m = jnp.einsum("g,gsik->sik", mf, k_chol, optimize="optimal")
+        return ham_data.h1[None, :, :] + v0m - v1m
+
     match ham_data.basis:
         case "restricted" | "generalized":
-            v0m = 0.5 * jnp.einsum("gik,gkj->ij", ham_data.chol, ham_data.chol, optimize="optimal")
-            mf_r = (1.0j * mf).real
-            v1m = jnp.einsum("g,gik->ik", mf_r, ham_data.chol, optimize="optimal")
-            h1_eff = ham_data.h1 - v0m - v1m
+            k_chol = field_factors[:, None, None] * ham_data.chol
+            v0m = 0.5 * jnp.einsum("gik,gkj->ij", k_chol, k_chol, optimize="optimal")
+            v1m = jnp.einsum("g,gik->ik", mf, k_chol, optimize="optimal")
+            h1_eff = ham_data.h1 + v0m - v1m
         case _:
             raise ValueError(f"Unknown Hamiltonian basis kind: {ham_data.basis}")
 
@@ -115,6 +189,8 @@ def _build_prop_ctx(
 
     exp_h1_half = _build_exp_h1_half_from_h1(h1_eff, dt_a)
     chol_flat = ham_data.chol.reshape(ham_data.chol.shape[0], -1).astype(chol_flat_precision)
+    field_factors = _field_factors(ham_data)
+    field_spin_coeffs = ham_data.field_spin_coeffs
     norb = ham_data.chol.shape[1]
     return CholAfqmcCtx(
         dt=dt_a,
@@ -123,6 +199,8 @@ def _build_prop_ctx(
         mf_shifts=mf,
         h0_prop=h0_prop,
         chol_flat=chol_flat,
+        field_factors=field_factors,
+        field_spin_coeffs=field_spin_coeffs,
         norb=norb,
     )
 
@@ -136,6 +214,8 @@ def _apply_one_body_half_unrestricted(
 ) -> Tuple[jax.Array, jax.Array]:
     wu, wd = w_ud
     e = prop_ctx.exp_h1_half
+    if e.ndim == 3 and e.shape[0] == 2:
+        return (e[0] @ wu, e[1] @ wd)
     return (e @ wu, e @ wd)
 
 
@@ -158,7 +238,7 @@ def _apply_two_body_array(
     make_vhs: Callable[[jax.Array, CholAfqmcCtx], jax.Array],
 ) -> jax.Array:
     vhs = make_vhs(field, prop_ctx).astype(w.dtype)
-    a = (1.0j * prop_ctx.sqrt_dt).astype(w.dtype)
+    a = prop_ctx.sqrt_dt.astype(w.dtype)
     return taylor_expm_action(a, vhs, w, n_terms)
 
 
@@ -171,8 +251,15 @@ def _apply_two_body_unrestricted(
     make_vhs: Callable[[jax.Array, CholAfqmcCtx], jax.Array],
 ) -> Tuple[jax.Array, jax.Array]:
     wu, wd = w_ud
-    vhs = make_vhs(field, prop_ctx).astype(wu.dtype)
-    a = (1.0j * prop_ctx.sqrt_dt).astype(wu.dtype)
+    vhs = make_vhs(field, prop_ctx)
+    a = prop_ctx.sqrt_dt.astype(wu.dtype)
+    if isinstance(vhs, tuple):
+        vhs_a, vhs_b = vhs
+        return (
+            taylor_expm_action(a, vhs_a.astype(wu.dtype), wu, n_terms),
+            taylor_expm_action(a, vhs_b.astype(wd.dtype), wd, n_terms),
+        )
+    vhs = vhs.astype(wu.dtype)
     return (
         taylor_expm_action(a, vhs, wu, n_terms),
         taylor_expm_action(a, vhs, wd, n_terms),
@@ -188,7 +275,7 @@ def _apply_two_body_generalized_from_restricted(
     make_vhs: Callable[[jax.Array, CholAfqmcCtx], jax.Array],
 ) -> jax.Array:
     vhs = make_vhs(field, prop_ctx).astype(w.dtype)
-    a = (1.0j * prop_ctx.sqrt_dt).astype(w.dtype)
+    a = prop_ctx.sqrt_dt.astype(w.dtype)
     norb = w.shape[0] // 2
     top = taylor_expm_action(a, vhs, w[:norb, :], n_terms)
     bot = taylor_expm_action(a, vhs, w[norb:, :], n_terms)
@@ -250,8 +337,20 @@ def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = F
         vhs_complex_dtype = jnp.complex128
 
     def make_vhs(field: jax.Array, ctx: CholAfqmcCtx) -> jax.Array:
+        x = field.astype(vhs_complex_dtype) * ctx.field_factors.astype(vhs_complex_dtype)
         return _make_vhs_split_flat(
             chol_flat=ctx.chol_flat,
+            x=x,
+            n=ctx.norb,
+        )
+
+    def make_vhs_unrestricted(field: jax.Array, ctx: CholAfqmcCtx) -> jax.Array:
+        if ctx.field_spin_coeffs is None:
+            return make_vhs(field, ctx)
+        return _make_vhs_spin_resolved_flat(
+            chol_flat=ctx.chol_flat,
+            field_factors=ctx.field_factors.astype(vhs_complex_dtype),
+            field_spin_coeffs=ctx.field_spin_coeffs.astype(vhs_complex_dtype),
             x=field.astype(vhs_complex_dtype),
             n=ctx.norb,
         )
@@ -268,7 +367,7 @@ def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = F
                 w, f, ctx, n_terms, make_vhs=mv
             )
         case "restricted", "unrestricted":
-            apply_trotter = lambda w, f, ctx, n_terms, mv=make_vhs: _apply_trotter_u(
+            apply_trotter = lambda w, f, ctx, n_terms, mv=make_vhs_unrestricted: _apply_trotter_u(
                 w, f, ctx, n_terms, make_vhs=mv
             )
         case "restricted", "generalized":

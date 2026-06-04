@@ -343,6 +343,7 @@ def stage_from_ccpy(
     cache: Union[str, Path] | None = None,
     overwrite: bool = False,
     verbose: bool = False,
+    real_field_centers: Any = None,
 ) -> StagedInputs:
     """
     Stage AFQMC inputs from a ccpy driver and a PySCF UHF mf object.
@@ -371,6 +372,10 @@ def stage_from_ccpy(
             If True, recompute even when cache exists.
         verbose:
             Print timing/info.
+        real_field_centers:
+            Optional localized-orbital centers used to extract onsite HK-density
+            real spin fields from FCIDUMP integrals. Accepts e.g. ``"2:7,13:18"``
+            or ``[(2, 3, 4, 5, 6), (13, 14, 15, 16, 17)]``.
 
     Returns:
         StagedInputs with HamInput and TrialInput
@@ -398,7 +403,11 @@ def stage_from_ccpy(
     ham_source = "mf"
     if fcidump is not None and int(obj.afqmc_frozen) == 0:
         ham = _stage_ham_input_from_fcidump(
-            obj, fcidump=fcidump, chol_cut=chol_cut, verbose=verbose
+            obj,
+            fcidump=fcidump,
+            chol_cut=chol_cut,
+            verbose=verbose,
+            real_field_centers=real_field_centers,
         )
         ham_source = "fcidump"
     else:
@@ -437,6 +446,8 @@ def stage_from_ccpy(
             "basis": getattr(mol, "basis", None),
         },
     }
+    if ham.field_metadata is not None:
+        meta["field_metadata"] = ham.field_metadata
 
     staged = StagedInputs(ham=ham, trial=trial, meta=meta)
 

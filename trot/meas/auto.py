@@ -43,8 +43,36 @@ def _v0_from_chol(chol: jax.Array) -> jax.Array:
     return 0.5 * jnp.einsum("gik,gjk->ij", chol, chol, optimize="optimal")
 
 
+def _field_factors(ham_data: HamChol) -> jax.Array:
+    if ham_data.field_factors is not None:
+        return ham_data.field_factors
+    n_chol = ham_data.nchol
+    n_fields = int(n_chol) if n_chol is not None else int(ham_data.chol.shape[0])
+    return jnp.full((n_fields,), 1.0j, dtype=jnp.complex128)
+
+
+def _quadratic_coefficients(ham_data: HamChol) -> jax.Array:
+    factors = _field_factors(ham_data)
+    return -(factors * factors)
+
+
+def _v0_from_ham(ham_data: HamChol) -> jax.Array:
+    coeff = _quadratic_coefficients(ham_data)
+    if ham_data.field_spin_coeffs is not None:
+        spin_coeffs = ham_data.field_spin_coeffs
+        return 0.5 * jnp.einsum(
+            "g,gs,gik,gjk->sij",
+            coeff,
+            spin_coeffs * spin_coeffs,
+            ham_data.chol,
+            ham_data.chol,
+            optimize="optimal",
+        )
+    return 0.5 * jnp.einsum("g,gik,gjk->ij", coeff, ham_data.chol, ham_data.chol)
+
+
 def build_meas_ctx(ham_data: HamChol, _trial_data: trial_data, eps: float = 1.0e-4) -> AutoMeasCtx:
-    v0 = _v0_from_chol(ham_data.chol)
+    v0 = _v0_from_ham(ham_data)
     h1_eff = ham_data.h1 - v0
     return AutoMeasCtx(h1_eff=h1_eff, eps=jnp.asarray(eps))
 
@@ -129,11 +157,22 @@ def force_bias_kernel_uw_rh(
     wu, wd = w
     chol = ham_data.chol
     n_fields = chol.shape[0]
+    spin_coeffs = ham_data.field_spin_coeffs
 
     def f(x_gamma: jax.Array) -> jax.Array:
-        x_chol = jnp.einsum("gij,g->ij", chol, x_gamma, optimize="optimal")
-        wu1 = wu + x_chol @ wu
-        wd1 = wd + x_chol @ wd
+        if spin_coeffs is None:
+            x_chol = jnp.einsum("gij,g->ij", chol, x_gamma, optimize="optimal")
+            wu1 = wu + x_chol @ wu
+            wd1 = wd + x_chol @ wd
+        else:
+            x_chol_a = jnp.einsum(
+                "gij,g,g->ij", chol, x_gamma, spin_coeffs[:, 0], optimize="optimal"
+            )
+            x_chol_b = jnp.einsum(
+                "gij,g,g->ij", chol, x_gamma, spin_coeffs[:, 1], optimize="optimal"
+            )
+            wu1 = wu + x_chol_a @ wu
+            wd1 = wd + x_chol_b @ wd
         return overlap((wu1, wd1), trial_data)
 
     x0 = jnp.zeros((n_fields,), dtype=wu.dtype)
@@ -226,27 +265,38 @@ def energy_kernel_uw_rh(
 
     # one-body derivative via jvp
     def f1(x: jax.Array) -> jax.Array:
-        wu1 = wu + x * (h1_eff @ wu)
-        wd1 = wd + x * (h1_eff @ wd)
+        if h1_eff.ndim == 3 and h1_eff.shape[0] == 2:
+            wu1 = wu + x * (h1_eff[0] @ wu)
+            wd1 = wd + x * (h1_eff[1] @ wd)
+        else:
+            wu1 = wu + x * (h1_eff @ wu)
+            wd1 = wd + x * (h1_eff @ wd)
         return overlap((wu1, wd1), trial_data)
 
     x0 = jnp.asarray(0.0)
     ovlp0, d_ovlp = jax.jvp(f1, (x0,), (jnp.asarray(1.0, dtype=x0.dtype),))
 
-    def sum_overlap_quad(x: jax.Array) -> jax.Array:
+    def weighted_d2_sum(x: jax.Array) -> jax.Array:
         acc0 = jnp.zeros((), dtype=ovlp0.dtype)
+        coeff = _quadratic_coefficients(ham_data)
+        spin_coeffs = ham_data.field_spin_coeffs
+        scan_spin = (
+            jnp.ones((n_fields, 2), dtype=chol.dtype) if spin_coeffs is None else spin_coeffs
+        )
 
-        def body(acc, chol_i):
-            wu1 = wu + x * (chol_i @ wu) + 0.5 * (x * x) * (chol_i @ (chol_i @ wu))
-            wd1 = wd + x * (chol_i @ wd) + 0.5 * (x * x) * (chol_i @ (chol_i @ wd))
-            return acc + overlap((wu1, wd1), trial_data), None
+        def body(acc, inputs):
+            chol_i, coeff_i, spin_i = inputs
+            chol_a = chol_i if spin_coeffs is None else spin_i[0] * chol_i
+            chol_b = chol_i if spin_coeffs is None else spin_i[1] * chol_i
+            wu1 = wu + x * (chol_a @ wu) + 0.5 * (x * x) * (chol_a @ (chol_a @ wu))
+            wd1 = wd + x * (chol_b @ wd) + 0.5 * (x * x) * (chol_b @ (chol_b @ wd))
+            second = (overlap((wu1, wd1), trial_data) - ovlp0) / (0.5 * x * x)
+            return acc + coeff_i * second, None
 
-        acc, _ = lax.scan(body, acc0, chol)
+        acc, _ = lax.scan(body, acc0, (chol, coeff, scan_spin))
         return acc
 
-    sum_p = sum_overlap_quad(+eps)
-    sum_m = sum_overlap_quad(-eps)
-    d2_sum = (sum_p - 2.0 * jnp.asarray(n_fields, dtype=ovlp0.dtype) * ovlp0 + sum_m) / (eps * eps)
+    d2_sum = 0.5 * (weighted_d2_sum(+eps) + weighted_d2_sum(-eps))
 
     return (d_ovlp + 0.5 * d2_sum) / ovlp0 + h0
 

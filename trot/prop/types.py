@@ -25,6 +25,7 @@ class PropState(NamedTuple):
     pop_control_ene_shift: jax.Array
     e_estimate: jax.Array
     node_encounters: jax.Array
+    diagnostics: dict[str, jax.Array] | None = None
 
 
 @dataclass(frozen=True)
