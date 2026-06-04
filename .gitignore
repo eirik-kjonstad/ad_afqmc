@@ -7,6 +7,7 @@ __pycache__/
 
 # Output files
 runs/
+examples/cc_amp_*.npy
 
 # OS
 .DS_Store
