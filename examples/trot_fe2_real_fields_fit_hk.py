@@ -182,6 +182,18 @@ def _print_field_metadata(label: str, staged: Any) -> None:
     print(f"HK real fields          = {meta.get('n_hk_real_fields')}")
     print(f"residual real fields    = {meta.get('n_residual_real_fields')}")
     print(f"residual complex fields = {meta.get('n_residual_complex_fields')}")
+    frob = meta.get("frobenius", {})
+    if frob:
+        print("Frobenius diagnostics:")
+        print(f"  ||V_full||                 = {float(frob['full_norm']):.10f}")
+        print(f"  ||V_HK onsite||            = {float(frob['hk_onsite_norm']):.10f}")
+        print(f"  ||V_residual||             = {float(frob['residual_norm']):.10f}")
+        print(f"  ||V_center block||         = {float(frob['center_block_norm']):.10f}")
+        print("  HK/full weight fraction    = " f"{float(frob['hk_fraction_full_weight']):.6f}")
+        print(
+            "  HK/center weight fraction  = "
+            f"{float(frob['hk_fraction_center_block_weight']):.6f}"
+        )
     extracted = meta.get("extracted_terms", [])
     if extracted:
         print("onsite U terms:")

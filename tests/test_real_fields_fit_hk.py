@@ -2,13 +2,17 @@ import numpy as np
 import jax.numpy as jnp
 from types import SimpleNamespace
 
+from trot.core.ops import k_energy
+from trot.core.system import System
 from trot.ham.chol import HamChol
+from trot.meas.auto import make_auto_meas_ops
 from trot.prop.chol_afqmc_ops import _build_prop_ctx, make_trotter_ops
 from trot.runtime_layout import _build_restricted_prop_ctx_from_host
 from trot.staging import (
     _build_hk_density_real_fields_from_eri,
     _normalize_real_field_centers,
 )
+from trot.trial.uhf import make_uhf_trial_data, make_uhf_trial_ops
 
 
 def test_normalize_real_field_centers_accepts_ranges():
@@ -35,8 +39,37 @@ def test_hk_density_fit_extracts_real_spin_field_and_residual():
     np.testing.assert_allclose(fit.chol[0], np.diag([2.0, 0.0]))
     np.testing.assert_allclose(fit.field_factors[0], 1.0)
     np.testing.assert_allclose(fit.field_spin_coeffs[0], [1.0, -1.0])
-    np.testing.assert_allclose(fit.h1_shift, np.diag([2.0, 0.0]))
+    np.testing.assert_allclose(fit.h1_shift, np.zeros((norb, norb)))
     assert fit.metadata["extracted_terms"][0]["U"] == 4.0
+    frob = fit.metadata["frobenius"]
+    np.testing.assert_allclose(frob["full_norm"], np.sqrt(4.0**2 + 1.5**2))
+    np.testing.assert_allclose(frob["hk_onsite_norm"], 4.0)
+    np.testing.assert_allclose(frob["center_block_norm"], 4.0)
+    np.testing.assert_allclose(frob["hk_fraction_center_block_weight"], 1.0)
+
+
+def test_hk_real_spin_field_local_energy_has_no_extra_one_body_shift():
+    ham = HamChol(
+        basis="restricted",
+        h0=jnp.asarray(0.0),
+        h1=jnp.zeros((1, 1)),
+        chol=jnp.asarray([[[2.0]]]),
+        field_factors=jnp.asarray([1.0 + 0.0j]),
+        field_spin_coeffs=jnp.asarray([[1.0, -1.0]]),
+    )
+    sys = System(norb=1, nelec=(1, 1), walker_kind="unrestricted")
+    trial_data = make_uhf_trial_data({"mo_a": np.eye(1), "mo_b": np.eye(1)}, sys)
+    trial_ops = make_uhf_trial_ops(sys)
+    meas_ops = make_auto_meas_ops(sys=sys, trial_ops_=trial_ops)
+    meas_ctx = meas_ops.build_meas_ctx(ham, trial_data)
+    energy = meas_ops.require_kernel(k_energy)(
+        (jnp.eye(1, dtype=jnp.complex128), jnp.eye(1, dtype=jnp.complex128)),
+        ham,
+        meas_ctx,
+        trial_data,
+    )
+
+    np.testing.assert_allclose(np.asarray(energy), 4.0, rtol=1.0e-6, atol=1.0e-6)
 
 
 def test_mixed_real_complex_prop_ctx_uses_spin_resolved_h1():

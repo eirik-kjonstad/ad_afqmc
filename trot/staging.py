@@ -1065,8 +1065,15 @@ def _build_hk_density_real_fields_from_eri(
 ) -> RealFieldFitResult:
     norb = int(eri_ao.shape[0])
     nmo = int(np.asarray(basis_coeff).shape[1])
+    eri_ao_arr = np.asarray(eri_ao)
     eri_residual = np.array(eri_ao, copy=True)
     h1_shift_ao = np.zeros((norb, norb), dtype=np.asarray(eri_ao).dtype)
+    center_orbitals = tuple(sorted({orb for center in centers for orb in center}))
+    if center_orbitals:
+        center_ix = np.ix_(center_orbitals, center_orbitals, center_orbitals, center_orbitals)
+        center_block_norm = float(np.linalg.norm(eri_ao_arr[center_ix].reshape(-1)))
+    else:
+        center_block_norm = 0.0
 
     real_chol: list[Array] = []
     real_factors: list[complex] = []
@@ -1087,10 +1094,9 @@ def _build_hk_density_real_fields_from_eri(
             labels.append(f"hk_density_real:center{center_idx}:orb{orb}")
             extracted.append({"center": center_idx, "orbital": int(orb), "U": u_value})
 
-            # U n_up n_down = -0.5 [sqrt(U) (n_up - n_down)]^2
-            #                 + 0.5 U (n_up + n_down)
+            # The normal-ordering correction for -0.5 [sqrt(U)(n_up - n_down)]^2
+            # is applied by the propagation/measurement h1_eff builders.
             eri_residual[orb, orb, orb, orb] -= u_value
-            h1_shift_ao[orb, orb] += 0.5 * u_value
 
     residual_chol, residual_factors, residual_spin_coeffs, residual_labels = (
         _factorize_symmetric_supermatrix(
@@ -1117,13 +1123,42 @@ def _build_hk_density_real_fields_from_eri(
     n_hk = len(real_chol)
     n_residual_complex = sum(label == "residual_complex" for label in residual_labels)
     n_residual_real = sum(label == "residual_real" for label in residual_labels)
+    hk_frobenius_norm = float(np.sqrt(sum(term["U"] * term["U"] for term in extracted)))
+    full_frobenius_norm = float(np.linalg.norm(eri_ao_arr.reshape(-1)))
+    residual_frobenius_norm = float(np.linalg.norm(eri_residual.reshape(-1)))
+    if center_orbitals:
+        residual_center_block_norm = float(np.linalg.norm(eri_residual[center_ix].reshape(-1)))
+    else:
+        residual_center_block_norm = 0.0
+
+    def _frac(num: float, den: float) -> float:
+        return float(num / den) if den > 0.0 else 0.0
+
     metadata: Dict[str, Any] = {
         "real_field_fit": "hk_density",
         "centers": [list(center) for center in centers],
+        "center_orbitals": list(center_orbitals),
         "extracted_terms": extracted,
         "n_hk_real_fields": int(n_hk),
         "n_residual_complex_fields": int(n_residual_complex),
         "n_residual_real_fields": int(n_residual_real),
+        "frobenius": {
+            "full_norm": full_frobenius_norm,
+            "hk_onsite_norm": hk_frobenius_norm,
+            "residual_norm": residual_frobenius_norm,
+            "center_block_norm": center_block_norm,
+            "center_block_residual_norm": residual_center_block_norm,
+            "hk_fraction_full_norm": _frac(hk_frobenius_norm, full_frobenius_norm),
+            "hk_fraction_full_weight": _frac(
+                hk_frobenius_norm * hk_frobenius_norm,
+                full_frobenius_norm * full_frobenius_norm,
+            ),
+            "hk_fraction_center_block_norm": _frac(hk_frobenius_norm, center_block_norm),
+            "hk_fraction_center_block_weight": _frac(
+                hk_frobenius_norm * hk_frobenius_norm,
+                center_block_norm * center_block_norm,
+            ),
+        },
         "field_labels": tuple(labels),
     }
 
