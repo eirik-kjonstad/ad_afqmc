@@ -16,7 +16,10 @@ try:
     from trot.afqmc import Afqmc
     from trot.prop.types import QmcParams
     from trot.staging import load as load_staged
+    from trot.staging import stage
     from trot.staging import stage_from_ccpy
+    from trot.staging import StagedMfOrCc
+    from trot.staging import _stage_ham_input_from_fcidump
 except ImportError as exc:
     raise RuntimeError(
         "This example requires trot on PYTHONPATH. For a local checkout, run with "
@@ -52,8 +55,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--standard-cache",
         type=Path,
-        default=Path(__file__).with_name("fe2_standard_ucisd_ccsd_staged.h5"),
+        default=None,
         help="Ordinary Cholesky staged HDF5 cache path used with --compare-standard.",
+    )
+    parser.add_argument(
+        "--method",
+        choices=("uhf", "ccsd", "ccsdt", "ccsdtq"),
+        default="ccsd",
+        help=(
+            "Trial/preparation method. Use 'uhf' for a UHF Slater trial without ccpy; "
+            "CC methods run ccpy and stage a CI expansion from the requested --order."
+        ),
+    )
+    parser.add_argument(
+        "--order",
+        type=int,
+        choices=(2, 3, 4),
+        default=2,
+        help="CI excitation order staged from ccpy amplitudes. Ignored for --method uhf.",
     )
     parser.add_argument(
         "--fe-band-model",
@@ -118,15 +137,19 @@ def parse_args() -> argparse.Namespace:
             else DEFAULT_FE_CENTERS_5_BAND
         )
     if args.cache is None:
+        trial_tag = "uhf" if args.method == "uhf" else f"{args.method}_order{args.order}"
         cache_name = (
-            f"fe2_real_fields_{args.real_field_method}_custom_ucisd_ccsd_staged.h5"
+            f"fe2_real_fields_{args.real_field_method}_custom_{trial_tag}_staged.h5"
             if custom_centers
             else (
                 f"fe2_real_fields_{args.real_field_method}_{args.fe_band_model}"
-                "band_ucisd_ccsd_staged.h5"
+                f"band_{trial_tag}_staged.h5"
             )
         )
         args.cache = Path(__file__).with_name(cache_name)
+    if args.standard_cache is None:
+        trial_tag = "uhf" if args.method == "uhf" else f"{args.method}_order{args.order}"
+        args.standard_cache = Path(__file__).with_name(f"fe2_standard_{trial_tag}_staged.h5")
     return args
 
 
@@ -175,6 +198,18 @@ def fe2_broken_symmetry_guess(umf) -> np.ndarray:
     return dm0
 
 
+def build_uhf_mf(args: argparse.Namespace):
+    start = time.perf_counter()
+    mf = prepare_fcidump_mf(args.fcidump)
+    umf = mf.to_uhf().newton()
+    umf.chkfile = str(args.chkfile)
+    umf.mol.verbose = 4
+    umf.kernel(dm0=fe2_broken_symmetry_guess(umf))
+    seconds = time.perf_counter() - start
+    print(f"Prepared Fe2 UHF inputs in {seconds:.2f}s")
+    return umf
+
+
 def build_cc_driver(args: argparse.Namespace):
     try:
         from ccpy.drivers.driver import Driver
@@ -182,20 +217,15 @@ def build_cc_driver(args: argparse.Namespace):
         raise RuntimeError("This example requires ccpy. Please install ccpy to run it.") from exc
 
     start = time.perf_counter()
-    mf = prepare_fcidump_mf(args.fcidump)
-    umf = mf.to_uhf().newton()
-    umf.chkfile = str(args.chkfile)
-    umf.mol.verbose = 4
-    umf.kernel(dm0=fe2_broken_symmetry_guess(umf))
-
+    umf = build_uhf_mf(args)
     cc_driver = Driver.from_pyscf(umf, nfrozen=0, uhf=True)
     cc_driver.options["amp_convergence"] = args.amp_convergence
     cc_driver.options["energy_convergence"] = args.energy_convergence
     cc_driver.options["RHF_symmetry"] = False
-    cc_driver.run_cc(method="ccsd")
+    cc_driver.run_cc(method=args.method)
 
     seconds = time.perf_counter() - start
-    print(f"Prepared Fe2 UHF/CCSD inputs in {seconds:.2f}s")
+    print(f"Prepared Fe2 UHF/{args.method.upper()} inputs in {seconds:.2f}s")
     return cc_driver, umf
 
 
@@ -293,6 +323,12 @@ def _print_field_metadata(label: str, staged: Any) -> None:
     print(f"n_fields   = {staged.ham.chol.shape[0]}")
     if hasattr(staged, "meta") and staged.meta.get("fe_band_model") is not None:
         print(f"Fe preset  = {staged.meta.get('fe_band_model')}-band")
+    if hasattr(staged, "meta") and staged.meta.get("trial_method") is not None:
+        method_line = f"trial method = {staged.meta.get('trial_method')}"
+        if staged.meta.get("trial_order") is not None:
+            method_line += f" order {staged.meta.get('trial_order')}"
+        method_line += f" ({staged.trial.kind})"
+        print(method_line)
     if not meta:
         print("field route = ordinary Cholesky")
         return
@@ -357,7 +393,15 @@ def _print_field_metadata(label: str, staged: Any) -> None:
     _print_local_parameters(meta)
 
 
-def stage_one(
+def _annotate_staged(staged: Any, args: argparse.Namespace) -> Any:
+    staged.meta["fe_band_model"] = args.fe_band_model
+    staged.meta["trial_method"] = args.method
+    if args.method != "uhf":
+        staged.meta["trial_order"] = int(args.order)
+    return staged
+
+
+def stage_ccpy_one(
     *,
     label: str,
     cache: Path,
@@ -370,7 +414,7 @@ def stage_one(
     staged = stage_from_ccpy(
         cc_driver,
         umf,
-        order=2,
+        order=args.order,
         chol_cut=args.chol_cut,
         fcidump=args.fcidump,
         cache=cache,
@@ -379,6 +423,39 @@ def stage_one(
         real_field_centers=real_field_centers,
         real_field_method=args.real_field_method if real_field_centers is not None else "hk_density",
     )
+    staged = _annotate_staged(staged, args)
+    seconds = time.perf_counter() - start
+    print(f"Wrote {label} staged inputs to {cache} in {seconds:.2f}s")
+    return staged, seconds
+
+
+def stage_uhf_one(
+    *,
+    label: str,
+    cache: Path,
+    args: argparse.Namespace,
+    umf: Any,
+    real_field_centers: str | None,
+):
+    start = time.perf_counter()
+    staged_obj = StagedMfOrCc(umf, 0)
+    ham = _stage_ham_input_from_fcidump(
+        staged_obj,
+        fcidump=args.fcidump,
+        chol_cut=args.chol_cut,
+        verbose=args.verbose_stage,
+        real_field_centers=real_field_centers,
+        real_field_method=args.real_field_method if real_field_centers is not None else "hk_density",
+    )
+    staged = stage(
+        umf,
+        chol_cut=args.chol_cut,
+        cache=cache,
+        overwrite=True,
+        verbose=args.verbose_stage,
+        ham=ham,
+    )
+    staged = _annotate_staged(staged, args)
     seconds = time.perf_counter() - start
     print(f"Wrote {label} staged inputs to {cache} in {seconds:.2f}s")
     return staged, seconds
@@ -396,34 +473,54 @@ def build_or_load_staged(args: argparse.Namespace) -> dict[str, tuple[Any, float
     )
 
     if not need_real:
-        real_staged = _load_cache(args.cache)
+        staged_inputs, seconds = _load_cache(args.cache)
+        real_staged = (_annotate_staged(staged_inputs, args), seconds)
     if args.compare_standard and not need_standard:
-        standard_staged = _load_cache(args.standard_cache)
+        staged_inputs, seconds = _load_cache(args.standard_cache)
+        standard_staged = (_annotate_staged(staged_inputs, args), seconds)
 
     if need_real or need_standard:
-        cc_driver, umf = build_cc_driver(args)
-        if need_real:
-            real_staged = stage_one(
-                label=f"real-field {args.real_field_method}",
-                cache=args.cache,
-                args=args,
-                cc_driver=cc_driver,
-                umf=umf,
-                real_field_centers=args.real_field_centers,
-            )
-        if need_standard:
-            standard_staged = stage_one(
-                label="standard Cholesky",
-                cache=args.standard_cache,
-                args=args,
-                cc_driver=cc_driver,
-                umf=umf,
-                real_field_centers=None,
-            )
+        if args.method == "uhf":
+            umf = build_uhf_mf(args)
+            if need_real:
+                real_staged = stage_uhf_one(
+                    label=f"real-field {args.real_field_method} UHF",
+                    cache=args.cache,
+                    args=args,
+                    umf=umf,
+                    real_field_centers=args.real_field_centers,
+                )
+            if need_standard:
+                standard_staged = stage_uhf_one(
+                    label="standard Cholesky UHF",
+                    cache=args.standard_cache,
+                    args=args,
+                    umf=umf,
+                    real_field_centers=None,
+                )
+        else:
+            cc_driver, umf = build_cc_driver(args)
+            if need_real:
+                real_staged = stage_ccpy_one(
+                    label=f"real-field {args.real_field_method} {args.method} order {args.order}",
+                    cache=args.cache,
+                    args=args,
+                    cc_driver=cc_driver,
+                    umf=umf,
+                    real_field_centers=args.real_field_centers,
+                )
+            if need_standard:
+                standard_staged = stage_ccpy_one(
+                    label=f"standard Cholesky {args.method} order {args.order}",
+                    cache=args.standard_cache,
+                    args=args,
+                    cc_driver=cc_driver,
+                    umf=umf,
+                    real_field_centers=None,
+                )
 
     staged: dict[str, tuple[Any, float]] = {}
     if real_staged is not None:
-        real_staged[0].meta["fe_band_model"] = args.fe_band_model
         staged["real-field"] = real_staged
     if standard_staged is not None:
         staged["standard"] = standard_staged
@@ -448,7 +545,7 @@ def run_afqmc(label: str, staged: Any, args: argparse.Namespace) -> tuple[float,
     start = time.perf_counter()
     mean, err = af.kernel()
     seconds = time.perf_counter() - start
-    print(f"{label} AFQMC/UCISD energy: {mean:.10f} +/- {err:.10f} Ha")
+    print(f"{label} AFQMC/{staged.trial.kind} energy: {mean:.10f} +/- {err:.10f} Ha")
     print(f"{label} AFQMC timing: {seconds:.2f}s")
     return float(mean), float(err), seconds
 
