@@ -158,15 +158,15 @@ def _get_h1_eff(ham_data: HamChol, mf: jax.Array) -> jax.Array:
             * spin_coeffs[:, :, None, None]
             * ham_data.chol[:, None, :, :]
         )
-        v0m = 0.5 * jnp.einsum("gsik,gskj->sij", k_chol, k_chol, optimize="optimal")
-        v1m = jnp.einsum("g,gsik->sik", mf, k_chol, optimize="optimal")
+        v0m = 0.5 * jnp.sum(jnp.matmul(k_chol, k_chol), axis=0)
+        v1m = jnp.sum(mf[:, None, None, None] * k_chol, axis=0)
         return ham_data.h1[None, :, :] + v0m - v1m
 
     match ham_data.basis:
         case "restricted" | "generalized":
             k_chol = field_factors[:, None, None] * ham_data.chol
-            v0m = 0.5 * jnp.einsum("gik,gkj->ij", k_chol, k_chol, optimize="optimal")
-            v1m = jnp.einsum("g,gik->ik", mf, k_chol, optimize="optimal")
+            v0m = 0.5 * jnp.sum(jnp.matmul(k_chol, k_chol), axis=0)
+            v1m = jnp.sum(mf[:, None, None] * k_chol, axis=0)
             h1_eff = ham_data.h1 + v0m - v1m
         case _:
             raise ValueError(f"Unknown Hamiltonian basis kind: {ham_data.basis}")
