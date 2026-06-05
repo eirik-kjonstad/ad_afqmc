@@ -25,4 +25,6 @@ mycc = cc.UCCSD(mf)
 mycc.kernel()
 
 af = Afqmc(mycc)
+af.mixed_precision = False
+af.n_blocks = 800
 mean, err = af.kernel()

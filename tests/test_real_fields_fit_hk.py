@@ -1,6 +1,7 @@
 import numpy as np
 import jax.numpy as jnp
 from types import SimpleNamespace
+from pyscf import ao2mo
 
 from trot.core.ops import k_energy
 from trot.core.system import System
@@ -9,6 +10,7 @@ from trot.meas.auto import make_auto_meas_ops
 from trot.prop.chol_afqmc_ops import _build_prop_ctx, make_trotter_ops
 from trot.runtime_layout import _build_restricted_prop_ctx_from_host
 from trot.staging import (
+    _factorize_symmetric_supermatrix,
     _build_hk_density_real_fields_from_eri,
     _normalize_real_field_centers,
 )
@@ -46,6 +48,38 @@ def test_hk_density_fit_extracts_real_spin_field_and_residual():
     np.testing.assert_allclose(frob["hk_onsite_norm"], 4.0)
     np.testing.assert_allclose(frob["center_block_norm"], 4.0)
     np.testing.assert_allclose(frob["hk_fraction_center_block_weight"], 1.0)
+
+
+def test_residual_factorization_reconstructs_packed_pair_matrix():
+    norb = 3
+    pair = np.asarray(
+        [
+            [1.2, 0.1, -0.2, 0.0, 0.3, 0.2],
+            [0.1, 0.7, 0.4, -0.1, 0.2, 0.0],
+            [-0.2, 0.4, 1.4, 0.3, -0.2, 0.1],
+            [0.0, -0.1, 0.3, 0.9, 0.2, -0.3],
+            [0.3, 0.2, -0.2, 0.2, 1.1, 0.4],
+            [0.2, 0.0, 0.1, -0.3, 0.4, 0.8],
+        ]
+    )
+    pair = 0.5 * (pair + pair.T)
+    eri = ao2mo.restore(1, pair, norb)
+
+    chol, factors, _spin_coeffs, _labels, diagnostics = _factorize_symmetric_supermatrix(
+        eri,
+        coeff=np.eye(norb),
+        chol_cut=1.0e-12,
+    )
+
+    chol_pair = []
+    for chol_i in chol:
+        chol_pair.append([chol_i[m, n] for m in range(norb) for n in range(m + 1)])
+    chol_pair = np.asarray(chol_pair)
+    coeff = -(factors * factors)
+    reconstructed = np.einsum("g,gi,gj->ij", coeff, chol_pair, chol_pair)
+
+    np.testing.assert_allclose(reconstructed, pair, rtol=1.0e-10, atol=1.0e-10)
+    assert diagnostics["residual_pair_reconstruction_relative_error"] < 1.0e-10
 
 
 def test_hk_real_spin_field_local_energy_has_no_extra_one_body_shift():

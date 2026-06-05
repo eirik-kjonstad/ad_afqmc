@@ -189,7 +189,15 @@ def _print_field_metadata(label: str, staged: Any) -> None:
         print(f"  ||V_HK onsite||            = {float(frob['hk_onsite_norm']):.10f}")
         print(f"  ||V_residual||             = {float(frob['residual_norm']):.10f}")
         print(f"  ||V_center block||         = {float(frob['center_block_norm']):.10f}")
+        print(f"  ||V_full pair||            = {float(frob['full_pair_norm']):.10f}")
+        print(
+            "  residual pair rel. error   = "
+            f"{float(frob['residual_pair_reconstruction_relative_error']):.3e}"
+        )
         print("  HK/full weight fraction    = " f"{float(frob['hk_fraction_full_weight']):.6f}")
+        print(
+            "  HK/full pair weight frac.  = " f"{float(frob['hk_fraction_full_pair_weight']):.6f}"
+        )
         print(
             "  HK/center weight fraction  = "
             f"{float(frob['hk_fraction_center_block_weight']):.6f}"

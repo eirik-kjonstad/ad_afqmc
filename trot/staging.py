@@ -1009,27 +1009,54 @@ def _rotate_one_body_to_mo(mat: Array, coeff: Array) -> Array:
     return np.asarray(coeff).T.conj() @ np.asarray(mat) @ np.asarray(coeff)
 
 
+def _unpack_pair_vector(vec: Array, norb: int) -> Array:
+    mat = np.zeros((norb, norb), dtype=np.asarray(vec).dtype)
+    for m in range(norb):
+        for n in range(m + 1):
+            pair_idx = m * (m + 1) // 2 + n
+            mat[m, n] = vec[pair_idx]
+            mat[n, m] = vec[pair_idx]
+    return mat
+
+
 def _factorize_symmetric_supermatrix(
     eri: Array,
     *,
     coeff: Array,
     chol_cut: float,
-) -> tuple[Array, Array, Array, list[str]]:
+) -> tuple[Array, Array, Array, list[str], dict[str, float | int]]:
+    from pyscf import ao2mo
+
     norb = int(eri.shape[0])
-    supermat = np.asarray(eri).reshape(norb * norb, norb * norb)
+    supermat = ao2mo.restore(4, np.asarray(eri), norb)
     supermat = 0.5 * (supermat + supermat.T.conj())
     eigvals, eigvecs = np.linalg.eigh(supermat)
     keep = np.abs(eigvals) > float(chol_cut)
     kept_vals = eigvals[keep]
     kept_vecs = eigvecs[:, keep]
+    discarded_vals = eigvals[~keep]
+    residual_pair_norm = float(np.linalg.norm(eigvals))
+    residual_pair_reconstruction_error_norm = float(np.linalg.norm(discarded_vals))
+    diagnostics: dict[str, float | int] = {
+        "residual_pair_norm": residual_pair_norm,
+        "residual_pair_retained_norm": float(np.linalg.norm(kept_vals)),
+        "residual_pair_reconstruction_error_norm": residual_pair_reconstruction_error_norm,
+        "residual_pair_reconstruction_relative_error": (
+            residual_pair_reconstruction_error_norm / residual_pair_norm
+            if residual_pair_norm > 0.0
+            else 0.0
+        ),
+        "n_residual_pair_positive_eigenvalues": int(np.sum(kept_vals > 0.0)),
+        "n_residual_pair_negative_eigenvalues": int(np.sum(kept_vals < 0.0)),
+        "n_residual_pair_discarded_eigenvalues": int(np.sum(~keep)),
+    }
 
     chol_blocks: list[Array] = []
     factors: list[complex] = []
     spin_coeffs: list[tuple[float, float]] = []
     labels: list[str] = []
     for idx, value in enumerate(kept_vals):
-        local = (kept_vecs[:, idx] * np.sqrt(abs(value))).reshape(norb, norb)
-        local = 0.5 * (local + local.T.conj())
+        local = _unpack_pair_vector(kept_vecs[:, idx] * np.sqrt(abs(value)), norb)
         chol_blocks.append(_rotate_one_body_to_mo(local, coeff))
         if value > 0.0:
             factors.append(1.0j)
@@ -1046,6 +1073,7 @@ def _factorize_symmetric_supermatrix(
             np.zeros((0,), dtype=np.complex128),
             np.zeros((0, 2), dtype=np.float64),
             [],
+            diagnostics,
         )
 
     return (
@@ -1053,6 +1081,7 @@ def _factorize_symmetric_supermatrix(
         np.asarray(factors, dtype=np.complex128),
         np.asarray(spin_coeffs, dtype=np.float64),
         labels,
+        diagnostics,
     )
 
 
@@ -1063,6 +1092,8 @@ def _build_hk_density_real_fields_from_eri(
     centers: tuple[tuple[int, ...], ...],
     chol_cut: float,
 ) -> RealFieldFitResult:
+    from pyscf import ao2mo
+
     norb = int(eri_ao.shape[0])
     nmo = int(np.asarray(basis_coeff).shape[1])
     eri_ao_arr = np.asarray(eri_ao)
@@ -1098,7 +1129,7 @@ def _build_hk_density_real_fields_from_eri(
             # is applied by the propagation/measurement h1_eff builders.
             eri_residual[orb, orb, orb, orb] -= u_value
 
-    residual_chol, residual_factors, residual_spin_coeffs, residual_labels = (
+    residual_chol, residual_factors, residual_spin_coeffs, residual_labels, residual_diagnostics = (
         _factorize_symmetric_supermatrix(
             eri_residual,
             coeff=basis_coeff,
@@ -1126,6 +1157,7 @@ def _build_hk_density_real_fields_from_eri(
     hk_frobenius_norm = float(np.sqrt(sum(term["U"] * term["U"] for term in extracted)))
     full_frobenius_norm = float(np.linalg.norm(eri_ao_arr.reshape(-1)))
     residual_frobenius_norm = float(np.linalg.norm(eri_residual.reshape(-1)))
+    full_pair_norm = float(np.linalg.norm(ao2mo.restore(4, eri_ao_arr, norb)))
     if center_orbitals:
         residual_center_block_norm = float(np.linalg.norm(eri_residual[center_ix].reshape(-1)))
     else:
@@ -1148,10 +1180,17 @@ def _build_hk_density_real_fields_from_eri(
             "residual_norm": residual_frobenius_norm,
             "center_block_norm": center_block_norm,
             "center_block_residual_norm": residual_center_block_norm,
+            "full_pair_norm": full_pair_norm,
+            "hk_onsite_pair_norm": hk_frobenius_norm,
+            **residual_diagnostics,
             "hk_fraction_full_norm": _frac(hk_frobenius_norm, full_frobenius_norm),
             "hk_fraction_full_weight": _frac(
                 hk_frobenius_norm * hk_frobenius_norm,
                 full_frobenius_norm * full_frobenius_norm,
+            ),
+            "hk_fraction_full_pair_weight": _frac(
+                hk_frobenius_norm * hk_frobenius_norm,
+                full_pair_norm * full_pair_norm,
             ),
             "hk_fraction_center_block_norm": _frac(hk_frobenius_norm, center_block_norm),
             "hk_fraction_center_block_weight": _frac(
