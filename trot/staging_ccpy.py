@@ -382,8 +382,10 @@ def stage_from_ccpy(
             preserves the onsite-only extraction; ``"local_exact"`` extracts the
             full same-center local block before residual factorization; and
             ``"kanamori_sign"`` extracts a sign-decomposed Hubbard-Kanamori-like
-            subset before residual factorization. ``"kanamori_sign_full"`` tries
-            an experimental spin-orbital-validated pair-block HK decomposition.
+            subset before residual factorization. ``"kanamori_uj"`` extracts
+            only onsite U and sign-aware Hund/pair channels, leaving U' in the
+            residual. ``"kanamori_sign_full"`` tries an experimental
+            spin-orbital-validated pair-block HK decomposition.
 
     Returns:
         StagedInputs with HamInput and TrialInput

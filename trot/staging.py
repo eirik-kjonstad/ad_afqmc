@@ -1564,12 +1564,14 @@ def _build_kanamori_sign_real_fields_from_eri(
     )
 
 
-def _build_kanamori_sign_full_real_fields_from_eri(
+def _build_kanamori_pair_real_fields_from_eri(
     eri_ao: Array,
     *,
     basis_coeff: Array,
     centers: tuple[tuple[int, ...], ...],
     chol_cut: float,
+    include_density_target: bool,
+    real_field_fit: str,
 ) -> RealFieldFitResult:
     from pyscf import ao2mo
 
@@ -1645,7 +1647,10 @@ def _build_kanamori_sign_full_real_fields_from_eri(
                 pq_idx = _packed_pair_index(p, q)
                 qq_idx = _packed_pair_index(q, q)
                 target_pair = np.zeros_like(residual_pair)
-                for a, b in ((pp_idx, qq_idx), (qq_idx, pp_idx), (pq_idx, pq_idx)):
+                target_entries = [(pq_idx, pq_idx)]
+                if include_density_target:
+                    target_entries.extend([(pp_idx, qq_idx), (qq_idx, pp_idx)])
+                for a, b in target_entries:
                     target_pair[a, b] = residual_pair[a, b]
                 if np.linalg.norm(target_pair) <= float(chol_cut):
                     continue
@@ -1663,14 +1668,22 @@ def _build_kanamori_sign_full_real_fields_from_eri(
                 hund_value = float(np.real(residual_pair[pq_idx, pq_idx]))
                 preferred_bond = "spin" if hund_value >= 0.0 else "charge"
                 other_bond = "charge" if preferred_bond == "spin" else "spin"
-                candidates = [
-                    ("density_plus_charge", plus, "charge"),
-                    ("density_minus_charge", minus, "charge"),
-                    ("density_plus_spin", plus, "spin"),
-                    ("density_minus_spin", minus, "spin"),
-                    ("hund_preferred", bond, preferred_bond),
-                    ("hund_other", bond, other_bond),
-                ]
+                candidates = []
+                if include_density_target:
+                    candidates.extend(
+                        [
+                            ("density_plus_charge", plus, "charge"),
+                            ("density_minus_charge", minus, "charge"),
+                            ("density_plus_spin", plus, "spin"),
+                            ("density_minus_spin", minus, "spin"),
+                        ]
+                    )
+                candidates.extend(
+                    [
+                        ("hund_preferred", bond, preferred_bond),
+                        ("hund_other", bond, other_bond),
+                    ]
+                )
                 matrix = np.stack(
                     [candidate_tensor(mode, channel).reshape(-1).real for _, mode, channel in candidates],
                     axis=1,
@@ -1706,7 +1719,7 @@ def _build_kanamori_sign_full_real_fields_from_eri(
                 extracted_pair += pair_extracted
                 kanamori_terms.append(
                     {
-                        "kind": "pair_full",
+                        "kind": "pair_full" if include_density_target else "hund_J_pair",
                         "center": int(center_idx),
                         "orbitals": [int(orbitals[p]), int(orbitals[q])],
                         "preferred_decomposition": preferred_bond,
@@ -1813,7 +1826,7 @@ def _build_kanamori_sign_full_real_fields_from_eri(
         return float(num / den) if den > 0.0 else 0.0
 
     metadata: Dict[str, Any] = {
-        "real_field_fit": "kanamori_sign_full",
+        "real_field_fit": real_field_fit,
         "centers": [list(center) for center in centers],
         "center_orbitals": list(sorted({orb for center in centers for orb in center})),
         "center_reports": center_reports,
@@ -1854,6 +1867,40 @@ def _build_kanamori_sign_full_real_fields_from_eri(
         field_factors=np.asarray(field_factors, dtype=np.complex128),
         field_spin_coeffs=np.asarray(field_spin_coeffs, dtype=np.float64),
         metadata=metadata,
+    )
+
+
+def _build_kanamori_sign_full_real_fields_from_eri(
+    eri_ao: Array,
+    *,
+    basis_coeff: Array,
+    centers: tuple[tuple[int, ...], ...],
+    chol_cut: float,
+) -> RealFieldFitResult:
+    return _build_kanamori_pair_real_fields_from_eri(
+        eri_ao,
+        basis_coeff=basis_coeff,
+        centers=centers,
+        chol_cut=chol_cut,
+        include_density_target=True,
+        real_field_fit="kanamori_sign_full",
+    )
+
+
+def _build_kanamori_uj_real_fields_from_eri(
+    eri_ao: Array,
+    *,
+    basis_coeff: Array,
+    centers: tuple[tuple[int, ...], ...],
+    chol_cut: float,
+) -> RealFieldFitResult:
+    return _build_kanamori_pair_real_fields_from_eri(
+        eri_ao,
+        basis_coeff=basis_coeff,
+        centers=centers,
+        chol_cut=chol_cut,
+        include_density_target=False,
+        real_field_fit="kanamori_uj",
     )
 
 
@@ -2294,6 +2341,13 @@ def _stage_ham_input_from_fcidump(
                     centers=real_centers,
                     chol_cut=chol_cut,
                 )
+            case "kanamori_uj":
+                fit = _build_kanamori_uj_real_fields_from_eri(
+                    eri_ao,
+                    basis_coeff=basis_coeff,
+                    centers=real_centers,
+                    chol_cut=chol_cut,
+                )
             case "kanamori_sign_full":
                 fit = _build_kanamori_sign_full_real_fields_from_eri(
                     eri_ao,
@@ -2304,7 +2358,8 @@ def _stage_ham_input_from_fcidump(
             case _:
                 raise ValueError(
                     "real_field_method must be one of "
-                    "{'hk_density', 'local_exact', 'kanamori_sign', 'kanamori_sign_full'}, "
+                    "{'hk_density', 'local_exact', 'kanamori_sign', "
+                    "'kanamori_uj', 'kanamori_sign_full'}, "
                     f"got {real_field_method!r}."
                 )
         h1 = h1 + fit.h1_shift

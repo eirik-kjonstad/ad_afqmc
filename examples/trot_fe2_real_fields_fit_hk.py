@@ -95,7 +95,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--real-field-method",
-        choices=("hk_density", "local_exact", "kanamori_sign", "kanamori_sign_full"),
+        choices=(
+            "hk_density",
+            "local_exact",
+            "kanamori_sign",
+            "kanamori_uj",
+            "kanamori_sign_full",
+        ),
         default="local_exact",
         help="Real-field staging route for the specified centers.",
     )
@@ -271,12 +277,12 @@ def _print_local_parameters(meta: dict[str, Any]) -> None:
         hund_dec = {
             tuple(term["orbitals"]): term["decomposition"]
             for term in kanamori_terms
-            if term.get("kind") == "hund_J_bond"
+            if term.get("kind") in {"hund_J_bond", "hund_J_pair", "pair_full"}
         }
         hund_pref = {
             tuple(term["orbitals"]): term.get("preferred_decomposition")
             for term in kanamori_terms
-            if term.get("kind") == "hund_J_bond"
+            if term.get("kind") in {"hund_J_bond", "hund_J_pair", "pair_full"}
         }
         print(f"  center={center} orbitals={orbitals}")
         for term in params.get("onsite_U", []):

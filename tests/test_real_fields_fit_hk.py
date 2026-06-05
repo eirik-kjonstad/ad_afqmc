@@ -12,6 +12,7 @@ from trot.runtime_layout import _build_restricted_prop_ctx_from_host
 from trot.staging import (
     _factorize_symmetric_supermatrix,
     _build_hk_density_real_fields_from_eri,
+    _build_kanamori_uj_real_fields_from_eri,
     _build_kanamori_sign_real_fields_from_eri,
     _build_kanamori_sign_full_real_fields_from_eri,
     _build_local_exact_real_fields_from_eri,
@@ -270,6 +271,50 @@ def test_kanamori_sign_full_reconstructs_pair_block_in_spin_orbital_space():
         fit.field_spin_coeffs,
     )
     np.testing.assert_allclose(pair_got, pair, rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_kanamori_uj_extracts_u_and_j_but_leaves_uprime_in_residual():
+    norb = 2
+    pair = np.zeros((3, 3))
+    pair[0, 0] = 4.0
+    pair[2, 2] = 3.0
+    pair[0, 2] = pair[2, 0] = 0.8
+    pair[1, 1] = 0.5
+    eri = ao2mo.restore(1, pair, norb)
+
+    fit = _build_kanamori_uj_real_fields_from_eri(
+        eri,
+        basis_coeff=np.eye(norb),
+        centers=((0, 1),),
+        chol_cut=1.0e-12,
+    )
+
+    report = fit.metadata["center_reports"][0]
+    assert fit.metadata["real_field_fit"] == "kanamori_uj"
+    assert {term["kind"] for term in report["kanamori_terms"]} == {
+        "onsite_U",
+        "hund_J_pair",
+    }
+    n_local = fit.metadata["n_local_real_fields"] + fit.metadata["n_local_complex_fields"]
+    local_pair = _reconstruct_packed_pair_from_fields(
+        fit.chol[:n_local],
+        fit.field_factors[:n_local],
+        fit.field_spin_coeffs[:n_local],
+    )
+    expected_local = np.zeros_like(pair)
+    expected_local[0, 0] = pair[0, 0]
+    expected_local[1, 1] = pair[1, 1]
+    expected_local[2, 2] = pair[2, 2]
+    np.testing.assert_allclose(local_pair, expected_local, rtol=1.0e-10, atol=1.0e-10)
+
+    pair_got = _reconstruct_packed_pair_from_fields(
+        fit.chol,
+        fit.field_factors,
+        fit.field_spin_coeffs,
+    )
+    np.testing.assert_allclose(pair_got, pair, rtol=1.0e-10, atol=1.0e-10)
+    assert report["parameters"]["interorbital_Uprime"][0]["Uprime"] == 0.8
+    assert report["residual_center_block_norm"] > 0.0
 
 
 def test_residual_factorization_reconstructs_packed_pair_matrix():

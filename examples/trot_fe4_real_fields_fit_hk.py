@@ -264,7 +264,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--real-field-method",
-        choices=("hk_density", "local_exact", "kanamori_sign", "kanamori_sign_full"),
+        choices=(
+            "hk_density",
+            "local_exact",
+            "kanamori_sign",
+            "kanamori_uj",
+            "kanamori_sign_full",
+        ),
         default="local_exact",
         help="Real-field staging route for the specified centers.",
     )
