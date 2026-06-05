@@ -13,11 +13,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 try:
-    from ccpy.drivers.driver import Driver
-except ImportError as exc:
-    raise RuntimeError("This example requires ccpy. Please install ccpy to run it.") from exc
-
-try:
     from trot.afqmc import Afqmc
     from trot.prop.types import QmcParams
     from trot.staging import load as load_staged
@@ -29,15 +24,16 @@ except ImportError as exc:
     ) from exc
 
 
-DEFAULT_FE_CENTERS = "2:7,13:18"
+DEFAULT_FE_CENTERS_5_BAND = "2:7,13:18"
+DEFAULT_FE_CENTERS_2_BAND = "2:4,13:15"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Stage and run Fe2S2 with the real-field HK-density route. "
+            "Stage and run Fe2S2 with a center-targeted real-field route. "
             "The default Fe-center ranges are the five-orbital localized blocks "
-            f"{DEFAULT_FE_CENTERS}."
+            f"{DEFAULT_FE_CENTERS_5_BAND}."
         )
     )
     parser.add_argument(
@@ -50,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cache",
         type=Path,
-        default=Path(__file__).with_name("fe2_real_fields_fit_hk_ucisd_ccsd_staged.h5"),
+        default=None,
         help="Real-field staged HDF5 cache path.",
     )
     parser.add_argument(
@@ -60,12 +56,29 @@ def parse_args() -> argparse.Namespace:
         help="Ordinary Cholesky staged HDF5 cache path used with --compare-standard.",
     )
     parser.add_argument(
+        "--fe-band-model",
+        type=int,
+        choices=(2, 5),
+        default=5,
+        help=(
+            "Preset Fe-center orbital count. The 5-band preset uses "
+            f"{DEFAULT_FE_CENTERS_5_BAND}; the 2-band preset uses "
+            f"{DEFAULT_FE_CENTERS_2_BAND}. Ignored when --real-field-centers is set."
+        ),
+    )
+    parser.add_argument(
         "--real-field-centers",
-        default=DEFAULT_FE_CENTERS,
+        default=None,
         help=(
             "Localized orbital ranges for the Fe centers. Use Python slice syntax per center, "
-            "comma separated; e.g. '2:7,13:18'."
+            "comma separated; e.g. '2:7,13:18'. Overrides --fe-band-model."
         ),
+    )
+    parser.add_argument(
+        "--real-field-method",
+        choices=("hk_density", "local_exact", "kanamori_sign", "kanamori_sign_full"),
+        default="local_exact",
+        help="Real-field staging route for the specified centers.",
     )
     parser.add_argument(
         "--chkfile",
@@ -93,7 +106,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-chunks", type=int, default=1)
     parser.add_argument("--dt", type=float, default=0.005)
     parser.add_argument("--seed", type=int, default=42)
-    return parser.parse_args()
+    args = parser.parse_args()
+    custom_centers = any(
+        arg == "--real-field-centers" or arg.startswith("--real-field-centers=")
+        for arg in sys.argv[1:]
+    )
+    if args.real_field_centers is None:
+        args.real_field_centers = (
+            DEFAULT_FE_CENTERS_2_BAND
+            if args.fe_band_model == 2
+            else DEFAULT_FE_CENTERS_5_BAND
+        )
+    if args.cache is None:
+        cache_name = (
+            f"fe2_real_fields_{args.real_field_method}_custom_ucisd_ccsd_staged.h5"
+            if custom_centers
+            else (
+                f"fe2_real_fields_{args.real_field_method}_{args.fe_band_model}"
+                "band_ucisd_ccsd_staged.h5"
+            )
+        )
+        args.cache = Path(__file__).with_name(cache_name)
+    return args
 
 
 def prepare_fcidump_mf(fcidump_path: Path):
@@ -142,6 +176,11 @@ def fe2_broken_symmetry_guess(umf) -> np.ndarray:
 
 
 def build_cc_driver(args: argparse.Namespace):
+    try:
+        from ccpy.drivers.driver import Driver
+    except ImportError as exc:
+        raise RuntimeError("This example requires ccpy. Please install ccpy to run it.") from exc
+
     start = time.perf_counter()
     mf = prepare_fcidump_mf(args.fcidump)
     umf = mf.to_uhf().newton()
@@ -168,25 +207,118 @@ def _load_cache(path: Path):
     return staged, seconds
 
 
+def _print_local_parameters(meta: dict[str, Any]) -> None:
+    center_reports = meta.get("center_reports", [])
+    if not center_reports:
+        return
+
+    print("local parameters:")
+    for report in center_reports:
+        center = int(report["center"])
+        orbitals = report.get("orbitals", [])
+        params = report.get("parameters", {})
+        kanamori_terms = report.get("kanamori_terms", [])
+        onsite_dec = {
+            int(term["orbital"]): term["decomposition"]
+            for term in kanamori_terms
+            if term.get("kind") == "onsite_U"
+        }
+        onsite_pref = {
+            int(term["orbital"]): term.get("preferred_decomposition")
+            for term in kanamori_terms
+            if term.get("kind") == "onsite_U"
+        }
+        density_dec = {
+            tuple(term["orbitals"]): term["decomposition"]
+            for term in kanamori_terms
+            if term.get("kind") == "interorbital_Uprime"
+        }
+        density_pref = {
+            tuple(term["orbitals"]): term.get("preferred_decomposition")
+            for term in kanamori_terms
+            if term.get("kind") == "interorbital_Uprime"
+        }
+        hund_dec = {
+            tuple(term["orbitals"]): term["decomposition"]
+            for term in kanamori_terms
+            if term.get("kind") == "hund_J_bond"
+        }
+        hund_pref = {
+            tuple(term["orbitals"]): term.get("preferred_decomposition")
+            for term in kanamori_terms
+            if term.get("kind") == "hund_J_bond"
+        }
+        print(f"  center={center} orbitals={orbitals}")
+        for term in params.get("onsite_U", []):
+            orb = int(term["orbital"])
+            dec = onsite_dec.get(orb)
+            suffix = f" decomposition={dec}" if dec is not None else ""
+            if onsite_pref.get(orb) is not None and onsite_pref[orb] != dec:
+                suffix += f" preferred={onsite_pref[orb]}"
+            print(f"    U      orb={orb} value={float(term['U']): .10f}{suffix}")
+
+        uprime = {
+            tuple(term["orbitals"]): float(term["Uprime"])
+            for term in params.get("interorbital_Uprime", [])
+        }
+        exchange = {tuple(term["orbitals"]): float(term["J"]) for term in params.get("exchange_J", [])}
+        pair_hopping = {
+            tuple(term["orbitals"]): float(term["P"])
+            for term in params.get("pair_hopping_like", [])
+        }
+        for pair in sorted(set(uprime) | set(exchange) | set(pair_hopping)):
+            dec_parts = []
+            if pair in density_dec:
+                dec_parts.append(f"Uprime_dec={density_dec[pair]}")
+                if density_pref.get(pair) is not None and density_pref[pair] != density_dec[pair]:
+                    dec_parts.append(f"Uprime_pref={density_pref[pair]}")
+            if pair in hund_dec:
+                dec_parts.append(f"J_dec={hund_dec[pair]}")
+                if hund_pref.get(pair) is not None and hund_pref[pair] != hund_dec[pair]:
+                    dec_parts.append(f"J_pref={hund_pref[pair]}")
+            suffix = f" {' '.join(dec_parts)}" if dec_parts else ""
+            print(
+                f"    pair   orbs={list(pair)} "
+                f"Uprime={uprime.get(pair, 0.0): .10f} "
+                f"J={exchange.get(pair, 0.0): .10f} "
+                f"P={pair_hopping.get(pair, 0.0): .10f}"
+                f"{suffix}"
+            )
+
+
 def _print_field_metadata(label: str, staged: Any) -> None:
     meta = staged.meta.get("field_metadata")
     print(f"\n[{label}]")
     print(f"n_orbitals = {staged.ham.norb}")
     print(f"n_fields   = {staged.ham.chol.shape[0]}")
+    if hasattr(staged, "meta") and staged.meta.get("fe_band_model") is not None:
+        print(f"Fe preset  = {staged.meta.get('fe_band_model')}-band")
     if not meta:
         print("field route = ordinary Cholesky")
         return
 
     print(f"field route             = {meta.get('real_field_fit')}")
     print(f"centers                 = {meta.get('centers')}")
-    print(f"HK real fields          = {meta.get('n_hk_real_fields')}")
+    if meta.get("real_field_fit") == "hk_density":
+        print(f"HK real fields          = {meta.get('n_hk_real_fields')}")
+    else:
+        print(f"local real fields       = {meta.get('n_local_real_fields')}")
+        print(f"local complex fields    = {meta.get('n_local_complex_fields')}")
     print(f"residual real fields    = {meta.get('n_residual_real_fields')}")
     print(f"residual complex fields = {meta.get('n_residual_complex_fields')}")
     frob = meta.get("frobenius", {})
     if frob:
         print("Frobenius diagnostics:")
         print(f"  ||V_full||                 = {float(frob['full_norm']):.10f}")
-        print(f"  ||V_HK onsite||            = {float(frob['hk_onsite_norm']):.10f}")
+        if "hk_onsite_norm" in frob:
+            print(f"  ||V_HK onsite||            = {float(frob['hk_onsite_norm']):.10f}")
+        if "local_block_norm" in frob:
+            print(f"  ||V_local block||          = {float(frob['local_block_norm']):.10f}")
+        if "extracted_local_block_norm" in frob:
+            print(
+                "  ||V_local extracted||      = "
+                f"{float(frob['extracted_local_block_norm']):.10f}"
+            )
         print(f"  ||V_residual||             = {float(frob['residual_norm']):.10f}")
         print(f"  ||V_center block||         = {float(frob['center_block_norm']):.10f}")
         print(f"  ||V_full pair||            = {float(frob['full_pair_norm']):.10f}")
@@ -194,14 +326,25 @@ def _print_field_metadata(label: str, staged: Any) -> None:
             "  residual pair rel. error   = "
             f"{float(frob['residual_pair_reconstruction_relative_error']):.3e}"
         )
-        print("  HK/full weight fraction    = " f"{float(frob['hk_fraction_full_weight']):.6f}")
-        print(
-            "  HK/full pair weight frac.  = " f"{float(frob['hk_fraction_full_pair_weight']):.6f}"
-        )
-        print(
-            "  HK/center weight fraction  = "
-            f"{float(frob['hk_fraction_center_block_weight']):.6f}"
-        )
+        if "hk_fraction_full_weight" in frob:
+            print("  HK/full weight fraction    = " f"{float(frob['hk_fraction_full_weight']):.6f}")
+            print(
+                "  HK/full pair weight frac.  = "
+                f"{float(frob['hk_fraction_full_pair_weight']):.6f}"
+            )
+            print(
+                "  HK/center weight fraction  = "
+                f"{float(frob['hk_fraction_center_block_weight']):.6f}"
+            )
+        if "local_block_fraction_full_weight" in frob:
+            print(
+                "  local/full weight fraction = "
+                f"{float(frob['local_block_fraction_full_weight']):.6f}"
+            )
+            print(
+                "  extracted/full weight frac.= "
+                f"{float(frob['extracted_local_block_fraction_full_weight']):.6f}"
+            )
     extracted = meta.get("extracted_terms", [])
     if extracted:
         print("onsite U terms:")
@@ -211,6 +354,7 @@ def _print_field_metadata(label: str, staged: Any) -> None:
             )
         if len(extracted) > 20:
             print(f"  ... {len(extracted) - 20} more")
+    _print_local_parameters(meta)
 
 
 def stage_one(
@@ -233,6 +377,7 @@ def stage_one(
         overwrite=True,
         verbose=args.verbose_stage,
         real_field_centers=real_field_centers,
+        real_field_method=args.real_field_method if real_field_centers is not None else "hk_density",
     )
     seconds = time.perf_counter() - start
     print(f"Wrote {label} staged inputs to {cache} in {seconds:.2f}s")
@@ -259,7 +404,7 @@ def build_or_load_staged(args: argparse.Namespace) -> dict[str, tuple[Any, float
         cc_driver, umf = build_cc_driver(args)
         if need_real:
             real_staged = stage_one(
-                label="real-field HK-density",
+                label=f"real-field {args.real_field_method}",
                 cache=args.cache,
                 args=args,
                 cc_driver=cc_driver,
@@ -278,6 +423,7 @@ def build_or_load_staged(args: argparse.Namespace) -> dict[str, tuple[Any, float
 
     staged: dict[str, tuple[Any, float]] = {}
     if real_staged is not None:
+        real_staged[0].meta["fe_band_model"] = args.fe_band_model
         staged["real-field"] = real_staged
     if standard_staged is not None:
         staged["standard"] = standard_staged

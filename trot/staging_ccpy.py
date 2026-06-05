@@ -344,6 +344,7 @@ def stage_from_ccpy(
     overwrite: bool = False,
     verbose: bool = False,
     real_field_centers: Any = None,
+    real_field_method: str = "hk_density",
 ) -> StagedInputs:
     """
     Stage AFQMC inputs from a ccpy driver and a PySCF UHF mf object.
@@ -373,9 +374,16 @@ def stage_from_ccpy(
         verbose:
             Print timing/info.
         real_field_centers:
-            Optional localized-orbital centers used to extract onsite HK-density
-            real spin fields from FCIDUMP integrals. Accepts e.g. ``"2:7,13:18"``
-            or ``[(2, 3, 4, 5, 6), (13, 14, 15, 16, 17)]``.
+            Optional localized-orbital centers used for the selected real-field route.
+            Accepts e.g. ``"2:7,13:18"`` or
+            ``[(2, 3, 4, 5, 6), (13, 14, 15, 16, 17)]``.
+        real_field_method:
+            Real-field staging route for FCIDUMP Hamiltonians. ``"hk_density"``
+            preserves the onsite-only extraction; ``"local_exact"`` extracts the
+            full same-center local block before residual factorization; and
+            ``"kanamori_sign"`` extracts a sign-decomposed Hubbard-Kanamori-like
+            subset before residual factorization. ``"kanamori_sign_full"`` tries
+            an experimental spin-orbital-validated pair-block HK decomposition.
 
     Returns:
         StagedInputs with HamInput and TrialInput
@@ -408,6 +416,7 @@ def stage_from_ccpy(
             chol_cut=chol_cut,
             verbose=verbose,
             real_field_centers=real_field_centers,
+            real_field_method=real_field_method,
         )
         ham_source = "fcidump"
     else:

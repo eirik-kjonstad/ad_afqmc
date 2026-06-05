@@ -1019,6 +1019,115 @@ def _unpack_pair_vector(vec: Array, norb: int) -> Array:
     return mat
 
 
+def _pack_pair_matrix(mat: Array) -> Array:
+    arr = np.asarray(mat)
+    norb = int(arr.shape[0])
+    return np.asarray([arr[m, n] for m in range(norb) for n in range(m + 1)])
+
+
+def _packed_pair_index(i: int, j: int) -> int:
+    m, n = (i, j) if i >= j else (j, i)
+    return m * (m + 1) // 2 + n
+
+
+def _reconstruct_packed_pair_from_fields(
+    chol: Array,
+    field_factors: Array,
+    field_spin_coeffs: Array | None = None,
+    *,
+    local_orbitals: tuple[int, ...] | None = None,
+) -> Array:
+    chol_arr = np.asarray(chol)
+    if local_orbitals is not None:
+        ix = np.ix_(local_orbitals, local_orbitals)
+        chol_arr = chol_arr[:, ix[0], ix[1]]
+    if chol_arr.shape[0] == 0:
+        norb = int(chol_arr.shape[1]) if chol_arr.ndim == 3 else 0
+        npair = norb * (norb + 1) // 2
+        return np.zeros((npair, npair), dtype=np.complex128)
+    packed = np.asarray([_pack_pair_matrix(chol_i) for chol_i in chol_arr])
+    factors = np.asarray(field_factors, dtype=np.complex128)
+    coeff = -(factors**2)
+    if field_spin_coeffs is not None:
+        spin_coeffs = np.asarray(field_spin_coeffs)
+        spin_mask = np.isclose(spin_coeffs[:, 0], 1.0) & np.isclose(spin_coeffs[:, 1], -1.0)
+        coeff = np.where(spin_mask, factors**2, coeff)
+    out = np.einsum("g,gi,gj->ij", coeff, packed, packed, optimize=True)
+    if np.linalg.norm(np.imag(out)) < 1.0e-12 * max(1.0, np.linalg.norm(out)):
+        out = np.real(out)
+    return out
+
+
+def _relative_error(reference: Array, actual: Array) -> float:
+    ref_norm = float(np.linalg.norm(reference))
+    err_norm = float(np.linalg.norm(np.asarray(reference) - np.asarray(actual)))
+    return err_norm / ref_norm if ref_norm > 0.0 else err_norm
+
+
+def _mode_is_exact_real_spin_channel(mode: Array, eigenvalue: float, *, tol: float) -> bool:
+    """Return True when a positive pair mode has no same-spin two-body part."""
+    if eigenvalue <= 0.0:
+        return False
+    mat = 0.5 * (np.asarray(mode) + np.asarray(mode).T.conj())
+    if np.linalg.norm(mat) <= tol:
+        return False
+    singular_values = np.linalg.svd(mat, compute_uv=False)
+    if singular_values.size <= 1:
+        return True
+    return bool(singular_values[1] <= tol * max(1.0, singular_values[0]))
+
+
+def _antisymmetrize_spin_orbital_tensor(tensor: Array) -> Array:
+    arr = np.asarray(tensor)
+    return 0.25 * (
+        arr
+        - np.swapaxes(arr, 0, 1)
+        - np.swapaxes(arr, 2, 3)
+        + np.swapaxes(np.swapaxes(arr, 0, 1), 2, 3)
+    )
+
+
+def _spin_orbital_tensor_from_eri(eri: Array) -> Array:
+    arr = np.asarray(eri)
+    norb = int(arr.shape[0])
+    nso = 2 * norb
+    out = np.zeros((nso, nso, nso, nso), dtype=arr.dtype)
+    for sigma in range(2):
+        for tau in range(2):
+            i0 = sigma * norb
+            j0 = tau * norb
+            out[i0 : i0 + norb, j0 : j0 + norb, i0 : i0 + norb, j0 : j0 + norb] = (
+                arr.transpose(0, 2, 1, 3)
+            )
+    return _antisymmetrize_spin_orbital_tensor(out)
+
+
+def _reconstruct_spin_orbital_tensor_from_fields(
+    chol: Array,
+    field_factors: Array,
+    field_spin_coeffs: Array,
+) -> Array:
+    chol_arr = np.asarray(chol)
+    norb = int(chol_arr.shape[1])
+    nso = 2 * norb
+    out = np.zeros((nso, nso, nso, nso), dtype=np.complex128)
+    factors = np.asarray(field_factors, dtype=np.complex128)
+    spin_coeffs = np.asarray(field_spin_coeffs, dtype=np.complex128)
+    for g, mode in enumerate(chol_arr):
+        for sigma in range(2):
+            for tau in range(2):
+                i0 = sigma * norb
+                j0 = tau * norb
+                coeff = -(factors[g] ** 2) * spin_coeffs[g, sigma] * spin_coeffs[g, tau]
+                out[i0 : i0 + norb, j0 : j0 + norb, i0 : i0 + norb, j0 : j0 + norb] += (
+                    coeff * np.asarray(mode)[:, None, :, None] * np.asarray(mode)[None, :, None, :]
+                )
+    out = _antisymmetrize_spin_orbital_tensor(out)
+    if np.linalg.norm(np.imag(out)) < 1.0e-12 * max(1.0, np.linalg.norm(out)):
+        out = np.real(out)
+    return out
+
+
 def _factorize_symmetric_supermatrix(
     eri: Array,
     *,
@@ -1082,6 +1191,886 @@ def _factorize_symmetric_supermatrix(
         np.asarray(spin_coeffs, dtype=np.float64),
         labels,
         diagnostics,
+    )
+
+
+def _local_parameter_diagnostics(block: Array, orbitals: tuple[int, ...]) -> dict[str, Any]:
+    arr = np.asarray(block)
+    onsite = []
+    interorbital = []
+    exchange = []
+    pair_hopping = []
+    nloc = len(orbitals)
+    for p in range(nloc):
+        onsite.append({"orbital": int(orbitals[p]), "U": float(np.real(arr[p, p, p, p]))})
+        for q in range(p + 1, nloc):
+            interorbital.append(
+                {
+                    "orbitals": [int(orbitals[p]), int(orbitals[q])],
+                    "Uprime": float(np.real(arr[p, p, q, q])),
+                }
+            )
+            exchange.append(
+                {
+                    "orbitals": [int(orbitals[p]), int(orbitals[q])],
+                    "J": float(np.real(arr[p, q, q, p])),
+                }
+            )
+            pair_hopping.append(
+                {
+                    "orbitals": [int(orbitals[p]), int(orbitals[q])],
+                    "P": float(np.real(arr[p, q, p, q])),
+                }
+            )
+    return {
+        "onsite_U": onsite,
+        "interorbital_Uprime": interorbital,
+        "exchange_J": exchange,
+        "pair_hopping_like": pair_hopping,
+    }
+
+
+def _kanamori_field_coeffs(
+    coefficient: float,
+    *,
+    channel: str,
+) -> tuple[complex, tuple[float, float], str]:
+    if channel == "spin":
+        return (1.0 if coefficient >= 0.0 else 1.0j), (1.0, -1.0), "spin"
+    if channel == "charge":
+        return (1.0j if coefficient >= 0.0 else 1.0), (1.0, 1.0), "charge"
+    raise ValueError(f"Unsupported Kanamori field channel: {channel!r}")
+
+
+def _append_kanamori_field(
+    *,
+    local_mode: Array,
+    coefficient: float,
+    local_chol: list[Array],
+    local_factors: list[complex],
+    local_spin_coeffs: list[tuple[float, float]],
+    labels: list[str],
+    basis_coeff: Array,
+    global_orbitals: tuple[int, ...],
+    norb: int,
+    label: str,
+    channel: str,
+) -> Array:
+    factor, spin_coeff, channel = _kanamori_field_coeffs(coefficient, channel=channel)
+    scaled_mode = np.asarray(local_mode) * np.sqrt(abs(coefficient))
+    global_mode = np.zeros((norb, norb), dtype=np.asarray(scaled_mode).dtype)
+    global_mode[np.ix_(global_orbitals, global_orbitals)] = scaled_mode
+    local_chol.append(_rotate_one_body_to_mo(global_mode, basis_coeff))
+    local_factors.append(factor)
+    local_spin_coeffs.append(spin_coeff)
+    complexity = "complex" if abs(np.imag(factor)) > 0.0 else "real"
+    labels.append(f"kanamori_{complexity}:{label}:{channel}")
+    return _reconstruct_packed_pair_from_fields(
+        np.asarray([scaled_mode]),
+        np.asarray([factor], dtype=np.complex128),
+        np.asarray([spin_coeff], dtype=np.float64),
+    )
+
+
+def _build_kanamori_sign_real_fields_from_eri(
+    eri_ao: Array,
+    *,
+    basis_coeff: Array,
+    centers: tuple[tuple[int, ...], ...],
+    chol_cut: float,
+) -> RealFieldFitResult:
+    from pyscf import ao2mo
+
+    norb = int(eri_ao.shape[0])
+    nmo = int(np.asarray(basis_coeff).shape[1])
+    eri_ao_arr = np.asarray(eri_ao)
+    eri_residual = np.array(eri_ao, copy=True)
+    h1_shift_ao = np.zeros((norb, norb), dtype=eri_ao_arr.dtype)
+
+    local_chol: list[Array] = []
+    local_factors: list[complex] = []
+    local_spin_coeffs: list[tuple[float, float]] = []
+    labels: list[str] = []
+    center_reports: list[dict[str, Any]] = []
+
+    for center_idx, orbitals in enumerate(centers):
+        ix4 = np.ix_(orbitals, orbitals, orbitals, orbitals)
+        block = np.asarray(eri_ao_arr[ix4])
+        nloc = len(orbitals)
+        full_block_pair = ao2mo.restore(4, block, nloc)
+        full_block_pair = 0.5 * (full_block_pair + full_block_pair.T.conj())
+        residual_pair = np.array(full_block_pair, copy=True)
+        extracted_pair = np.zeros_like(full_block_pair)
+
+        center_start = len(local_chol)
+        kanamori_terms: list[dict[str, Any]] = []
+
+        for local_orb, orb in enumerate(orbitals):
+            pair_idx = _packed_pair_index(local_orb, local_orb)
+            u_value = float(np.real(residual_pair[pair_idx, pair_idx]))
+            if abs(u_value) <= float(chol_cut):
+                continue
+            mode = np.zeros((nloc, nloc), dtype=eri_ao_arr.dtype)
+            mode[local_orb, local_orb] = 1.0
+            contribution = _append_kanamori_field(
+                local_mode=mode,
+                coefficient=u_value,
+                local_chol=local_chol,
+                local_factors=local_factors,
+                local_spin_coeffs=local_spin_coeffs,
+                labels=labels,
+                basis_coeff=basis_coeff,
+                global_orbitals=orbitals,
+                norb=norb,
+                label=f"center{center_idx}:onsite{orb}",
+                channel="spin" if u_value >= 0.0 else "charge",
+            )
+            residual_pair -= contribution
+            extracted_pair += contribution
+            kanamori_terms.append(
+                {
+                    "kind": "onsite_U",
+                    "center": int(center_idx),
+                    "orbital": int(orb),
+                    "coefficient": u_value,
+                    "preferred_decomposition": "spin" if u_value >= 0.0 else "charge",
+                    "decomposition": "spin" if u_value >= 0.0 else "charge",
+                }
+            )
+
+        for p in range(nloc):
+            for q in range(p + 1, nloc):
+                pp_idx = _packed_pair_index(p, p)
+                qq_idx = _packed_pair_index(q, q)
+                density_value = float(np.real(residual_pair[pp_idx, qq_idx]))
+                if abs(density_value) > float(chol_cut):
+                    amplitude = 0.5 * abs(density_value)
+                    plus_mode = np.zeros((nloc, nloc), dtype=eri_ao_arr.dtype)
+                    plus_mode[p, p] = 1.0
+                    plus_mode[q, q] = 1.0
+                    minus_mode = np.zeros((nloc, nloc), dtype=eri_ao_arr.dtype)
+                    minus_mode[p, p] = 1.0
+                    minus_mode[q, q] = -1.0
+                    for mode, sign, component in (
+                        (plus_mode, np.sign(density_value), "plus"),
+                        (minus_mode, -np.sign(density_value), "minus"),
+                    ):
+                        contribution = _append_kanamori_field(
+                            local_mode=mode,
+                            coefficient=float(sign * amplitude),
+                            local_chol=local_chol,
+                            local_factors=local_factors,
+                            local_spin_coeffs=local_spin_coeffs,
+                            labels=labels,
+                            basis_coeff=basis_coeff,
+                            global_orbitals=orbitals,
+                            norb=norb,
+                            label=(
+                                f"center{center_idx}:density{orbitals[p]}-{orbitals[q]}:"
+                                f"{component}"
+                            ),
+                            channel="charge",
+                        )
+                        residual_pair -= contribution
+                        extracted_pair += contribution
+                    kanamori_terms.append(
+                        {
+                            "kind": "interorbital_Uprime",
+                            "center": int(center_idx),
+                            "orbitals": [int(orbitals[p]), int(orbitals[q])],
+                            "coefficient": density_value,
+                            "preferred_decomposition": (
+                                "spin" if density_value >= 0.0 else "charge"
+                            ),
+                            "decomposition": "charge",
+                        }
+                    )
+
+                pq_idx = _packed_pair_index(p, q)
+                hund_value = float(np.real(residual_pair[pq_idx, pq_idx]))
+                if abs(hund_value) <= float(chol_cut):
+                    continue
+                bond_mode = np.zeros((nloc, nloc), dtype=eri_ao_arr.dtype)
+                bond_mode[p, q] = 1.0
+                bond_mode[q, p] = 1.0
+                contribution = _append_kanamori_field(
+                    local_mode=bond_mode,
+                    coefficient=hund_value,
+                    local_chol=local_chol,
+                    local_factors=local_factors,
+                    local_spin_coeffs=local_spin_coeffs,
+                    labels=labels,
+                    basis_coeff=basis_coeff,
+                    global_orbitals=orbitals,
+                    norb=norb,
+                    label=f"center{center_idx}:hund{orbitals[p]}-{orbitals[q]}",
+                    channel="charge",
+                )
+                residual_pair -= contribution
+                extracted_pair += contribution
+                kanamori_terms.append(
+                    {
+                        "kind": "hund_J_bond",
+                        "center": int(center_idx),
+                        "orbitals": [int(orbitals[p]), int(orbitals[q])],
+                        "coefficient": hund_value,
+                        "preferred_decomposition": "spin" if hund_value >= 0.0 else "charge",
+                        "decomposition": "charge",
+                    }
+                )
+
+        center_stop = len(local_chol)
+        center_chol_ao = []
+        for chol_mo in local_chol[center_start:center_stop]:
+            center_chol_ao.append(np.asarray(basis_coeff) @ chol_mo @ np.asarray(basis_coeff).T.conj())
+        center_chol_ao = np.asarray(center_chol_ao)
+        if center_chol_ao.size:
+            center_chol_ao = center_chol_ao[:, orbitals, :][:, :, orbitals]
+        else:
+            center_chol_ao = np.zeros((0, nloc, nloc), dtype=eri_ao_arr.dtype)
+        center_factors = np.asarray(local_factors[center_start:center_stop], dtype=np.complex128)
+        center_spin_coeffs = np.asarray(
+            local_spin_coeffs[center_start:center_stop], dtype=np.float64
+        )
+        reconstructed_pair = _reconstruct_packed_pair_from_fields(
+            center_chol_ao, center_factors, center_spin_coeffs
+        )
+
+        eri_residual[ix4] = ao2mo.restore(1, residual_pair, nloc)
+        block_norm = float(np.linalg.norm(block.reshape(-1)))
+        extracted_block_norm = float(np.linalg.norm(ao2mo.restore(1, extracted_pair, nloc)))
+        residual_block_norm = float(np.linalg.norm(eri_residual[ix4].reshape(-1)))
+        center_reports.append(
+            {
+                "center": int(center_idx),
+                "orbitals": [int(x) for x in orbitals],
+                "kanamori_terms": kanamori_terms,
+                "local_block_norm": block_norm,
+                "extracted_local_block_norm": extracted_block_norm,
+                "residual_center_block_norm": residual_block_norm,
+                "packed_pair_norm": float(np.linalg.norm(full_block_pair)),
+                "kanamori_packed_pair_norm": float(np.linalg.norm(extracted_pair)),
+                "residual_packed_pair_norm": float(np.linalg.norm(residual_pair)),
+                "packed_pair_reconstruction_relative_error": _relative_error(
+                    extracted_pair, reconstructed_pair
+                ),
+                "spin_orbital_reconstruction_relative_error": _relative_error(
+                    _spin_orbital_tensor_from_eri(ao2mo.restore(1, extracted_pair, nloc)),
+                    _reconstruct_spin_orbital_tensor_from_fields(
+                        center_chol_ao, center_factors, center_spin_coeffs
+                    ),
+                ),
+                "n_local_real_fields": int(
+                    sum(
+                        label.startswith("kanamori_real:")
+                        for label in labels[center_start:center_stop]
+                    )
+                ),
+                "n_local_complex_fields": int(
+                    sum(
+                        label.startswith("kanamori_complex:")
+                        for label in labels[center_start:center_stop]
+                    )
+                ),
+                "parameters": _local_parameter_diagnostics(block, orbitals),
+            }
+        )
+
+    residual_chol, residual_factors, residual_spin_coeffs, residual_labels, residual_diagnostics = (
+        _factorize_symmetric_supermatrix(
+            eri_residual,
+            coeff=basis_coeff,
+            chol_cut=chol_cut,
+        )
+    )
+
+    if local_chol:
+        chol = np.concatenate([np.asarray(local_chol), residual_chol], axis=0)
+        field_factors = np.concatenate(
+            [np.asarray(local_factors, dtype=np.complex128), residual_factors], axis=0
+        )
+        field_spin_coeffs = np.concatenate(
+            [np.asarray(local_spin_coeffs, dtype=np.float64), residual_spin_coeffs], axis=0
+        )
+    else:
+        chol = residual_chol
+        field_factors = residual_factors
+        field_spin_coeffs = residual_spin_coeffs
+    labels.extend(residual_labels)
+
+    n_local_real = sum(label.startswith("kanamori_real:") for label in labels)
+    n_local_complex = sum(label.startswith("kanamori_complex:") for label in labels)
+    n_residual_complex = sum(label == "residual_complex" for label in residual_labels)
+    n_residual_real = sum(label == "residual_real" for label in residual_labels)
+    full_frobenius_norm = float(np.linalg.norm(eri_ao_arr.reshape(-1)))
+    residual_frobenius_norm = float(np.linalg.norm(eri_residual.reshape(-1)))
+    full_pair_norm = float(np.linalg.norm(ao2mo.restore(4, eri_ao_arr, norb)))
+    local_block_norm = float(
+        np.sqrt(sum(report["local_block_norm"] ** 2 for report in center_reports))
+    )
+    extracted_local_block_norm = float(
+        np.sqrt(sum(report["extracted_local_block_norm"] ** 2 for report in center_reports))
+    )
+    residual_center_block_norm = float(
+        np.sqrt(sum(report["residual_center_block_norm"] ** 2 for report in center_reports))
+    )
+
+    def _frac(num: float, den: float) -> float:
+        return float(num / den) if den > 0.0 else 0.0
+
+    metadata: Dict[str, Any] = {
+        "real_field_fit": "kanamori_sign",
+        "centers": [list(center) for center in centers],
+        "center_orbitals": list(sorted({orb for center in centers for orb in center})),
+        "center_reports": center_reports,
+        "local_real_fields": int(n_local_real),
+        "local_complex_fields": int(n_local_complex),
+        "residual_real_fields": int(n_residual_real),
+        "residual_complex_fields": int(n_residual_complex),
+        "n_local_real_fields": int(n_local_real),
+        "n_local_complex_fields": int(n_local_complex),
+        "n_residual_real_fields": int(n_residual_real),
+        "n_residual_complex_fields": int(n_residual_complex),
+        "frobenius": {
+            "full_norm": full_frobenius_norm,
+            "local_block_norm": local_block_norm,
+            "extracted_local_block_norm": extracted_local_block_norm,
+            "residual_norm": residual_frobenius_norm,
+            "center_block_norm": local_block_norm,
+            "center_block_residual_norm": residual_center_block_norm,
+            "full_pair_norm": full_pair_norm,
+            **residual_diagnostics,
+            "local_block_fraction_full_norm": _frac(local_block_norm, full_frobenius_norm),
+            "local_block_fraction_full_weight": _frac(
+                local_block_norm * local_block_norm,
+                full_frobenius_norm * full_frobenius_norm,
+            ),
+            "extracted_local_block_fraction_full_weight": _frac(
+                extracted_local_block_norm * extracted_local_block_norm,
+                full_frobenius_norm * full_frobenius_norm,
+            ),
+        },
+        "field_labels": tuple(labels),
+    }
+
+    if chol.shape[0] == 0:
+        chol = np.zeros((0, nmo, nmo), dtype=eri_ao_arr.dtype)
+    return RealFieldFitResult(
+        h1_shift=_rotate_one_body_to_mo(h1_shift_ao, basis_coeff),
+        chol=np.asarray(chol),
+        field_factors=np.asarray(field_factors, dtype=np.complex128),
+        field_spin_coeffs=np.asarray(field_spin_coeffs, dtype=np.float64),
+        metadata=metadata,
+    )
+
+
+def _build_kanamori_sign_full_real_fields_from_eri(
+    eri_ao: Array,
+    *,
+    basis_coeff: Array,
+    centers: tuple[tuple[int, ...], ...],
+    chol_cut: float,
+) -> RealFieldFitResult:
+    from pyscf import ao2mo
+
+    norb = int(eri_ao.shape[0])
+    nmo = int(np.asarray(basis_coeff).shape[1])
+    eri_ao_arr = np.asarray(eri_ao)
+    eri_residual = np.array(eri_ao, copy=True)
+    h1_shift_ao = np.zeros((norb, norb), dtype=eri_ao_arr.dtype)
+
+    local_chol: list[Array] = []
+    local_factors: list[complex] = []
+    local_spin_coeffs: list[tuple[float, float]] = []
+    labels: list[str] = []
+    center_reports: list[dict[str, Any]] = []
+
+    def candidate_tensor(mode: Array, channel: str) -> Array:
+        factor, spin_coeff, _ = _kanamori_field_coeffs(1.0, channel=channel)
+        return _reconstruct_spin_orbital_tensor_from_fields(
+            np.asarray([mode]),
+            np.asarray([factor], dtype=np.complex128),
+            np.asarray([spin_coeff], dtype=np.float64),
+        )
+
+    for center_idx, orbitals in enumerate(centers):
+        ix4 = np.ix_(orbitals, orbitals, orbitals, orbitals)
+        block = np.asarray(eri_ao_arr[ix4])
+        nloc = len(orbitals)
+        full_block_pair = ao2mo.restore(4, block, nloc)
+        full_block_pair = 0.5 * (full_block_pair + full_block_pair.T.conj())
+        residual_pair = np.array(full_block_pair, copy=True)
+        extracted_pair = np.zeros_like(full_block_pair)
+
+        center_start = len(local_chol)
+        kanamori_terms: list[dict[str, Any]] = []
+
+        for local_orb, orb in enumerate(orbitals):
+            pair_idx = _packed_pair_index(local_orb, local_orb)
+            u_value = float(np.real(residual_pair[pair_idx, pair_idx]))
+            if abs(u_value) <= float(chol_cut):
+                continue
+            mode = np.zeros((nloc, nloc), dtype=eri_ao_arr.dtype)
+            mode[local_orb, local_orb] = 1.0
+            channel = "spin" if u_value >= 0.0 else "charge"
+            contribution = _append_kanamori_field(
+                local_mode=mode,
+                coefficient=u_value,
+                local_chol=local_chol,
+                local_factors=local_factors,
+                local_spin_coeffs=local_spin_coeffs,
+                labels=labels,
+                basis_coeff=basis_coeff,
+                global_orbitals=orbitals,
+                norb=norb,
+                label=f"center{center_idx}:onsite{orb}",
+                channel=channel,
+            )
+            residual_pair -= contribution
+            extracted_pair += contribution
+            kanamori_terms.append(
+                {
+                    "kind": "onsite_U",
+                    "center": int(center_idx),
+                    "orbital": int(orb),
+                    "coefficient": u_value,
+                    "preferred_decomposition": channel,
+                    "decomposition": channel,
+                }
+            )
+
+        for p in range(nloc):
+            for q in range(p + 1, nloc):
+                pp_idx = _packed_pair_index(p, p)
+                pq_idx = _packed_pair_index(p, q)
+                qq_idx = _packed_pair_index(q, q)
+                target_pair = np.zeros_like(residual_pair)
+                for a, b in ((pp_idx, qq_idx), (qq_idx, pp_idx), (pq_idx, pq_idx)):
+                    target_pair[a, b] = residual_pair[a, b]
+                if np.linalg.norm(target_pair) <= float(chol_cut):
+                    continue
+
+                target_spin = _spin_orbital_tensor_from_eri(ao2mo.restore(1, target_pair, nloc))
+                plus = np.zeros((nloc, nloc), dtype=eri_ao_arr.dtype)
+                plus[p, p] = 1.0
+                plus[q, q] = 1.0
+                minus = np.zeros((nloc, nloc), dtype=eri_ao_arr.dtype)
+                minus[p, p] = 1.0
+                minus[q, q] = -1.0
+                bond = np.zeros((nloc, nloc), dtype=eri_ao_arr.dtype)
+                bond[p, q] = 1.0
+                bond[q, p] = 1.0
+                hund_value = float(np.real(residual_pair[pq_idx, pq_idx]))
+                preferred_bond = "spin" if hund_value >= 0.0 else "charge"
+                other_bond = "charge" if preferred_bond == "spin" else "spin"
+                candidates = [
+                    ("density_plus_charge", plus, "charge"),
+                    ("density_minus_charge", minus, "charge"),
+                    ("density_plus_spin", plus, "spin"),
+                    ("density_minus_spin", minus, "spin"),
+                    ("hund_preferred", bond, preferred_bond),
+                    ("hund_other", bond, other_bond),
+                ]
+                matrix = np.stack(
+                    [candidate_tensor(mode, channel).reshape(-1).real for _, mode, channel in candidates],
+                    axis=1,
+                )
+                rhs = target_spin.reshape(-1).real
+                coeffs, *_ = np.linalg.lstsq(matrix, rhs, rcond=None)
+                spin_relerr = _relative_error(rhs, matrix @ coeffs)
+                if spin_relerr > max(10.0 * float(chol_cut), 1.0e-10):
+                    continue
+
+                pair_extracted = np.zeros_like(residual_pair)
+                accepted_terms = []
+                for coeff, (name, mode, channel) in zip(coeffs, candidates):
+                    coeff = float(coeff)
+                    if abs(coeff) <= float(chol_cut):
+                        continue
+                    contribution = _append_kanamori_field(
+                        local_mode=mode,
+                        coefficient=coeff,
+                        local_chol=local_chol,
+                        local_factors=local_factors,
+                        local_spin_coeffs=local_spin_coeffs,
+                        labels=labels,
+                        basis_coeff=basis_coeff,
+                        global_orbitals=orbitals,
+                        norb=norb,
+                        label=f"center{center_idx}:pair{orbitals[p]}-{orbitals[q]}:{name}",
+                        channel=channel,
+                    )
+                    pair_extracted += contribution
+                    accepted_terms.append({"component": name, "coefficient": coeff, "channel": channel})
+                residual_pair -= pair_extracted
+                extracted_pair += pair_extracted
+                kanamori_terms.append(
+                    {
+                        "kind": "pair_full",
+                        "center": int(center_idx),
+                        "orbitals": [int(orbitals[p]), int(orbitals[q])],
+                        "preferred_decomposition": preferred_bond,
+                        "decomposition": "spin_orbital_lstsq",
+                        "spin_orbital_fit_relative_error": spin_relerr,
+                        "components": accepted_terms,
+                    }
+                )
+
+        center_stop = len(local_chol)
+        center_chol_ao = []
+        for chol_mo in local_chol[center_start:center_stop]:
+            center_chol_ao.append(np.asarray(basis_coeff) @ chol_mo @ np.asarray(basis_coeff).T.conj())
+        center_chol_ao = np.asarray(center_chol_ao)
+        if center_chol_ao.size:
+            center_chol_ao = center_chol_ao[:, orbitals, :][:, :, orbitals]
+        else:
+            center_chol_ao = np.zeros((0, nloc, nloc), dtype=eri_ao_arr.dtype)
+        center_factors = np.asarray(local_factors[center_start:center_stop], dtype=np.complex128)
+        center_spin_coeffs = np.asarray(
+            local_spin_coeffs[center_start:center_stop], dtype=np.float64
+        )
+        reconstructed_pair = _reconstruct_packed_pair_from_fields(
+            center_chol_ao, center_factors, center_spin_coeffs
+        )
+        eri_residual[ix4] = ao2mo.restore(1, residual_pair, nloc)
+        center_reports.append(
+            {
+                "center": int(center_idx),
+                "orbitals": [int(x) for x in orbitals],
+                "kanamori_terms": kanamori_terms,
+                "local_block_norm": float(np.linalg.norm(block.reshape(-1))),
+                "extracted_local_block_norm": float(
+                    np.linalg.norm(ao2mo.restore(1, extracted_pair, nloc))
+                ),
+                "residual_center_block_norm": float(np.linalg.norm(eri_residual[ix4].reshape(-1))),
+                "packed_pair_norm": float(np.linalg.norm(full_block_pair)),
+                "kanamori_packed_pair_norm": float(np.linalg.norm(extracted_pair)),
+                "residual_packed_pair_norm": float(np.linalg.norm(residual_pair)),
+                "packed_pair_reconstruction_relative_error": _relative_error(
+                    extracted_pair, reconstructed_pair
+                ),
+                "spin_orbital_reconstruction_relative_error": _relative_error(
+                    _spin_orbital_tensor_from_eri(ao2mo.restore(1, extracted_pair, nloc)),
+                    _reconstruct_spin_orbital_tensor_from_fields(
+                        center_chol_ao, center_factors, center_spin_coeffs
+                    ),
+                ),
+                "n_local_real_fields": int(
+                    sum(
+                        label.startswith("kanamori_real:")
+                        for label in labels[center_start:center_stop]
+                    )
+                ),
+                "n_local_complex_fields": int(
+                    sum(
+                        label.startswith("kanamori_complex:")
+                        for label in labels[center_start:center_stop]
+                    )
+                ),
+                "parameters": _local_parameter_diagnostics(block, orbitals),
+            }
+        )
+
+    residual_chol, residual_factors, residual_spin_coeffs, residual_labels, residual_diagnostics = (
+        _factorize_symmetric_supermatrix(
+            eri_residual,
+            coeff=basis_coeff,
+            chol_cut=chol_cut,
+        )
+    )
+    if local_chol:
+        chol = np.concatenate([np.asarray(local_chol), residual_chol], axis=0)
+        field_factors = np.concatenate(
+            [np.asarray(local_factors, dtype=np.complex128), residual_factors], axis=0
+        )
+        field_spin_coeffs = np.concatenate(
+            [np.asarray(local_spin_coeffs, dtype=np.float64), residual_spin_coeffs], axis=0
+        )
+    else:
+        chol = residual_chol
+        field_factors = residual_factors
+        field_spin_coeffs = residual_spin_coeffs
+    labels.extend(residual_labels)
+
+    n_local_real = sum(label.startswith("kanamori_real:") for label in labels)
+    n_local_complex = sum(label.startswith("kanamori_complex:") for label in labels)
+    n_residual_complex = sum(label == "residual_complex" for label in residual_labels)
+    n_residual_real = sum(label == "residual_real" for label in residual_labels)
+    full_frobenius_norm = float(np.linalg.norm(eri_ao_arr.reshape(-1)))
+    residual_frobenius_norm = float(np.linalg.norm(eri_residual.reshape(-1)))
+    full_pair_norm = float(np.linalg.norm(ao2mo.restore(4, eri_ao_arr, norb)))
+    local_block_norm = float(
+        np.sqrt(sum(report["local_block_norm"] ** 2 for report in center_reports))
+    )
+    extracted_local_block_norm = float(
+        np.sqrt(sum(report["extracted_local_block_norm"] ** 2 for report in center_reports))
+    )
+    residual_center_block_norm = float(
+        np.sqrt(sum(report["residual_center_block_norm"] ** 2 for report in center_reports))
+    )
+
+    def _frac(num: float, den: float) -> float:
+        return float(num / den) if den > 0.0 else 0.0
+
+    metadata: Dict[str, Any] = {
+        "real_field_fit": "kanamori_sign_full",
+        "centers": [list(center) for center in centers],
+        "center_orbitals": list(sorted({orb for center in centers for orb in center})),
+        "center_reports": center_reports,
+        "local_real_fields": int(n_local_real),
+        "local_complex_fields": int(n_local_complex),
+        "residual_real_fields": int(n_residual_real),
+        "residual_complex_fields": int(n_residual_complex),
+        "n_local_real_fields": int(n_local_real),
+        "n_local_complex_fields": int(n_local_complex),
+        "n_residual_real_fields": int(n_residual_real),
+        "n_residual_complex_fields": int(n_residual_complex),
+        "frobenius": {
+            "full_norm": full_frobenius_norm,
+            "local_block_norm": local_block_norm,
+            "extracted_local_block_norm": extracted_local_block_norm,
+            "residual_norm": residual_frobenius_norm,
+            "center_block_norm": local_block_norm,
+            "center_block_residual_norm": residual_center_block_norm,
+            "full_pair_norm": full_pair_norm,
+            **residual_diagnostics,
+            "local_block_fraction_full_norm": _frac(local_block_norm, full_frobenius_norm),
+            "local_block_fraction_full_weight": _frac(
+                local_block_norm * local_block_norm,
+                full_frobenius_norm * full_frobenius_norm,
+            ),
+            "extracted_local_block_fraction_full_weight": _frac(
+                extracted_local_block_norm * extracted_local_block_norm,
+                full_frobenius_norm * full_frobenius_norm,
+            ),
+        },
+        "field_labels": tuple(labels),
+    }
+    if chol.shape[0] == 0:
+        chol = np.zeros((0, nmo, nmo), dtype=eri_ao_arr.dtype)
+    return RealFieldFitResult(
+        h1_shift=_rotate_one_body_to_mo(h1_shift_ao, basis_coeff),
+        chol=np.asarray(chol),
+        field_factors=np.asarray(field_factors, dtype=np.complex128),
+        field_spin_coeffs=np.asarray(field_spin_coeffs, dtype=np.float64),
+        metadata=metadata,
+    )
+
+
+def _build_local_exact_real_fields_from_eri(
+    eri_ao: Array,
+    *,
+    basis_coeff: Array,
+    centers: tuple[tuple[int, ...], ...],
+    chol_cut: float,
+) -> RealFieldFitResult:
+    from pyscf import ao2mo
+
+    norb = int(eri_ao.shape[0])
+    nmo = int(np.asarray(basis_coeff).shape[1])
+    eri_ao_arr = np.asarray(eri_ao)
+    eri_residual = np.array(eri_ao, copy=True)
+    h1_shift_ao = np.zeros((norb, norb), dtype=eri_ao_arr.dtype)
+
+    local_chol: list[Array] = []
+    local_factors: list[complex] = []
+    local_spin_coeffs: list[tuple[float, float]] = []
+    labels: list[str] = []
+    center_reports: list[dict[str, Any]] = []
+
+    for center_idx, orbitals in enumerate(centers):
+        ix4 = np.ix_(orbitals, orbitals, orbitals, orbitals)
+        block = np.asarray(eri_ao_arr[ix4])
+        local_residual_block = np.array(block, copy=True)
+        full_block_pair = ao2mo.restore(4, block, len(orbitals))
+        full_block_pair = 0.5 * (full_block_pair + full_block_pair.T.conj())
+
+        center_start = len(local_chol)
+        onsite_terms: list[dict[str, Any]] = []
+        for local_orb, orb in enumerate(orbitals):
+            u_value = float(np.real(local_residual_block[local_orb, local_orb, local_orb, local_orb]))
+            if u_value <= float(chol_cut):
+                continue
+            global_mode = np.zeros((norb, norb), dtype=eri_ao_arr.dtype)
+            global_mode[orb, orb] = np.sqrt(u_value)
+            local_chol.append(_rotate_one_body_to_mo(global_mode, basis_coeff))
+            local_factors.append(1.0)
+            local_spin_coeffs.append((1.0, -1.0))
+            labels.append(f"local_exact_real:center{center_idx}:onsite{orb}")
+            onsite_terms.append({"center": int(center_idx), "orbital": int(orb), "U": u_value})
+            local_residual_block[local_orb, local_orb, local_orb, local_orb] -= u_value
+
+        block_pair = ao2mo.restore(4, local_residual_block, len(orbitals))
+        block_pair = 0.5 * (block_pair + block_pair.T.conj())
+        eigvals, eigvecs = np.linalg.eigh(block_pair)
+        keep = np.abs(eigvals) > float(chol_cut)
+
+        for local_mode_idx, value in enumerate(eigvals[keep]):
+            vec = eigvecs[:, keep][:, local_mode_idx]
+            small = _unpack_pair_vector(vec * np.sqrt(abs(value)), len(orbitals))
+            small = 0.5 * (small + small.T.conj())
+            global_mode = np.zeros((norb, norb), dtype=eri_ao_arr.dtype)
+            global_mode[np.ix_(orbitals, orbitals)] = small
+            local_chol.append(_rotate_one_body_to_mo(global_mode, basis_coeff))
+
+            spin_tol = max(float(chol_cut), 1.0e-12)
+            if _mode_is_exact_real_spin_channel(small, float(np.real(value)), tol=spin_tol):
+                local_factors.append(1.0)
+                local_spin_coeffs.append((1.0, -1.0))
+                labels.append(f"local_exact_real:center{center_idx}:mode{local_mode_idx}")
+            else:
+                local_factors.append(1.0j if value > 0.0 else 1.0)
+                local_spin_coeffs.append((1.0, 1.0))
+                labels.append(f"local_exact_complex:center{center_idx}:mode{local_mode_idx}")
+
+        center_stop = len(local_chol)
+        center_chol_ao = []
+        for chol_mo in local_chol[center_start:center_stop]:
+            # basis_coeff is unitary in the FCIDUMP local-orbital route; this inverse
+            # rotation keeps diagnostics in the same local basis as the extracted block.
+            center_chol_ao.append(np.asarray(basis_coeff) @ chol_mo @ np.asarray(basis_coeff).T.conj())
+        center_chol_ao = np.asarray(center_chol_ao)
+        if center_chol_ao.size:
+            center_chol_ao = center_chol_ao[:, orbitals, :][:, :, orbitals]
+        else:
+            center_chol_ao = np.zeros((0, len(orbitals), len(orbitals)), dtype=eri_ao_arr.dtype)
+        center_factors = np.asarray(local_factors[center_start:center_stop], dtype=np.complex128)
+        center_spin_coeffs = np.asarray(
+            local_spin_coeffs[center_start:center_stop], dtype=np.float64
+        )
+        reconstructed_pair = _reconstruct_packed_pair_from_fields(
+            center_chol_ao, center_factors, center_spin_coeffs
+        )
+        reconstructed_spin_orbital = _reconstruct_spin_orbital_tensor_from_fields(
+            center_chol_ao, center_factors, center_spin_coeffs
+        )
+        reference_spin_orbital = _spin_orbital_tensor_from_eri(block)
+
+        residual_eigs = eigvals[~keep]
+        block_norm = float(np.linalg.norm(block.reshape(-1)))
+        kept_pair_norm = float(np.linalg.norm(eigvals[keep]))
+        discarded_pair_norm = float(np.linalg.norm(residual_eigs))
+        extracted_block_norm = float(
+            np.linalg.norm(ao2mo.restore(1, np.asarray(reconstructed_pair), len(orbitals)))
+        )
+        center_reports.append(
+            {
+                "center": int(center_idx),
+                "orbitals": [int(x) for x in orbitals],
+                "onsite_real_terms": onsite_terms,
+                "local_block_norm": block_norm,
+                "extracted_local_block_norm": extracted_block_norm,
+                "residual_center_block_norm": 0.0,
+                "packed_pair_norm": float(np.linalg.norm(full_block_pair)),
+                "onsite_subtracted_packed_pair_norm": float(np.linalg.norm(block_pair)),
+                "retained_packed_pair_norm": kept_pair_norm,
+                "discarded_packed_pair_norm": discarded_pair_norm,
+                "packed_pair_reconstruction_relative_error": _relative_error(
+                    full_block_pair, reconstructed_pair
+                ),
+                "spin_orbital_reconstruction_relative_error": _relative_error(
+                    reference_spin_orbital, reconstructed_spin_orbital
+                ),
+                "n_local_real_fields": int(
+                    sum(
+                        label.startswith(f"local_exact_real:center{center_idx}:")
+                        for label in labels[center_start:center_stop]
+                    )
+                ),
+                "n_local_complex_fields": int(
+                    sum(
+                        label.startswith(f"local_exact_complex:center{center_idx}:")
+                        for label in labels[center_start:center_stop]
+                    )
+                ),
+                "parameters": _local_parameter_diagnostics(block, orbitals),
+            }
+        )
+
+        eri_residual[ix4] = 0.0
+
+    residual_chol, residual_factors, residual_spin_coeffs, residual_labels, residual_diagnostics = (
+        _factorize_symmetric_supermatrix(
+            eri_residual,
+            coeff=basis_coeff,
+            chol_cut=chol_cut,
+        )
+    )
+
+    if local_chol:
+        chol = np.concatenate([np.asarray(local_chol), residual_chol], axis=0)
+        field_factors = np.concatenate(
+            [np.asarray(local_factors, dtype=np.complex128), residual_factors], axis=0
+        )
+        field_spin_coeffs = np.concatenate(
+            [np.asarray(local_spin_coeffs, dtype=np.float64), residual_spin_coeffs], axis=0
+        )
+    else:
+        chol = residual_chol
+        field_factors = residual_factors
+        field_spin_coeffs = residual_spin_coeffs
+    labels.extend(residual_labels)
+
+    n_local_real = sum(label.startswith("local_exact_real:") for label in labels)
+    n_local_complex = sum(label.startswith("local_exact_complex:") for label in labels)
+    n_residual_complex = sum(label == "residual_complex" for label in residual_labels)
+    n_residual_real = sum(label == "residual_real" for label in residual_labels)
+    full_frobenius_norm = float(np.linalg.norm(eri_ao_arr.reshape(-1)))
+    residual_frobenius_norm = float(np.linalg.norm(eri_residual.reshape(-1)))
+    full_pair_norm = float(np.linalg.norm(ao2mo.restore(4, eri_ao_arr, norb)))
+    local_block_norm = float(
+        np.sqrt(sum(report["local_block_norm"] ** 2 for report in center_reports))
+    )
+    extracted_local_block_norm = float(
+        np.sqrt(sum(report["extracted_local_block_norm"] ** 2 for report in center_reports))
+    )
+
+    def _frac(num: float, den: float) -> float:
+        return float(num / den) if den > 0.0 else 0.0
+
+    metadata: Dict[str, Any] = {
+        "real_field_fit": "local_exact",
+        "centers": [list(center) for center in centers],
+        "center_orbitals": list(sorted({orb for center in centers for orb in center})),
+        "center_reports": center_reports,
+        "local_real_fields": int(n_local_real),
+        "local_complex_fields": int(n_local_complex),
+        "residual_real_fields": int(n_residual_real),
+        "residual_complex_fields": int(n_residual_complex),
+        "n_local_real_fields": int(n_local_real),
+        "n_local_complex_fields": int(n_local_complex),
+        "n_residual_real_fields": int(n_residual_real),
+        "n_residual_complex_fields": int(n_residual_complex),
+        "frobenius": {
+            "full_norm": full_frobenius_norm,
+            "local_block_norm": local_block_norm,
+            "extracted_local_block_norm": extracted_local_block_norm,
+            "residual_norm": residual_frobenius_norm,
+            "center_block_norm": local_block_norm,
+            "center_block_residual_norm": 0.0,
+            "full_pair_norm": full_pair_norm,
+            **residual_diagnostics,
+            "local_block_fraction_full_norm": _frac(local_block_norm, full_frobenius_norm),
+            "local_block_fraction_full_weight": _frac(
+                local_block_norm * local_block_norm,
+                full_frobenius_norm * full_frobenius_norm,
+            ),
+            "extracted_local_block_fraction_full_weight": _frac(
+                extracted_local_block_norm * extracted_local_block_norm,
+                full_frobenius_norm * full_frobenius_norm,
+            ),
+        },
+        "field_labels": tuple(labels),
+    }
+
+    if chol.shape[0] == 0:
+        chol = np.zeros((0, nmo, nmo), dtype=eri_ao_arr.dtype)
+    return RealFieldFitResult(
+        h1_shift=_rotate_one_body_to_mo(h1_shift_ao, basis_coeff),
+        chol=np.asarray(chol),
+        field_factors=np.asarray(field_factors, dtype=np.complex128),
+        field_spin_coeffs=np.asarray(field_spin_coeffs, dtype=np.float64),
+        metadata=metadata,
     )
 
 
@@ -1219,6 +2208,7 @@ def _stage_ham_input_from_fcidump(
     chol_cut: float,
     verbose: bool,
     real_field_centers: Any = None,
+    real_field_method: str = "hk_density",
 ) -> HamInput:
     """
     Build HamInput from FCIDUMP integrals while preserving the trial MO basis convention.
@@ -1282,12 +2272,41 @@ def _stage_ham_input_from_fcidump(
     t0 = time.time()
     real_centers = _normalize_real_field_centers(real_field_centers, norb=norb)
     if real_centers:
-        fit = _build_hk_density_real_fields_from_eri(
-            eri_ao,
-            basis_coeff=basis_coeff,
-            centers=real_centers,
-            chol_cut=chol_cut,
-        )
+        match real_field_method:
+            case "hk_density":
+                fit = _build_hk_density_real_fields_from_eri(
+                    eri_ao,
+                    basis_coeff=basis_coeff,
+                    centers=real_centers,
+                    chol_cut=chol_cut,
+                )
+            case "local_exact":
+                fit = _build_local_exact_real_fields_from_eri(
+                    eri_ao,
+                    basis_coeff=basis_coeff,
+                    centers=real_centers,
+                    chol_cut=chol_cut,
+                )
+            case "kanamori_sign":
+                fit = _build_kanamori_sign_real_fields_from_eri(
+                    eri_ao,
+                    basis_coeff=basis_coeff,
+                    centers=real_centers,
+                    chol_cut=chol_cut,
+                )
+            case "kanamori_sign_full":
+                fit = _build_kanamori_sign_full_real_fields_from_eri(
+                    eri_ao,
+                    basis_coeff=basis_coeff,
+                    centers=real_centers,
+                    chol_cut=chol_cut,
+                )
+            case _:
+                raise ValueError(
+                    "real_field_method must be one of "
+                    "{'hk_density', 'local_exact', 'kanamori_sign', 'kanamori_sign_full'}, "
+                    f"got {real_field_method!r}."
+                )
         h1 = h1 + fit.h1_shift
         chol = fit.chol
         field_factors = fit.field_factors
@@ -1309,7 +2328,9 @@ def _stage_ham_input_from_fcidump(
         if field_metadata is not None:
             print(
                 "[stage] FCIDUMP real-field fit: "
-                f"hk_real={field_metadata['n_hk_real_fields']} "
+                f"method={field_metadata['real_field_fit']} "
+                f"local_real={field_metadata.get('n_local_real_fields', field_metadata.get('n_hk_real_fields', 0))} "
+                f"local_complex={field_metadata.get('n_local_complex_fields', 0)} "
                 f"residual_complex={field_metadata['n_residual_complex_fields']} "
                 f"residual_real={field_metadata['n_residual_real_fields']} "
                 f"nchol={chol.shape[0]} in {time.time() - t0:.2f}s"
@@ -1591,6 +2612,7 @@ def stage_from_ccpy(
     overwrite: bool = False,
     verbose: bool = False,
     real_field_centers: Any = None,
+    real_field_method: str = "hk_density",
 ) -> StagedInputs:
     from .staging_ccpy import stage_from_ccpy as _impl
 
@@ -1606,6 +2628,7 @@ def stage_from_ccpy(
         overwrite=overwrite,
         verbose=verbose,
         real_field_centers=real_field_centers,
+        real_field_method=real_field_method,
     )
 
 
