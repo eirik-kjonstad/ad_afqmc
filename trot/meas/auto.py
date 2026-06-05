@@ -58,12 +58,24 @@ def _quadratic_coefficients(ham_data: HamChol) -> jax.Array:
 
 def _v0_from_ham(ham_data: HamChol) -> jax.Array:
     coeff = _quadratic_coefficients(ham_data)
-    chol_gram = jnp.matmul(ham_data.chol, jnp.swapaxes(ham_data.chol, -1, -2))
     if ham_data.field_spin_coeffs is not None:
         spin_coeffs = ham_data.field_spin_coeffs
-        weights = coeff[:, None] * spin_coeffs * spin_coeffs
-        return 0.5 * jnp.sum(weights.T[:, :, None, None] * chol_gram[None, :, :, :], axis=1)
-    return 0.5 * jnp.sum(coeff[:, None, None] * chol_gram, axis=0)
+        v0_a = jnp.einsum(
+            "g,gik,gjk->ij",
+            coeff * spin_coeffs[:, 0] * spin_coeffs[:, 0],
+            ham_data.chol,
+            ham_data.chol,
+            optimize="optimal",
+        )
+        v0_b = jnp.einsum(
+            "g,gik,gjk->ij",
+            coeff * spin_coeffs[:, 1] * spin_coeffs[:, 1],
+            ham_data.chol,
+            ham_data.chol,
+            optimize="optimal",
+        )
+        return 0.5 * jnp.stack([v0_a, v0_b], axis=0)
+    return 0.5 * jnp.einsum("g,gik,gjk->ij", coeff, ham_data.chol, ham_data.chol)
 
 
 def build_meas_ctx(ham_data: HamChol, _trial_data: trial_data, eps: float = 1.0e-4) -> AutoMeasCtx:
