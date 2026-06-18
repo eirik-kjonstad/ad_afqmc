@@ -374,7 +374,7 @@ class Afqmc:
         qmc_result = job.kernel(**driver_kwargs)
 
         e_tot = float(qmc_result.mean_energy)
-        e_err = float(qmc_result.stderr_energy)
+        e_err = float("nan") if qmc_result.stderr_energy is None else float(qmc_result.stderr_energy)
 
         self.qmc_result = qmc_result
 

@@ -263,12 +263,27 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ligand-centers",
+        default=None,
+        help=(
+            "Ligand/S orbital ranges. HK analysis uses these as the ligand subset; "
+            "AFQMC staging also extracts their positive onsite U as real spin fields. "
+            "Use Python slice syntax, comma separated; e.g. '12:24,34:36'."
+        ),
+    )
+    parser.add_argument(
         "--real-field-method",
         choices=(
             "hk_density",
             "local_exact",
             "kanamori_sign",
+            "kanamori_real",
             "kanamori_uj",
+            "charge_spin",
+            "uhf_charge_spin",
+            "uhf_charge_spin_blocks",
+            "uhf_charge_spin_unrham",
+            "uhf_local_real_then_charge_spin_unrham",
             "kanamori_sign_full",
         ),
         default="local_exact",
@@ -289,7 +304,59 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also stage and optionally run the ordinary Cholesky decomposition.",
     )
+    parser.add_argument(
+        "--vanilla-afqmc",
+        action="store_true",
+        help=(
+            "Run only the ordinary Cholesky AFQMC route. This ignores real-field and "
+            "ligand-center extraction for staging."
+        ),
+    )
     parser.add_argument("--stage-only", action="store_true")
+    parser.add_argument(
+        "--analyze-hk",
+        action="store_true",
+        help=(
+            "Analyze HK-like tensor weights in the FCIDUMP basis for the selected Fe centers "
+            "and exit before UHF/CC/AFQMC."
+        ),
+    )
+    parser.add_argument(
+        "--write-model-fcidump",
+        type=Path,
+        default=None,
+        help=(
+            "Write a reduced/model FCIDUMP from the selected Fe centers and ligand centers, "
+            "then exit before UHF/CC/AFQMC."
+        ),
+    )
+    parser.add_argument(
+        "--model-orbitals",
+        default=None,
+        help=(
+            "Explicit model orbital ranges. Defaults to Fe centers plus --ligand-centers. "
+            "Use Python slice syntax, comma separated."
+        ),
+    )
+    parser.add_argument(
+        "--model-h2",
+        choices=("onsite", "onsite_bridge_density", "selected_full"),
+        default="onsite_bridge_density",
+        help=(
+            "Two-body content of --write-model-fcidump. 'onsite_bridge_density' keeps "
+            "onsite U and Fe-ligand density Vdp terms."
+        ),
+    )
+    parser.add_argument("--model-nelec", type=int, default=None)
+    parser.add_argument("--model-ms2", type=int, default=None)
+    parser.add_argument(
+        "--model-occupation-string",
+        default=None,
+        help=(
+            "Occupation string used to infer NELEC/MS2 for --write-model-fcidump. "
+            "Defaults to the selected --uhf-init string."
+        ),
+    )
     parser.add_argument("--verbose-stage", action="store_true")
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--n-walkers", type=int, default=200)
@@ -300,6 +367,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-chunks", type=int, default=1)
     parser.add_argument("--dt", type=float, default=0.005)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--samples-raw",
+        type=Path,
+        default=None,
+        help="Write AFQMC block samples to this whitespace table for live monitoring.",
+    )
     args = parser.parse_args()
 
     custom_centers = any(
@@ -321,12 +394,20 @@ def parse_args() -> argparse.Namespace:
         center_tag = _center_spec_for_cache(args.real_field_centers)
     else:
         center_tag = f"{args.fe_band_model}band"
+    ligand_tag = fe_common._cache_tag_from_center_spec(args.ligand_centers, prefix="lig")
+    if ligand_tag:
+        center_tag = f"{center_tag}_{ligand_tag}"
     if args.cache is None:
         args.cache = Path(__file__).with_name(
             f"fe4_real_fields_{args.real_field_method}_{center_tag}_{trial_tag}_staged.h5"
         )
     if args.standard_cache is None:
-        args.standard_cache = Path(__file__).with_name(f"fe4_standard_{trial_tag}_staged.h5")
+        source_tag = fe_common._cache_tag_from_fcidump(args.fcidump, default_name="Fe4S4.FCIDUMP")
+        args.standard_cache = Path(__file__).with_name(
+            f"fe4_standard{source_tag}_{trial_tag}_staged.h5"
+        )
+    if args.vanilla_afqmc:
+        args.compare_standard = True
     return args
 
 
@@ -455,17 +536,30 @@ def build_or_load_staged(args: argparse.Namespace) -> dict[str, tuple[Any, float
     real_staged: tuple[Any, float] | None = None
     standard_staged: tuple[Any, float] | None = None
 
-    need_real = args.overwrite_cache or not args.cache.exists()
-    need_standard = args.compare_standard and (
-        args.overwrite_cache or not args.standard_cache.exists()
-    )
+    run_real = not args.vanilla_afqmc
+    run_standard = bool(args.compare_standard or args.vanilla_afqmc)
+    need_real = run_real and (args.overwrite_cache or not args.cache.exists())
+    need_standard = run_standard and (args.overwrite_cache or not args.standard_cache.exists())
 
-    if not need_real:
-        staged_inputs, seconds = _load_cache(args.cache)
-        real_staged = (fe_common._annotate_staged(staged_inputs, args), seconds)
-    if args.compare_standard and not need_standard:
-        staged_inputs, seconds = _load_cache(args.standard_cache)
-        standard_staged = (fe_common._annotate_staged(staged_inputs, args), seconds)
+    if run_real and not need_real:
+        loaded = fe_common._load_cache_if_compatible(args.cache, args)
+        if loaded is None:
+            need_real = True
+        else:
+            staged_inputs, seconds = loaded
+            real_staged = (fe_common._annotate_staged(staged_inputs, args), seconds)
+    if run_standard and not need_standard:
+        loaded = fe_common._load_cache_if_compatible(
+            args.standard_cache, args, require_psd_fcidump=True
+        )
+        if loaded is None:
+            need_standard = True
+        else:
+            staged_inputs, seconds = loaded
+            standard_staged = (fe_common._annotate_staged(staged_inputs, args), seconds)
+
+    if need_standard:
+        fe_common._assert_psd_fcidump_for_standard(args)
 
     if need_real or need_standard:
         if args.method == "uhf":
@@ -511,12 +605,22 @@ def build_or_load_staged(args: argparse.Namespace) -> dict[str, tuple[Any, float
     if real_staged is not None:
         staged["real-field"] = real_staged
     if standard_staged is not None:
-        staged["standard"] = standard_staged
+        staged["vanilla" if args.vanilla_afqmc else "standard"] = standard_staged
     return staged
 
 
 def main() -> None:
     args = parse_args()
+    if args.analyze_hk:
+        fe_common.analyze_hk(args)
+        return
+    if args.write_model_fcidump is not None:
+        occupation_string = args.model_occupation_string
+        if occupation_string is None:
+            occupation_string = read_fe4_occupation_init(args.inits, args.uhf_init)
+        fe_common.write_model_fcidump(args, occupation_string=occupation_string)
+        return
+
     staged = build_or_load_staged(args)
 
     for label, (staged_inputs, stage_seconds) in staged.items():

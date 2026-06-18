@@ -6,7 +6,7 @@ from typing import Literal
 import jax
 from jax import tree_util
 
-HamBasis = Literal["restricted", "generalized"]
+HamBasis = Literal["restricted", "unrestricted", "generalized"]
 
 
 @tree_util.register_pytree_node_class
@@ -18,6 +18,10 @@ class HamChol:
     basis="restricted":
       h1:   (norb, norb)
       chol: (n_fields, norb, norb)
+
+    basis="unrestricted":
+      h1:   (2, norb, norb)
+      chol: (n_fields, 2, norb, norb)
 
     basis="generalized":
       h1:   (nso, nso)   where nso = 2*norb
@@ -43,7 +47,7 @@ class HamChol:
     field_labels: tuple[str, ...] | None = None
 
     def __post_init__(self):
-        if self.basis not in ("restricted", "generalized"):
+        if self.basis not in ("restricted", "unrestricted", "generalized"):
             raise ValueError(f"unknown basis: {self.basis}")
         chol_shape = getattr(self.chol, "shape", None)
         if chol_shape is None:
@@ -116,8 +120,12 @@ def slice_ham_level(ham: HamChol, *, norb_keep: int | None, nchol_keep: int | No
     new_nchol = ham.nchol
 
     if norb_keep is not None:
-        h1 = h1[:norb_keep, :norb_keep]
-        chol = chol[:, :norb_keep, :norb_keep]
+        if ham.basis == "unrestricted":
+            h1 = h1[:, :norb_keep, :norb_keep]
+            chol = chol[:, :, :norb_keep, :norb_keep]
+        else:
+            h1 = h1[:norb_keep, :norb_keep]
+            chol = chol[:, :norb_keep, :norb_keep]
 
     if nchol_keep is not None:
         chol = chol[:nchol_keep]

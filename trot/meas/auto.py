@@ -58,6 +58,14 @@ def _quadratic_coefficients(ham_data: HamChol) -> jax.Array:
 
 def _v0_from_ham(ham_data: HamChol) -> jax.Array:
     coeff = _quadratic_coefficients(ham_data)
+    if ham_data.basis == "unrestricted":
+        return 0.5 * jnp.einsum(
+            "g,gsik,gskj->sij",
+            coeff,
+            ham_data.chol,
+            ham_data.chol,
+            optimize="optimal",
+        )
     if ham_data.field_spin_coeffs is not None:
         spin_coeffs = ham_data.field_spin_coeffs
         v0_a = jnp.einsum(
@@ -167,7 +175,12 @@ def force_bias_kernel_uw_rh(
     spin_coeffs = ham_data.field_spin_coeffs
 
     def f(x_gamma: jax.Array) -> jax.Array:
-        if spin_coeffs is None:
+        if ham_data.basis == "unrestricted":
+            x_chol_a = jnp.einsum("gij,g->ij", chol[:, 0], x_gamma, optimize="optimal")
+            x_chol_b = jnp.einsum("gij,g->ij", chol[:, 1], x_gamma, optimize="optimal")
+            wu1 = wu + x_chol_a @ wu
+            wd1 = wd + x_chol_b @ wd
+        elif spin_coeffs is None:
             x_chol = jnp.einsum("gij,g->ij", chol, x_gamma, optimize="optimal")
             wu1 = wu + x_chol @ wu
             wd1 = wd + x_chol @ wd
@@ -203,7 +216,6 @@ def _energy_from_overlap_array(
     h0 = ham_data.h0
     h1_eff = meas_ctx.h1_eff
     chol = ham_data.chol
-    n_fields = chol.shape[0]
     eps = meas_ctx.eps
 
     # one-body derivative via jvp at x=0
@@ -215,20 +227,20 @@ def _energy_from_overlap_array(
     ovlp0, d_ovlp = jax.jvp(f1, (x0,), (jnp.asarray(1.0, dtype=x0.dtype),))
 
     # two-body second derivative sum via FD on quadratic truncation
-    def sum_overlap_quad(x: jax.Array) -> jax.Array:
+    def weighted_d2_sum(x: jax.Array) -> jax.Array:
         acc0 = jnp.zeros((), dtype=ovlp0.dtype)
+        coeff = _quadratic_coefficients(ham_data)
 
-        def body(acc, chol_i):
+        def body(acc, inputs):
+            chol_i, coeff_i = inputs
             wi = _quad_rot_walker_array(w, chol_i, x)
-            return acc + overlap(wi, trial_data), None
+            second = (overlap(wi, trial_data) - ovlp0) / (0.5 * x * x)
+            return acc + coeff_i * second, None
 
-        acc, _ = lax.scan(body, acc0, chol)
+        acc, _ = lax.scan(body, acc0, (chol, coeff))
         return acc
 
-    sum_p = sum_overlap_quad(+eps)
-    sum_m = sum_overlap_quad(-eps)
-
-    d2_sum = (sum_p - 2.0 * jnp.asarray(n_fields, dtype=ovlp0.dtype) * ovlp0 + sum_m) / (eps * eps)
+    d2_sum = 0.5 * (weighted_d2_sum(+eps) + weighted_d2_sum(-eps))
 
     return (d_ovlp + 0.5 * d2_sum) / ovlp0 + h0
 
@@ -293,8 +305,12 @@ def energy_kernel_uw_rh(
 
         def body(acc, inputs):
             chol_i, coeff_i, spin_i = inputs
-            chol_a = chol_i if spin_coeffs is None else spin_i[0] * chol_i
-            chol_b = chol_i if spin_coeffs is None else spin_i[1] * chol_i
+            if ham_data.basis == "unrestricted":
+                chol_a = chol_i[0]
+                chol_b = chol_i[1]
+            else:
+                chol_a = chol_i if spin_coeffs is None else spin_i[0] * chol_i
+                chol_b = chol_i if spin_coeffs is None else spin_i[1] * chol_i
             wu1 = wu + x * (chol_a @ wu) + 0.5 * (x * x) * (chol_a @ (chol_a @ wu))
             wd1 = wd + x * (chol_b @ wd) + 0.5 * (x * x) * (chol_b @ (chol_b @ wd))
             second = (overlap((wu1, wd1), trial_data) - ovlp0) / (0.5 * x * x)

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 import time
 from functools import partial
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, NamedTuple, TextIO
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +28,58 @@ from .walkers import stochastic_reconfiguration
 from .meas.pt2ccsd import get_init_pt2trial_energy
 
 print = partial(print, flush=True)
+
+
+class _BlockSampleWriter:
+    def __init__(self, path: str | Path | None):
+        self.path = Path(path).expanduser().resolve() if path is not None else None
+        self.handle: TextIO | None = None
+
+    def __enter__(self) -> "_BlockSampleWriter":
+        if self.path is None:
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("w", encoding="utf-8")
+        self.handle.write("# trot AFQMC block samples\n")
+        self.handle.write(
+            "# columns: phase block total_blocks energy weight nodes elapsed_s "
+            "dt_s_per_block mean_energy stderr_energy\n"
+        )
+        self.handle.flush()
+        print(f"[samples] writing block samples to {self.path}")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+    def write(
+        self,
+        *,
+        phase: str,
+        block: int,
+        total_blocks: int,
+        energy: Any,
+        weight: Any,
+        nodes: int,
+        elapsed_s: float,
+        dt_s_per_block: float | None = None,
+        mean_energy: Any | None = None,
+        stderr_energy: Any | None = None,
+    ) -> None:
+        if self.handle is None:
+            return
+        dt_value = float("nan") if dt_s_per_block is None else float(dt_s_per_block)
+        mean_value = float("nan") if mean_energy is None else float(mean_energy)
+        stderr_value = float("nan") if stderr_energy is None else float(stderr_energy)
+        self.handle.write(
+            f"{phase:3s} {int(block):8d} {int(total_blocks):8d} "
+            f"{float(energy): .16e} {float(weight): .16e} {int(nodes):10d} "
+            f"{float(elapsed_s): .8e} {dt_value: .8e} "
+            f"{mean_value: .16e} {stderr_value: .16e}\n"
+        )
+        self.handle.flush()
 
 
 class QmcResult(NamedTuple):
@@ -181,6 +234,7 @@ def run_qmc(
     target_error: float | None = None,
     mesh: Mesh | None = None,
     observable_names: tuple[str, ...] = (),
+    samples_path: str | Path | None = None,
 ) -> QmcResult:
     """
     equilibration blocks then sampling blocks.
@@ -224,8 +278,49 @@ def run_qmc(
         observable_names=observable_names,
     )
 
+    with _BlockSampleWriter(samples_path) as sample_writer:
+        return _run_qmc_inner(
+            sys=sys,
+            params=params,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            meas_ops=meas_ops,
+            trial_ops=trial_ops,
+            prop_ops=prop_ops,
+            block_fn_sr=block_fn_sr,
+            run_blocks=run_blocks,
+            state=state,
+            meas_ctx=meas_ctx,
+            prop_ctx=prop_ctx,
+            target_error=target_error,
+            observable_names=observable_names,
+            sample_writer=sample_writer,
+        )
+
+
+def _run_qmc_inner(
+    *,
+    sys: System,
+    params: QmcParams,
+    ham_data: Any,
+    trial_data: Any,
+    meas_ops: MeasOps,
+    trial_ops: TrialOps,
+    prop_ops: PropOps,
+    block_fn_sr: BlockFn,
+    run_blocks: Callable,
+    state: PropState,
+    meas_ctx: Any,
+    prop_ctx: Any,
+    target_error: float | None,
+    observable_names: tuple[str, ...],
+    sample_writer: _BlockSampleWriter,
+) -> QmcResult:
+    del sys, meas_ops, trial_ops, prop_ops, block_fn_sr
+
     t0 = time.perf_counter()
     t_mark = t0
+    stream_blocks = sample_writer.path is not None
 
     print_every = params.n_eql_blocks // 5 if params.n_eql_blocks >= 5 else 0
     block_e_eq = []
@@ -250,7 +345,16 @@ def run_qmc(
         f"{int(state.node_encounters):10d}  "
         f"{0.0:8.1f}"
     )
-    chunk = print_every if print_every > 0 else 1
+    sample_writer.write(
+        phase="eql",
+        block=0,
+        total_blocks=params.n_eql_blocks,
+        energy=state.e_estimate,
+        weight=jnp.sum(state.weights),
+        nodes=int(state.node_encounters),
+        elapsed_s=0.0,
+    )
+    chunk = 1 if stream_blocks else (print_every if print_every > 0 else 1)
     for start in range(0, params.n_eql_blocks, chunk):
         n = min(chunk, params.n_eql_blocks - start)
         state, scalars_chunk, obs_chunk = run_blocks(
@@ -270,13 +374,23 @@ def run_qmc(
         w_chunk_avg = jnp.mean(w_chunk)
         e_chunk_avg = jnp.mean(e_chunk * w_chunk) / w_chunk_avg
         elapsed = time.perf_counter() - t0
-        print(
-            f"[eql {start + n:4d}/{params.n_eql_blocks}]  "
-            f"{float(e_chunk_avg):14.10f}  "
-            f"{float(w_chunk_avg):12.6e}  "
-            f"{int(state.node_encounters):10d}  "
-            f"{elapsed:8.1f}"
+        sample_writer.write(
+            phase="eql",
+            block=start + n,
+            total_blocks=params.n_eql_blocks,
+            energy=e_chunk_avg,
+            weight=w_chunk_avg,
+            nodes=int(state.node_encounters),
+            elapsed_s=elapsed,
         )
+        if print_every == 0 or start + n == params.n_eql_blocks or (start + n) % print_every == 0:
+            print(
+                f"[eql {start + n:4d}/{params.n_eql_blocks}]  "
+                f"{float(e_chunk_avg):14.10f}  "
+                f"{float(w_chunk_avg):12.6e}  "
+                f"{int(state.node_encounters):10d}  "
+                f"{elapsed:8.1f}"
+            )
     block_e_eq = jnp.asarray(block_e_eq)
     block_w_eq = jnp.asarray(block_w_eq)
     block_obs_eq = {
@@ -298,7 +412,7 @@ def run_qmc(
             f"{'W':>12s}    {'nodes':>10s}  {'dt[s/bl]':>10s}  {'t[s]':>7s}"
         )
 
-    chunk = print_every if print_every > 0 else 1
+    chunk = 1 if stream_blocks else (print_every if print_every > 0 else 1)
     for start in range(0, params.n_blocks, chunk):
         n = min(chunk, params.n_blocks - start)
         state, scalars_chunk, obs_chunk = run_blocks(
@@ -335,6 +449,18 @@ def run_qmc(
             f"{nodes:10d}  "
             f"{dt_per_block:9.3f}  "
             f"{elapsed:8.1f}"
+        )
+        sample_writer.write(
+            phase="blk",
+            block=start + n,
+            total_blocks=params.n_blocks,
+            energy=e_chunk_avg,
+            weight=w_chunk_avg,
+            nodes=nodes,
+            elapsed_s=elapsed,
+            dt_s_per_block=dt_per_block,
+            mean_energy=mu,
+            stderr_energy=se,
         )
         if se is not None and se <= target_error and target_error > 0.0:
             print(f"\nTarget error {target_error:.3e} reached at block {start + n}.")

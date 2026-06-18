@@ -79,8 +79,17 @@ def _get_dm(rdm1: jax.Array, ham_basis: str) -> jax.Array:
     match ham_basis:
         case "restricted":
             dm = _as_total_rdm1_restricted(rdm1)
-        case "generalized":
+        case "unrestricted":
+            if rdm1.ndim != 3 or rdm1.shape[0] != 2:
+                raise ValueError("unrestricted Hamiltonian basis requires rdm1 shape (2, norb, norb).")
             dm = rdm1
+        case "generalized":
+            if rdm1.ndim == 3 and rdm1.shape[0] == 2:
+                z_ab = jnp.zeros_like(rdm1[0])
+                z_ba = jnp.zeros_like(rdm1[1])
+                dm = jnp.block([[rdm1[0], z_ab], [z_ba, rdm1[1]]])
+            else:
+                dm = rdm1
         case _:
             raise ValueError(f"Unknown Hamiltonian basis kind: {ham_basis}")
     return dm
@@ -100,6 +109,9 @@ def _mf_shifts(ham_data: HamChol, rdm1: jax.Array) -> jax.Array:
         return field_factors * jnp.einsum(
             "gs,gs->g", spin_coeffs, spin_contractions, optimize="optimal"
         )
+    if ham_data.basis == "unrestricted":
+        dm = _get_dm(rdm1, ham_data.basis)
+        return field_factors * jnp.einsum("gsij,sji->g", ham_data.chol, dm, optimize="optimal")
     dm = _get_dm(rdm1, ham_data.basis)
     return field_factors * jnp.einsum("gij,ji->g", ham_data.chol, dm, optimize="optimal")
 
@@ -180,6 +192,11 @@ def _get_h1_eff(ham_data: HamChol, mf: jax.Array) -> jax.Array:
             v0m = 0.5 * jnp.einsum("gik,gkj->ij", k_chol, k_chol, optimize="optimal")
             v1m = jnp.einsum("g,gik->ik", mf, k_chol, optimize="optimal")
             h1_eff = ham_data.h1 + v0m - v1m
+        case "unrestricted":
+            k_chol = field_factors[:, None, None, None] * ham_data.chol
+            v0m = 0.5 * jnp.einsum("gsik,gskj->sij", k_chol, k_chol, optimize="optimal")
+            v1m = jnp.einsum("g,gsik->sik", mf, k_chol, optimize="optimal")
+            h1_eff = ham_data.h1 + v0m - v1m
         case _:
             raise ValueError(f"Unknown Hamiltonian basis kind: {ham_data.basis}")
 
@@ -203,7 +220,7 @@ def _build_prop_ctx(
     chol_flat = ham_data.chol.reshape(ham_data.chol.shape[0], -1).astype(chol_flat_precision)
     field_factors = _field_factors(ham_data)
     field_spin_coeffs = ham_data.field_spin_coeffs
-    norb = ham_data.chol.shape[1]
+    norb = ham_data.chol.shape[2] if ham_data.basis == "unrestricted" else ham_data.chol.shape[1]
     return CholAfqmcCtx(
         dt=dt_a,
         sqrt_dt=sqrt_dt,
@@ -357,6 +374,13 @@ def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = F
         )
 
     def make_vhs_unrestricted(field: jax.Array, ctx: CholAfqmcCtx) -> jax.Array:
+        if ham_basis == "unrestricted":
+            n = ctx.norb
+            chol_flat = ctx.chol_flat.reshape(ctx.chol_flat.shape[0], 2, n * n)
+            x = field.astype(vhs_complex_dtype) * ctx.field_factors.astype(vhs_complex_dtype)
+            alpha = _make_vhs_split_flat(chol_flat=chol_flat[:, 0], x=x, n=n)
+            beta = _make_vhs_split_flat(chol_flat=chol_flat[:, 1], x=x, n=n)
+            return alpha, beta
         if ctx.field_spin_coeffs is None:
             return make_vhs(field, ctx)
         return _make_vhs_spin_resolved_flat(
@@ -370,7 +394,7 @@ def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = F
     if walker_kind not in ("restricted", "unrestricted", "generalized"):
         raise ValueError(f"unknown walker_kind: {walker_kind}")
 
-    if ham_basis not in ("restricted", "generalized"):
+    if ham_basis not in ("restricted", "unrestricted", "generalized"):
         raise ValueError(f"unknown ham_basis: {ham_basis}")
 
     match ham_basis, walker_kind:
@@ -379,6 +403,10 @@ def make_trotter_ops(ham_basis: str, walker_kind: str, mixed_precision: bool = F
                 w, f, ctx, n_terms, make_vhs=mv
             )
         case "restricted", "unrestricted":
+            apply_trotter = lambda w, f, ctx, n_terms, mv=make_vhs_unrestricted: _apply_trotter_u(
+                w, f, ctx, n_terms, make_vhs=mv
+            )
+        case "unrestricted", "unrestricted":
             apply_trotter = lambda w, f, ctx, n_terms, mv=make_vhs_unrestricted: _apply_trotter_u(
                 w, f, ctx, n_terms, make_vhs=mv
             )

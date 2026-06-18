@@ -331,6 +331,21 @@ def _stage_ucisdtq_input_from_ccpy(driver: Any, staged_mf: Any, order_cc: int) -
     return TrialInput(kind="ucisdtq", data=data, frozen=staged_mf.trial_frozen, source_kind="cc")
 
 
+def _put_unrestricted_trial_in_uhf_mo_basis(trial: TrialInput, norb: int) -> TrialInput:
+    if trial.kind not in {"ucisd", "ucisdt", "ucisdtq"}:
+        return trial
+    data = dict(trial.data)
+    eye = np.eye(norb)
+    data["mo_coeff_a"] = eye
+    data["mo_coeff_b"] = eye
+    return TrialInput(
+        kind=trial.kind,
+        data=data,
+        frozen=trial.frozen,
+        source_kind=trial.source_kind,
+    )
+
+
 def stage_from_ccpy(
     driver: Any,
     mf: Any,
@@ -437,6 +452,13 @@ def stage_from_ccpy(
         trial = _stage_ucisdt_input_from_ccpy(driver, staged_mf, order_cc)
     else:
         trial = _stage_ucisdtq_input_from_ccpy(driver, staged_mf, order_cc)
+    if real_field_method in {
+        "uhf_charge_spin",
+        "uhf_charge_spin_blocks",
+        "uhf_charge_spin_unrham",
+        "uhf_local_real_then_charge_spin_unrham",
+    }:
+        trial = _put_unrestricted_trial_in_uhf_mo_basis(trial, int(ham.norb))
     _stage_end(t_trial, "trial input ready", details=f"kind={trial.kind}")
 
     mol = obj.mol
