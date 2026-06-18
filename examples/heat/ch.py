@@ -119,6 +119,56 @@ def validate_charge_spin_staged(staged, cache: Path):
     return staged
 
 
+def print_field_summary(staged) -> None:
+    meta = staged.ham.field_metadata or {}
+    print("\n[CH field summary]")
+    print(f"trial kind              = {staged.trial.kind}")
+    print(f"hamiltonian basis       = {staged.ham.basis}")
+    print(f"one-body shape          = {tuple(staged.ham.h1.shape)}")
+    print(f"field shape             = {tuple(staged.ham.chol.shape)}")
+    print(f"n_orbitals              = {staged.ham.norb}")
+    print(f"n_fields                = {staged.ham.chol.shape[0]}")
+    print(f"field factors present   = {staged.ham.field_factors is not None}")
+    print(
+        "real-field AFQMC route  = "
+        f"{'enabled' if staged.ham.field_factors is not None else 'disabled'}"
+    )
+    if not meta:
+        print("field route             = ordinary Cholesky")
+        return
+
+    print(f"field route             = {meta.get('real_field_fit')}")
+    print(f"field basis metadata    = {meta.get('basis')}")
+    print(f"decomposition scope     = {meta.get('decomposition_scope')}")
+    if meta.get("decomposition_scope") == "full":
+        print(f"full real fields        = {meta.get('n_full_real_fields')}")
+        print(f"full complex fields     = {meta.get('n_full_complex_fields')}")
+        print(f"charge-dominant fields  = {meta.get('n_full_charge_dominant_fields')}")
+        print(f"spin-dominant fields    = {meta.get('n_full_spin_dominant_fields')}")
+        print(f"mixed charge-spin fields= {meta.get('n_full_mixed_charge_spin_fields')}")
+    else:
+        print(f"local real fields       = {meta.get('n_local_real_fields')}")
+        print(f"local complex fields    = {meta.get('n_local_complex_fields')}")
+        print(f"residual real fields    = {meta.get('n_residual_real_fields')}")
+        print(f"residual complex fields = {meta.get('n_residual_complex_fields')}")
+
+    frob = meta.get("frobenius", {})
+    if frob:
+        print("Frobenius diagnostics:")
+        print(f"  ||V_full||                 = {float(frob['full_norm']):.10f}")
+        print(f"  ||V_full pair||            = {float(frob['full_pair_norm']):.10f}")
+        if meta.get("decomposition_scope") == "full":
+            print(
+                "  full pair rel. error       = "
+                f"{float(frob['full_pair_reconstruction_relative_error']):.3e}"
+            )
+        else:
+            print(
+                "  residual pair rel. error   = "
+                f"{float(frob['residual_pair_reconstruction_relative_error']):.3e}"
+            )
+
+
 def run_stable_uhf(mol, args: argparse.Namespace):
     mf = scf.UHF(mol)
     mf.max_cycle = args.scf_max_cycle
@@ -234,6 +284,7 @@ def main() -> None:
     staged = make_staged(args, cache)
     fit = staged.ham.field_metadata["real_field_fit"] if staged.ham.field_metadata else "standard"
     print(f"Staged CH/{staged.trial.kind} inputs ({fit} Hamiltonian): {cache}")
+    print_field_summary(staged)
 
     if args.stage_only:
         return
