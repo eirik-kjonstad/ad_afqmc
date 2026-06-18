@@ -7,10 +7,12 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+import numpy as np
 from pyscf import gto, scf
 
 from trot.afqmc import Afqmc
 from trot.staging import load as load_staged
+from trot.staging import StagedMfOrCc, TrialInput, _stage_ham_input_from_fcidump
 from trot.staging import stage, stage_from_ccpy
 
 
@@ -84,6 +86,39 @@ def build_mol(verbose: int):
     )
 
 
+def build_fcidump_context(mf) -> dict[str, object]:
+    mol = mf.mol
+    norb = int(mf.mo_coeff[0].shape[1])
+    return {
+        "NORB": norb,
+        "NELEC": int(mol.nelectron),
+        "MS2": int(mol.spin),
+        "ECORE": float(mol.energy_nuc()),
+        "H1": np.asarray(mf.get_hcore()),
+        "H2": np.asarray(mol.intor("int2e")),
+    }
+
+
+def uhf_identity_trial(norb: int) -> TrialInput:
+    eye = np.eye(norb)
+    return TrialInput(
+        kind="uhf",
+        data={"mo_a": eye, "mo_b": eye},
+        frozen=0,
+        source_kind="mf",
+    )
+
+
+def validate_charge_spin_staged(staged, cache: Path):
+    field_metadata = staged.ham.field_metadata or {}
+    if field_metadata.get("real_field_fit") != "uhf_charge_spin_unrham":
+        raise RuntimeError(
+            f"{cache} was not staged with the UHF charge/spin unrestricted Hamiltonian; "
+            "rerun with --overwrite-cache or choose a different --cache path."
+        )
+    return staged
+
+
 def run_stable_uhf(mol, args: argparse.Namespace):
     mf = scf.UHF(mol)
     mf.max_cycle = args.scf_max_cycle
@@ -133,34 +168,49 @@ def require_ccpy_driver():
 
 def make_staged(args: argparse.Namespace, cache: Path):
     if cache.exists() and not args.overwrite_cache:
-        return load_staged(cache)
+        return validate_charge_spin_staged(load_staged(cache), cache)
 
     if args.trial != "uhf":
         require_ccpy_driver()
 
     mol = build_mol(args.pyscf_verbose)
     mf = run_stable_uhf(mol, args)
+    fcidump = build_fcidump_context(mf)
 
     if args.trial == "uhf":
-        return stage(
+        ham = _stage_ham_input_from_fcidump(
+            StagedMfOrCc(mf, 0),
+            fcidump=fcidump,
+            chol_cut=args.chol_cut,
+            verbose=args.stage_verbose,
+            real_field_centers=None,
+            real_field_method="uhf_charge_spin_unrham",
+        )
+        staged = stage(
             mf,
             chol_cut=args.chol_cut,
             cache=cache,
             overwrite=args.overwrite_cache,
             verbose=args.stage_verbose,
+            ham=ham,
+            trial=uhf_identity_trial(int(ham.norb)),
         )
+        return validate_charge_spin_staged(staged, cache)
 
     _cc_method, order = TRIAL_TO_CCPY[args.trial]
     driver = build_ccpy_driver(mf, args)
-    return stage_from_ccpy(
+    staged = stage_from_ccpy(
         driver,
         mf,
         order=order,
         chol_cut=args.chol_cut,
+        fcidump=fcidump,
         cache=cache,
         overwrite=args.overwrite_cache,
         verbose=args.stage_verbose,
+        real_field_method="uhf_charge_spin_unrham",
     )
+    return validate_charge_spin_staged(staged, cache)
 
 
 def run_afqmc(staged, args: argparse.Namespace) -> tuple[float, float]:
@@ -182,7 +232,8 @@ def main() -> None:
     args = parse_args()
     cache = (args.cache or default_cache_path(args.trial)).expanduser()
     staged = make_staged(args, cache)
-    print(f"Staged CH/{staged.trial.kind} inputs: {cache}")
+    fit = staged.ham.field_metadata["real_field_fit"] if staged.ham.field_metadata else "standard"
+    print(f"Staged CH/{staged.trial.kind} inputs ({fit} Hamiltonian): {cache}")
 
     if args.stage_only:
         return
